@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+
+# runtime / debug artifacts
+.dbg/
+.turing/
+.DS_Store
+
+# editor / AI tool configs
+.claude/
+.trae/
