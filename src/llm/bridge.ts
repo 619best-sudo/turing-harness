@@ -14,6 +14,7 @@ import type {
   LLMBridge,
   LLMOptions,
   Message,
+  Modality,
   Model,
   StopReason,
   ToolCall,
@@ -40,15 +41,39 @@ function dataUri(mimeType: string, base64: string): string {
   return `data:${mimeType};base64,${base64}`;
 }
 
-function toORContent(msg: Message): string | ORContentPart[] | null {
+/**
+ * Drop non-text content a model cannot accept, replacing it with a short text
+ * note so the model still knows something was there.
+ *
+ * Sending an image to a text-only model is a HARD failure: the provider rejects
+ * the whole request, so a browser session that took a screenshot loses every
+ * turn of work that came before it. Degrading to a note keeps the run alive.
+ *
+ * Gated on `Model.input`, which is accurate for catalogued models. Unknown slugs
+ * still get the permissive all-modality default (`resolveModel`), so this only
+ * ever removes content we positively know the model rejects.
+ */
+function acceptsModality(model: Model | undefined, modality: Modality): boolean {
+  if (!model?.input || model.input.length === 0) return true;
+  return model.input.includes(modality);
+}
+
+function toORContent(msg: Message, model?: Model): string | ORContentPart[] | null {
   if (msg.role === "user") {
     if (typeof msg.content === "string") return msg.content;
     const parts: ORContentPart[] = [];
     for (const block of msg.content) {
       if (block.type === "text") parts.push({ type: "text", text: block.text });
-      else if (block.type === "image")
+      else if (block.type === "image") {
+        if (!acceptsModality(model, "image")) {
+          parts.push({
+            type: "text",
+            text: `[image omitted: ${model?.id ?? "this model"} cannot accept image input]`,
+          });
+          continue;
+        }
         parts.push({ type: "image_url", image_url: { url: dataUri(block.mimeType, block.data) } });
-      else if (block.type === "audio" && block.data)
+      } else if (block.type === "audio" && block.data)
         parts.push({
           type: "input_audio",
           input_audio: { data: block.data, format: block.mimeType.split("/")[1] ?? "wav" },
@@ -97,13 +122,13 @@ export function contextToRequest(
 
   for (const msg of context.messages) {
     if (msg.role === "user") {
-      messages.push({ role: "user", content: toORContent(msg) });
+      messages.push({ role: "user", content: toORContent(msg, model) });
     } else if (msg.role === "assistant") {
       const toolCalls = msg.content.filter((c): c is ToolCall => c.type === "toolCall");
       const reasoning = msg.content.find((c) => c.type === "thinking");
       messages.push({
         role: "assistant",
-        content: toORContent(msg) || null,
+        content: toORContent(msg, model) || null,
         ...(toolCalls.length
           ? {
               tool_calls: toolCalls.map((t) => ({
@@ -121,7 +146,7 @@ export function contextToRequest(
         role: "tool",
         tool_call_id: msg.toolCallId,
         name: msg.toolName,
-        content: toORContent(msg),
+        content: toORContent(msg, model),
       });
     }
   }
@@ -147,9 +172,36 @@ export function contextToRequest(
   if (options?.temperature != null) req.temperature = options.temperature;
   if (options?.maxTokens != null) req.max_tokens = options.maxTokens;
   else req.max_tokens = model.maxTokens;
-  if (options?.reasoning && options.reasoning !== "off" && model.reasoning) {
-    const effort = options.reasoning === "xhigh" ? "high" : options.reasoning;
-    req.reasoning = { effort: effort as "minimal" | "low" | "medium" | "high" };
+  if (model.reasoning && (options?.reasoning || options?.reasoningMaxTokens != null)) {
+    const level = options.reasoning;
+    // `off` means "do not think", which on the wire is a zero reasoning budget —
+    // not an omitted parameter. Omitting it hands the choice to the provider, and
+    // an unbounded reasoning model can spend the whole completion budget thinking
+    // and return no content at all.
+    if (level === "off") {
+      req.reasoning = { exclude: true, max_tokens: 0 };
+    } else if (options.reasoningMaxTokens != null) {
+      // MUTUALLY EXCLUSIVE with `effort` — sending both is a 400 from OpenRouter,
+      // and a rejected request never appears in the provider's activity log, so it
+      // presents as "the model returned nothing" with no upstream trace at all.
+      // A token budget is the stronger guarantee, so it wins when both are given.
+      req.reasoning = { max_tokens: options.reasoningMaxTokens };
+    } else {
+      const effort = level === "xhigh" ? "high" : level;
+      req.reasoning = { effort: effort as "minimal" | "low" | "medium" | "high" };
+    }
+  }
+  // Forward complexity + candidate hints to a backend proxy (modelSelection),
+  // so the backend can control model selection "from there". Carried under
+  // `metadata.modelSelection` — OpenRouter ignores unknown metadata, so this is
+  // harmless even when the bridge goes direct. A backend reading it (the
+  // turing-machine proxy) uses it to resolve the upstream model by complexity.
+  if (options?.modelSelection) {
+    const existing =
+      req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata)
+        ? (req.metadata as Record<string, unknown>)
+        : {};
+    req.metadata = { ...existing, modelSelection: options.modelSelection };
   }
   return req;
 }
@@ -250,12 +302,34 @@ export async function complete(
   }
 }
 
+/**
+ * Key under which an UNPARSEABLE tool-call argument buffer is preserved.
+ *
+ * Providers stream tool arguments as JSON text fragments. If the stream is cut
+ * off mid-arguments (usually `finish_reason: "length"`) or the model emits
+ * invalid JSON, the accumulated buffer will not parse. Losing it silently is
+ * worse than useless: the caller then sees a call with NO arguments and reports
+ * "missing required argument 'x'", which is a lie — the model did send `x`. It
+ * retries identically, fails identically, and loops.
+ *
+ * So the raw buffer is kept here, and callers use {@link isMalformedToolArgs} to
+ * tell "never sent" apart from "sent but unreadable" and say which.
+ */
+export const MALFORMED_TOOL_ARGS_KEY = "_raw";
+
+/** Whether a parsed argument object is actually an unparseable buffer. */
+export function isMalformedToolArgs(args: Record<string, unknown> | undefined): boolean {
+  if (!args) return false;
+  const keys = Object.keys(args);
+  return keys.length === 1 && keys[0] === MALFORMED_TOOL_ARGS_KEY;
+}
+
 function safeParseArgs(raw: string): Record<string, unknown> {
   if (!raw) return {};
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
-    return { _raw: raw };
+    return { [MALFORMED_TOOL_ARGS_KEY]: raw };
   }
 }
 
@@ -385,7 +459,15 @@ async function* streamImpl(
 // ---------------------------------------------------------------------------
 
 export interface OpenRouterBridgeOptions {
-  apiKey?: string;
+  /**
+   * Credential for every request this bridge makes.
+   *
+   * A function is resolved per request, which matters when the credential is a
+   * short-lived token: a host whose JWT is renewed on a timer would otherwise
+   * hold the value captured at construction for the whole lifetime of the
+   * bridge, and every turn after expiry would 401 mid-run.
+   */
+  apiKey?: string | (() => string | undefined);
   baseUrl?: string;
   headers?: Record<string, string>;
 }
@@ -393,10 +475,23 @@ export interface OpenRouterBridgeOptions {
 export class OpenRouterBridge implements LLMBridge {
   constructor(private readonly opts: OpenRouterBridgeOptions = {}) {}
 
+  /** Resolve a possibly-callable credential. Errors are left to the caller's
+   *  request, which fails with the provider's own 401 rather than a throw from
+   *  deep inside option merging. */
+  private resolveApiKey(): string | undefined {
+    const { apiKey } = this.opts;
+    if (typeof apiKey !== "function") return apiKey;
+    try {
+      return apiKey();
+    } catch {
+      return undefined;
+    }
+  }
+
   private mergeOptions(options?: LLMOptions): LLMOptions {
     return {
       ...options,
-      apiKey: options?.apiKey ?? this.opts.apiKey,
+      apiKey: options?.apiKey ?? this.resolveApiKey(),
       headers: { ...this.opts.headers, ...options?.headers },
     };
   }

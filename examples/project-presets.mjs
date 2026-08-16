@@ -30,10 +30,10 @@ async function main() {
   const h = new Harness({ apiKey: "x" });
   for (const cat of ["frontend", "mobile", "games", "backend"]) {
     const s = h.createSession({ preset: cat });
-    // Base fix: bash + read + ui_screen_auditor must be usable in Perfect.
+    // Base fix: bash + read + media_analysis must be usable in Perfect.
     const perfect = s.toolsForPhase("perfect").map((t) => t.name);
     assert(perfect.includes("bash"), `${cat}: bash in perfect`);
-    assert(perfect.includes("ui_screen_auditor"), `${cat}: auditor in perfect`);
+    assert(perfect.includes("media_analysis"), `${cat}: auditor in perfect`);
     // Perform has the mutation tools.
     const perform = s.toolsForPhase("perform").map((t) => t.name);
     assert(perform.includes("write") && perform.includes("edit"), `${cat}: write/edit in perform`);

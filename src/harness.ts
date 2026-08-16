@@ -25,6 +25,7 @@ import type {
   PermissionMode,
   Phase,
   PhaseResult,
+  RunLoopResult,
   ThreadRunSnapshot,
   TranscriptMode,
 } from "./types.js";
@@ -37,11 +38,14 @@ import type {
 } from "./registry/registry.js";
 import type { LogStore } from "./logging/logger.js";
 import type { PermissionGate } from "./orchestrator/permission.js";
-import type { ChainResult, Orchestrator, OrchestratorConfig, RunChainOptions, RunPhaseOptions } from "./orchestrator/orchestrator.js";
+import type { ChainResult, Orchestrator, OrchestratorConfig, RunChainOptions, RunOptions, RunPhaseOptions } from "./orchestrator/orchestrator.js";
 import { OpenRouterBridge } from "./llm/bridge.js";
 import type { McpServerOptions } from "./mcp/client.js";
 import type { AssetsGeneratorConfig } from "./tools/builtin/assets-generator.js";
-import type { UiScreenAuditorConfig } from "./tools/builtin/ui-screen-auditor.js";
+import type { MediaAnalysisConfig } from "./tools/builtin/media-analysis.js";
+import type { WebConfig } from "./tools/builtin/web.js";
+import type { PlanToolConfig } from "./tools/builtin/plan.js";
+import type { InspirationGeneratorConfig } from "./tools/builtin/inspiration-generator.js";
 import { HarnessAgent, type AgentHost, type HarnessAgentOptions } from "./agent.js";
 import { Session, type SessionInfo, type SessionOptions } from "./session.js";
 import {
@@ -61,8 +65,15 @@ import { createFileMemoryTool } from "./tools/builtin/file-memory.js";
 import { createProjectMemoryTool } from "./tools/builtin/project-memory.js";
 
 export interface HarnessConfig extends Omit<OrchestratorConfig, "registry" | "logStore" | "permission" | "llm"> {
-  /** OpenRouter API key (else read from OPENROUTER_API_KEY). */
-  apiKey?: string;
+  /**
+   * OpenRouter API key (else read from OPENROUTER_API_KEY).
+   *
+   * Pass a function when the credential is short-lived (e.g. a host proxying
+   * through its own backend with a renewed JWT): it is resolved per request, so
+   * a token rotated mid-run reaches the very next turn instead of leaving the
+   * run to 401 on the value captured here.
+   */
+  apiKey?: string | (() => string | undefined);
   /** Override the base URL (any OpenAI-compatible endpoint). */
   baseUrl?: string;
   /** Provide a custom LLM bridge (defaults to OpenRouter). Shared by all sessions. */
@@ -75,10 +86,34 @@ export interface HarnessConfig extends Omit<OrchestratorConfig, "registry" | "lo
   registerBuiltins?: boolean;
   /** Default backends for the assets_generator tool. */
   assets?: AssetsGeneratorConfig;
-  /** Default config for the ui_screen_auditor tool. */
-  auditor?: UiScreenAuditorConfig;
+  /** Default config for the media_analysis tool. */
+  mediaAnalysis?: MediaAnalysisConfig;
+  /**
+   * Multimodal slug used to describe images a TOOL returns when the run model
+   * cannot read them. Defaults to `mediaAnalysis.model` when that is set, so a
+   * host configuring vision once gets both behaviours.
+   */
+  visionModel?: string;
+  /** Config for `create_plan`, including its replaceable planning prompt. */
+  plan?: PlanToolConfig;
+  /** Config for `web_search` / `web_fetch` (engine, model, limits, custom backend). */
+  web?: WebConfig;
+  /**
+   * Config for the `inspiration_generator` tool — a host-injected keyword
+   * lookup returning a reusable UI/poster/parallax blueprint (or null). The
+   * harness owns no HTTP client; the host wires the real backend here.
+   */
+  inspiration?: InspirationGeneratorConfig;
   /** Default model used by activity_monitor's "study" action. */
   studyModel?: string;
+  /**
+   * Register `write`/`edit` in content-less author-only mode for new sessions
+   * (see BuiltinToolsConfig.authorOnlyWrites). The calling model emits only the
+   * path (+ `oldString` for edit); a resolved authoring model authors the bytes,
+   * eliminating the wasted full-file draft. Only meaningful when an authoring
+   * model is configured; default false keeps today's behaviour.
+   */
+  authorOnlyWrites?: boolean;
   /** Default custom 4P categorization strategy for new sessions' registries. */
   categorizer?: ToolCategorizer;
   /** Default transcript emission mode for new sessions. */
@@ -138,6 +173,7 @@ export class Harness implements AgentHost {
       permissionCallback: this.config.permissionCallback,
       models: this.config.models,
       toolModelCandidates: this.config.toolModelCandidates,
+      ...(this.config.routeModel ? { routeModel: this.config.routeModel } : {}),
       phaseTools: this.config.phaseTools,
       maxSteps: this.config.maxSteps,
       reasoning: this.config.reasoning,
@@ -146,8 +182,15 @@ export class Harness implements AgentHost {
       transcriptMode: this.config.transcriptMode,
       registerBuiltins: this.config.registerBuiltins,
       assets: this.config.assets,
-      auditor: this.config.auditor,
+      mediaAnalysis: this.config.mediaAnalysis,
+      ...(this.config.visionModel ?? this.config.mediaAnalysis?.model
+        ? { visionModel: this.config.visionModel ?? this.config.mediaAnalysis?.model }
+        : {}),
+      plan: this.config.plan,
+      web: this.config.web,
+      inspiration: this.config.inspiration,
       studyModel: this.config.studyModel,
+      ...(this.config.authorOnlyWrites ? { authorOnlyWrites: true } : {}),
       categorizer: this.config.categorizer,
       ...opts,
       // Shared providers are prepended; per-session `providers` come after.
@@ -370,6 +413,11 @@ export class Harness implements AgentHost {
   setPermissionMode(mode: PermissionMode): void {
     this.default.setPermissionMode(mode);
   }
+  /** Install the plan-review callback on the default session. */
+  setPlanApprovalCallback(cb: import("./types.js").PlanApprovalCallback | undefined): void {
+    this.default.setPlanApprovalCallback(cb);
+  }
+
   setPermissionCallback(cb: PermissionCallback | undefined): void {
     this.default.setPermissionCallback(cb);
   }
@@ -378,6 +426,10 @@ export class Harness implements AgentHost {
   }
   runChain(task: string, opts?: RunChainOptions): Promise<ChainResult> {
     return this.default.runChain(task, opts);
+  }
+  /** Flat loop driver — the primary entry point (delegates to the default session). */
+  run(task: string, opts?: RunOptions): Promise<RunLoopResult> {
+    return this.default.run(task, opts);
   }
   subscribe(fn: (e: AgentEvent) => void): () => void {
     return this.default.subscribe(fn);

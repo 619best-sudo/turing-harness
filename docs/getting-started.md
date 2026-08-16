@@ -101,7 +101,7 @@ new Harness({
   toolModelCandidates: ["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4.5"],
 
   phaseTools: { perfect: [/* pin exact AgentTool[] */] },   // else resolved by 4P category
-  maxSteps: { perform: 20 },        // tool-loop cap per phase
+  maxSteps: { perform: 20 },        // OPTIONAL hard cap per phase; unset = run to completion
   reasoning: { plan: "high" },      // thinking level per phase
   temperature: { perform: 0.2 },
   maxChainIterations: 3,            // Perfect→Perform retries

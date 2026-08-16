@@ -12,12 +12,13 @@
  *
  * Recommended servers (2026), by category:
  *   frontend: Playwright MCP, Chrome DevTools MCP, Figma MCP, Context7
- *   mobile:   mobile-mcp (mobile-next), Context7
+ *   mobile:   Context7 only — device automation is the BUILT-IN mobile_* toolkit
+ *             (src/devices/mobilecli.ts), not a spawned server
  *   games:    Godot MCP, (assets via built-in assets_generator)
  *   backend:  Postgres MCP, Filesystem MCP, Context7
  *
  * Sources: builder.io/blog/best-mcp-servers-2026, thenewstack.io "10 MCP Servers
- * for Frontend Developers", github.com/mobile-next/mobile-mcp,
+ * for Frontend Developers", github.com/mobile-next/mobilecli,
  * strayspark.studio game-dev MCP guide, bytebase.com top Postgres MCP servers.
  */
 import type { Phase } from "../types.js";
@@ -111,12 +112,14 @@ const figma: PresetMcpEntry = {
       : undefined,
 };
 
-const mobile: PresetMcpEntry = {
-  id: "mobile",
-  phases: ["perfect"],
-  note: "mobile-mcp (mobile-next) — drive iOS/Android simulators & devices, screenshots, vision element-finding.",
-  build: () => ({ id: "mobile", name: "Mobile", command: "npx", args: ["-y", "@mobilenext/mobile-mcp@latest"], mutates: true }),
-};
+// NOTE: there is deliberately no `mobile` MCP entry any more.
+//
+// Device automation used to be an external device-MCP server, spawned per run. It
+// is now the BUILT-IN `mobile_*` toolkit backed by the `mobilecli` binary
+// (src/devices/mobilecli.ts) — no server to spawn, no npx download on every
+// run, no MCP tool-name resolution, and a coordinate contract this repo has
+// actually verified against a device. The tools register unconditionally, so
+// nothing needs to be added here to make a mobile project work.
 
 const godot: PresetMcpEntry = {
   id: "godot",
@@ -178,11 +181,11 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
     },
     mcp: [context7(["prepare", "plan"]), figma, playwright, chromeDevtools],
     models: {
-      orchestrator: "poolside/laguna-xs-2.1",
-      prepare: "poolside/laguna-xs-2.1",
-      plan: "poolside/laguna-xs-2.1",
-      perform: "poolside/laguna-xs-2.1",
-      perfect: "poolside/laguna-xs-2.1",
+      orchestrator: "xiaomi/mimo-v2.5",
+      prepare: "xiaomi/mimo-v2.5",
+      plan: "xiaomi/mimo-v2.5",
+      perform: "xiaomi/mimo-v2.5",
+      perfect: "xiaomi/mimo-v2.5",
     },
   },
 
@@ -194,24 +197,23 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
       plan: { fromCategory: true, providers: ["context7"] },
       // Same `bash`-as-fallback policy as the frontend preset: in Perform
       // the model produces code with read/write/edit and lets Perfect drive
-      // the simulator via Mobile MCP. bash is excluded so the model can't
-      // fall back to `npx expo start` etc. from inside the harness. The
-      // mobile provider is explicitly added so a future mobile_* tool can be
-      // surfaced in Plan for env validation.
-      perform: { fromCategory: true, providers: ["mobile"], exclude: ["bash"] },
+      // the simulator. bash is excluded so the model can't fall back to
+      // `npx expo start` etc. from inside the harness. The built-in mobile
+      // toolkit is named explicitly so it is present for env validation.
+      perform: { fromCategory: true, providers: ["builtin:mobile"], exclude: ["bash"] },
       // Perfect: mobile tools FIRST (mandatory, not just first-listed) +
-      // ui_screen_auditor. bash is explicitly included as a fallback for STEP
+      // media_analysis. bash is explicitly included as a fallback for STEP
       // 0 (starting Metro) and cleanup, but the demote-bash-last ordering in
       // the registry keeps it behind every mobile_* tool in the tool list.
-      perfect: { fromCategory: true, providers: ["mobile", "ui_screen_auditor"] },
+      perfect: { fromCategory: true, providers: ["builtin:mobile", "builtin:media_analysis"] },
     },
-    mcp: [context7(["prepare", "plan"]), mobile],
+    mcp: [context7(["prepare", "plan"])],
     models: {
-      orchestrator: "poolside/laguna-xs-2.1",
-      prepare: "poolside/laguna-xs-2.1",
-      plan: "poolside/laguna-xs-2.1",
-      perform: "poolside/laguna-xs-2.1",
-      perfect: "poolside/laguna-xs-2.1",
+      orchestrator: "xiaomi/mimo-v2.5",
+      prepare: "xiaomi/mimo-v2.5",
+      plan: "xiaomi/mimo-v2.5",
+      perform: "xiaomi/mimo-v2.5",
+      perfect: "xiaomi/mimo-v2.5",
     },
   },
 
@@ -226,11 +228,11 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
     },
     mcp: [godot],
     models: {
-      orchestrator: "poolside/laguna-xs-2.1",
-      prepare: "poolside/laguna-xs-2.1",
-      plan: "poolside/laguna-xs-2.1",
-      perform: "poolside/laguna-xs-2.1",
-      perfect: "poolside/laguna-xs-2.1",
+      orchestrator: "xiaomi/mimo-v2.5",
+      prepare: "xiaomi/mimo-v2.5",
+      plan: "xiaomi/mimo-v2.5",
+      perform: "xiaomi/mimo-v2.5",
+      perfect: "xiaomi/mimo-v2.5",
     },
   },
 
@@ -245,11 +247,11 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
     },
     mcp: [context7(["prepare", "plan"]), postgres, filesystem],
     models: {
-      orchestrator: "poolside/laguna-xs-2.1",
-      prepare: "poolside/laguna-xs-2.1",
-      plan: "poolside/laguna-xs-2.1",
-      perform: "poolside/laguna-xs-2.1",
-      perfect: "poolside/laguna-xs-2.1",
+      orchestrator: "xiaomi/mimo-v2.5",
+      prepare: "xiaomi/mimo-v2.5",
+      plan: "xiaomi/mimo-v2.5",
+      perform: "xiaomi/mimo-v2.5",
+      perfect: "xiaomi/mimo-v2.5",
     },
   },
 };

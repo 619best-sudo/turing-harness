@@ -75,7 +75,7 @@ async function main() {
   console.log("Capabilities:");
   for (const c of caps) console.log(`  - [${c.source}/${c.kind}] ${c.name} → phases: ${c.phases.join(", ")}`);
   assert(caps.find((c) => c.name === "assets_generator"), "assets_generator registered");
-  assert(caps.find((c) => c.name === "ui_screen_auditor")?.phases.includes("perfect"), "auditor is a Perfect tool");
+  assert(caps.find((c) => c.name === "media_analysis")?.phases.includes("perfect"), "media_analysis is a Perfect tool");
   assert(caps.find((c) => c.name === "coding")?.phases.includes("perform"), "coding serves Perform");
 
   // 2) Per-phase toolsets resolve from categories.
@@ -101,13 +101,14 @@ async function main() {
   assert(written.includes("hi from perform"), "write tool created the file");
   console.log("\nFile written by Perform:", JSON.stringify(written.trim()));
 
-  // 6) activity_monitor can search the harness log by tag (noise removal).
-  const monitor = harness.toolsForPhase("prepare").find((t) => t.name === "activity_monitor");
-  const search = await monitor.execute("t", { action: "search", anyTags: ["mutation"] }, {
+  // 6) activity_search can filter the harness log by tag (noise removal).
+  // The activity tools are perform/perfect — they are not in the Prepare toolset.
+  const monitor = harness.toolsForPhase("perform").find((t) => t.name === "activity_search");
+  const search = await monitor.execute("t", { anyTags: ["mutation"] }, {
     cwd, log: () => {}, llm: fakeLLM,
   });
-  console.log("\nactivity_monitor (mutation tag) matched entries:\n" + search.output.split("\n").slice(0, 3).join("\n"));
-  assert(search.output.includes("write"), "activity_monitor found the write mutation");
+  console.log("\nactivity_search (mutation tag) matched entries:\n" + search.output.split("\n").slice(0, 3).join("\n"));
+  assert(search.output.includes("write"), "activity_search found the write mutation");
 
   // 7) Permission mode: ask-mutations should invoke callback only on mutating calls.
   const asked = [];

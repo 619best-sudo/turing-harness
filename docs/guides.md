@@ -156,22 +156,28 @@ const harness = new Harness({
 
 The tool writes the bytes to `<cwd>/assets` (or `outDir`) and returns a `MediaRef` — never the bytes inline.
 
-## Visual QA in Perfect
+## Analyzing attachments
 
-`ui_screen_auditor` runs a vision model against acceptance criteria:
+`media_analysis` hands any attachment — image, video, audio, document — to a multimodal model:
 
 ```ts
-// Called by the Perfect phase model, or directly:
-const auditor = harness.toolsForPhase("perfect").find((t) => t.name === "ui_screen_auditor")!;
-const res = await auditor.execute("id", {
-  images: ["screens/after.png"],
-  systemPrompt: "The primary button must be teal, centered, and not clipped on mobile.",
+// Called by any phase model, or directly:
+const analyze = harness.toolsForPhase("perfect").find((t) => t.name === "media_analysis")!;
+const res = await analyze.execute("id", {
+  file: "screens/after.png",
+  prompt: "Is the primary button teal, centered, and un-clipped on mobile?",
 }, { cwd: process.cwd(), log: () => {}, llm: harness.llm });
 
-console.log(res.details); // { pass, score, findings: [{ severity, area, issue, suggestion }] }
+console.log(res.details.analysis); // the model's answer, grounded in the screenshot
 ```
 
-Pick the vision model with `auditor: { model: "google/gemini-2.5-pro" }` or per-call `model`.
+Pass `files: [a, b]` instead of `file` to compare several in one request (before/after screenshots).
+The modality is inferred from the extension; pin `type: "image" | "video" | "audio" | "document"` when
+the extension is missing or misleading. Video is always carried by address, as is anything over 20 MB —
+everything else is inlined as base64.
+
+The model **must** be multimodal. Pick it with `mediaAnalysis: { model: "google/gemini-2.5-pro" }` or
+per-call `model`; left unset it falls back to the session model, which may be text-only.
 
 ## Log tags & activity monitoring
 
@@ -181,11 +187,59 @@ Everything the harness does emits tagged `LogEntry`s (`phase:*`, `tool:*`, `muta
 harness.logStore.search({ anyTags: ["mutation"], level: "info" });
 harness.logStore.tagHistogram();   // discover what tags exist
 
-// Or let a phase model use the tool to cut noise and study a slice:
-//   activity_monitor { action: "search", tags: ["tool:bash", "error"] }
-//   activity_monitor { action: "tail_file", file: "server.log", text: "ERROR" }
-//   activity_monitor { action: "study",  anyTags: ["verify:fail"] }   // model summarizes
+// Or let a phase model use the tools to cut noise and study a slice:
+//   activity_tags {}                                                  // what tags exist
+//   activity_search    { tags: ["tool:bash", "error"] }
+//   activity_tail_file { file: "server.log", text: "ERROR" }
+//   activity_study     { anyTags: ["verify:fail"] }                   // model summarizes
 ```
+
+## Searching the internet
+
+`web_search` and `web_fetch` drive the **Playwright MCP** — there is no HTTP client and no
+search API key in either of them. Attach a browser MCP and both work:
+
+```ts
+new Harness({ providers: [{ id: "playwright", kind: "mcp", /* npx @playwright/mcp@latest */ }] });
+```
+
+```ts
+// Find the page...
+await search.execute("id", { query: "vite 7 breaking changes", site: "vite.dev" }, ctx);
+//   -> details.hits: [{ url, title?, snippet? }], details.searchUrl (reproducible by hand)
+
+// ...then read it. The page is RENDERED first, so client-side docs sites work.
+await fetchTool.execute("id", { url: "https://github.com/vitejs/vite/issues/42" }, ctx);
+//   -> details.text (truncated at maxChars), details.title, details.finalUrl
+```
+
+Search goes to DuckDuckGo's HTML endpoint by default because it renders server-side and is the
+least hostile to automation; point `web: { searchUrlTemplate }` at another engine or an internal
+index (`{query}` is substituted URL-encoded). The scraper reads DuckDuckGo's markup first and
+falls back to "off-site links with visible text", so an unfamiliar layout still yields something.
+
+With no browser MCP connected, both tools return a clear error naming the missing capability —
+they never fall back to `curl`, which returns unrendered markup and usually no content at all.
+
+## Tracing runtime data flow
+
+`activity_trace_start` opens a trace session; the model then instruments the code with its
+**own** `read`/`edit` calls, so every insertion is a visible, reviewable tool call that the
+permission gate sees:
+
+```
+activity_trace_start { language: "typescript", hint: "why is the cart total wrong?" }
+  -> traceId + a __t() snippet writing to console AND /tmp/turing-trace-<id>.log
+read  src/cart.ts                 # the model's own calls, in the transcript
+edit  src/cart.ts                 # inserts __t() at the flow points it chose
+<run the flow>
+activity_collect { traceId, waitMs: 30000 }   # waits, reporting progress, if the flow runs late
+activity_study   { traceId }                  # root-cause analysis over the collected lines
+activity_cleanup { traceId }                  # delete the file, kill anything auto-started
+```
+
+Pass `startCommand` to `activity_trace_start` to have the dev server started with its
+stdout/stderr piped into the trace file (`port` frees the port first).
 
 ## Custom / non-OpenRouter endpoints
 

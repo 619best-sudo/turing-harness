@@ -22,6 +22,8 @@ import {
   PHASE_DEFAULT_TOOLS,
   DEFAULT_PHASE_MODELS,
   PROJECT_PRESETS,
+  resolveModel,
+  selectModel,
   Harness,
   Orchestrator,
   PermissionGate,
@@ -29,6 +31,7 @@ import {
   LogStore,
   Registry,
   registerBuiltins,
+  parseConcernLines,
 } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
@@ -104,7 +107,7 @@ function makeStubLlm({ projectFile }) {
                 "PROVIDER ASSIGNMENTS:",
                 "PLAN => builtin:project_memory",
                 "PERFORM => builtin:assets_generator",
-                "PERFECT => builtin:ui_screen_auditor",
+                "PERFECT => builtin:media_analysis",
                 "FILE SEARCH:",
                 `${projectFile} | complexity=medium | why=Primary task file | blast=files=${projectFile}; notes=entrypoint`,
                 "TOOL TRANSCRIPT:",
@@ -260,6 +263,54 @@ test("runner rejects bash({timeoutMs}) with missing command in perform", async (
   assert.match(texts.join(""), /missing required argument 'command'/);
 });
 
+test("edit with empty newString (deletion) is not rejected as a missing argument", async () => {
+  // An empty string is a legitimate, intentional value (here: delete the
+  // matched span). The required-arg gate must treat only absent (undefined/
+  // null) values as missing, not empty strings — otherwise every deletion is
+  // wrongly blocked with "edit: missing required argument 'newString'".
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
+  const file = path.join(tmp, "deleteme.txt");
+  await fs.writeFile(file, "keep\nREMOVE-ME\nkeep\n");
+  const orch = newOrch(
+    tmp,
+    makeScriptedLlm([
+      { tool: "edit", args: { path: file, oldString: "REMOVE-ME\n", newString: "" } },
+      { text: "SUMMARY: done" },
+    ]),
+  );
+  const ends = [];
+  orch.subscribe((e) => {
+    if (e.type === "tool_execution_end") ends.push(e);
+  });
+  await orch.runPhase("perform", "noop");
+  const editEnd = ends.find((e) => e.toolName === "edit");
+  assert.ok(editEnd, "the edit call should have executed");
+  assert.equal(editEnd.isError, false, "an empty newString (deletion) must not be treated as a missing argument");
+  const after = await fs.readFile(file, "utf8");
+  assert.equal(after, "keep\nkeep\n", "the matched span was deleted");
+});
+
+test("edit with a genuinely absent oldString is still rejected", async () => {
+  // Only ABSENT required args (undefined/null) are "missing". The model
+  // omitting oldString entirely is a real error the gate must still catch.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
+  const file = path.join(tmp, "x.txt");
+  await fs.writeFile(file, "hi");
+  const orch = newOrch(
+    tmp,
+    makeScriptedLlm([
+      { tool: "edit", args: { path: file, newString: "bye" } },
+      { text: "done" },
+    ]),
+  );
+  const texts = [];
+  orch.subscribe((e) => {
+    if (e.type === "tool_execution_end") texts.push(JSON.stringify(e.result));
+  });
+  await orch.runPhase("perform", "noop");
+  assert.match(texts.join(""), /missing required argument 'oldString'/);
+});
+
 test("successful read populates readPaths handover; not writtenPaths", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
   const file = path.join(tmp, "a.txt");
@@ -362,6 +413,88 @@ test("failed mutation does NOT pollute writtenPaths (success-only handover)", as
   assert.ok(!(r.writtenPaths ?? []).includes(ghost), "failed edit must not be in writtenPaths");
 });
 
+test("a generated asset (details.uri) reaches writtenPaths and the summary covers it", async () => {
+  // The gap this closes: assets_generator writes its file and reports the path as
+  // details.uri, but it is neither in MUTATING_TOOLS nor does it take a file_path
+  // argument — so the loop's arg-based path capture never saw it, the generated
+  // asset was missing from writtenPaths, and the run summary (the only context the
+  // next prompt on the thread receives) dropped every generation the run did.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
+  const generated = path.join(tmp, "assets", "hero.png");
+
+  // Registry with a fake generation tool that mimics assets_generator's result
+  // shape: details.uri = the written file, plus mimeType + summary. The capture
+  // logic keys on details.uri (tool-name-agnostic), so a distinct name still
+  // proves the fix without colliding with the real builtin.
+  const registry = newRegistryWithBuiltins();
+  registry.add({
+    id: "test:assets",
+    kind: "tool",
+    source: "internal",
+    name: "assets_test",
+    tools: [{
+      name: "fake_generator",
+      description: "Fake generator for the writtenPaths test (mimics assets_generator result shape).",
+      mutates: true,
+      phases: ["perform", "perfect"],
+      parameters: { type: "object", properties: { kind: { type: "string" }, prompt: { type: "string" } }, required: ["prompt"] },
+      async execute() {
+        return {
+          output: `Generated image → ${generated}`,
+          details: { uri: generated, mimeType: "image/png", size: 1234, summary: "Generated image for: hero" },
+          content: [],
+        };
+      },
+    }],
+  });
+  const llm = new OpenRouterBridge();
+  let summaryPrompt = "";
+  llm.stream = async function* (_model, ctx) {
+    yield { type: "start", partial: { role: "assistant", content: [], model: "x", api: "openrouter", provider: "x", usage: zeroUsage(), stopReason: "stop", timestamp: 0 } };
+    if (ctx.messages.length === 1) {
+      yield {
+        type: "done",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "t1", name: "fake_generator", arguments: { kind: "image", prompt: "hero" } }],
+          model: "x", api: "openrouter", provider: "x",
+          usage: zeroUsage(), stopReason: "tool_use", timestamp: 0,
+        },
+      };
+      return;
+    }
+    yield {
+      type: "done",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "CHANGES: generated the hero image" }],
+        model: "x", api: "openrouter", provider: "x",
+        usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+      },
+    };
+  };
+  // Capture the summary turn's user prompt (the second complete() call).
+  llm.complete = async (_model, ctx) => {
+    const content = ctx.messages?.[0]?.content ?? "";
+    if (typeof content === "string") summaryPrompt = content;
+    return { role: "assistant", content: [{ type: "text", text: "Generated the hero image at assets/hero.png." }], model: "x", api: "openrouter", provider: "x", usage: zeroUsage(), stopReason: "stop", timestamp: 0 };
+  };
+
+  const orch = new Orchestrator({ cwd: tmp, llm, registry, permission: new PermissionGate("allow-all"), logStore: new LogStore() });
+  const r = await orch.run("generate a hero image", {});
+
+  // 1. The generated asset path is captured as written (on the snapshot, which is
+  //    what the next prompt's thread context receives).
+  const written = r.threadSnapshot?.writtenPaths ?? [];
+  assert.ok(written.includes(generated), `generated asset must be in threadSnapshot.writtenPaths (got ${JSON.stringify(written)})`);
+  // 2. It is also surfaced as a ref (existing behavior, unchanged).
+  assert.ok((r.refs ?? []).some((ref) => ref.uri === generated), "generated asset must be in refs");
+  // 3. The summary turn was told about ASSETS GENERATED, so the carried summary
+  //    can name the generation rather than dropping it.
+  assert.match(summaryPrompt, /ASSETS GENERATED/);
+  assert.match(summaryPrompt, /hero\.png/);
+});
+
 test("duplicate identical read is served from cache, not re-executed", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
   const file = path.join(tmp, "b.txt");
@@ -435,9 +568,9 @@ test("bash background polling returns ready for long-running startup commands in
   const bashEnd = ends.find((e) => e.toolName === "bash");
   assert.ok(bashEnd, "bash result should be surfaced");
   assert.equal(bashEnd.isError, false);
-  assert.equal(bashEnd.result?.status, "ready");
-  assert.equal(bashEnd.result?.background, true);
-  await stopBackgroundPid(bashEnd.result?.pid);
+  assert.equal(bashEnd.result?.details?.status ?? bashEnd.result?.status, "ready");
+  assert.equal(bashEnd.result?.details?.background ?? bashEnd.result?.background, true);
+  await stopBackgroundPid(bashEnd.result?.details?.pid ?? bashEnd.result?.pid);
 });
 
 test("bash background polling returns pending instead of hanging when startup has no completion signal yet in perform", async () => {
@@ -455,9 +588,9 @@ test("bash background polling returns pending instead of hanging when startup ha
   const bashEnd = ends.find((e) => e.toolName === "bash");
   assert.ok(bashEnd, "bash result should be surfaced");
   assert.equal(bashEnd.isError, false);
-  assert.equal(bashEnd.result?.status, "pending");
-  assert.equal(bashEnd.result?.background, true);
-  await stopBackgroundPid(bashEnd.result?.pid);
+  assert.equal(bashEnd.result?.details?.status ?? bashEnd.result?.status, "pending");
+  assert.equal(bashEnd.result?.details?.background ?? bashEnd.result?.background, true);
+  await stopBackgroundPid(bashEnd.result?.details?.pid ?? bashEnd.result?.pid);
 });
 
 test("bash background polling fails fast on failure patterns even if the process stays alive in perform", async () => {
@@ -475,9 +608,10 @@ test("bash background polling fails fast on failure patterns even if the process
   const bashEnd = ends.find((e) => e.toolName === "bash");
   assert.ok(bashEnd, "bash result should be surfaced");
   assert.equal(bashEnd.isError, true);
-  assert.equal(bashEnd.result?.status, "failed");
-  assert.match(String(bashEnd.result?.failureMatch ?? ""), /port 5173 already in use/i);
-  await stopBackgroundPid(bashEnd.result?.pid);
+  const bashDetails = bashEnd.result?.details ?? bashEnd.result;
+  assert.equal(bashDetails?.status, "failed");
+  assert.match(String(bashDetails?.failureMatch ?? ""), /port 5173 already in use/i);
+  await stopBackgroundPid(bashDetails?.pid);
 });
 
 test("Plan opening surfaces FILES ALREADY READ from Prepare", async () => {
@@ -517,6 +651,105 @@ test("read tool returns clear error on empty path", async () => {
   assert.match(r.output, /missing required argument 'path'/);
 });
 
+// ---------------------------------------------------------------------------
+// mark_concern_lines: parser, arg guards, accumulation, phase membership
+// ---------------------------------------------------------------------------
+
+test("parseConcernLines: expands ranges, lists, dedupes, sorts, skips junk", () => {
+  assert.deepEqual(parseConcernLines("42-44"), [42, 43, 44], "range expands");
+  assert.deepEqual(parseConcernLines("42,43,44"), [42, 43, 44], "list works");
+  assert.deepEqual(parseConcernLines("44,42,43"), [42, 43, 44], "sorts ascending");
+  assert.deepEqual(parseConcernLines("42-44,43"), [42, 43, 44], "dedupes across range+list");
+  assert.deepEqual(parseConcernLines("1,3-5,7"), [1, 3, 4, 5, 7], "mixed range+list");
+  assert.deepEqual(parseConcernLines("5-3"), [3, 4, 5], "reversed range expands to ascending");
+  assert.deepEqual(parseConcernLines("1, 2 , 3"), [1, 2, 3], "tolerates whitespace");
+  assert.deepEqual(parseConcernLines("0,abc,-2,3.5"), [], "skips non-positive/non-integer/non-range tokens");
+  assert.deepEqual(parseConcernLines("3,abc,5"), [3, 5], "keeps valid tokens around junk");
+  assert.deepEqual(parseConcernLines(""), [], "empty input yields empty");
+  assert.deepEqual(parseConcernLines("   "), [], "whitespace-only yields empty");
+});
+
+test("mark_concern_lines resolves in all four phases", () => {
+  const reg = newRegistryWithBuiltins();
+  for (const phase of ["prepare", "plan", "perform", "perfect"]) {
+    const all = reg.selectPhaseTools(phase, undefined);
+    assert.ok(all.find((t) => t.name === "mark_concern_lines"), `mark_concern_lines should be available in ${phase}`);
+  }
+});
+
+test("mark_concern_lines returns clear error on empty path", async () => {
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("prepare", undefined);
+  const tool = all.find((t) => t.name === "mark_concern_lines");
+  assert.ok(tool, "mark_concern_lines should be present");
+  const r = await tool.execute("x", { lines: "42-44" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
+  assert.equal(r.isError, true);
+  assert.match(r.output, /missing required argument 'path'/);
+});
+
+test("mark_concern_lines returns clear error on empty lines", async () => {
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("prepare", undefined);
+  const tool = all.find((t) => t.name === "mark_concern_lines");
+  const r = await tool.execute("x", { path: "some/file.ts" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
+  assert.equal(r.isError, true);
+  assert.match(r.output, /missing required argument 'lines'/);
+});
+
+test("mark_concern_lines returns error when no line tokens parse", async () => {
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("prepare", undefined);
+  const tool = all.find((t) => t.name === "mark_concern_lines");
+  const r = await tool.execute("x", { path: "f.ts", lines: "abc" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
+  assert.equal(r.isError, true);
+  assert.match(r.output, /could not parse any valid line numbers/);
+});
+
+test("mark_concern_lines parses range into sorted deduped details", async () => {
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("plan", undefined);
+  const tool = all.find((t) => t.name === "mark_concern_lines");
+  const r = await tool.execute(
+    "x",
+    { path: "f.ts", lines: "44,42-43", why: "entrypoint exports" },
+    { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg },
+  );
+  assert.equal(r.isError, undefined);
+  assert.deepEqual(r.details.lines, [42, 43, 44]);
+  assert.equal(r.details.why, "entrypoint exports");
+  assert.match(r.details.path, /f\.ts$/);
+});
+
+test("successful mark_concern_lines populates lineConcerns handover", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
+  const file = path.join(tmp, "a.txt");
+  await fs.writeFile(file, "line1\nline2\nline3\n");
+  const orch = newOrch(
+    tmp,
+    makeScriptedLlm([
+      { tool: "read", args: { path: file } },
+      { tool: "mark_concern_lines", args: { path: file, lines: "1-2", why: "first two lines matter" } },
+      { text: "SUMMARY: done" },
+    ]),
+  );
+  const r = await orch.runPhase("prepare", "noop");
+  assert.ok(Array.isArray(r.lineConcerns), "lineConcerns should be an array");
+  assert.equal(r.lineConcerns.length, 1, "one concern entry");
+  const concern = r.lineConcerns[0];
+  assert.equal(concern.path, file, "concern path matches read path");
+  assert.deepEqual(concern.lines, [1, 2], "lines parsed from range");
+  assert.equal(concern.why, "first two lines matter", "why preserved");
+});
+
+test("mark_concern_lines may be omitted with no error", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-"));
+  const file = path.join(tmp, "a.txt");
+  await fs.writeFile(file, "hello");
+  const orch = newOrch(tmp, makeScriptedLlm([{ tool: "read", args: { path: file } }, { text: "SUMMARY: done" }]));
+  const r = await orch.runPhase("prepare", "noop");
+  assert.equal(r.lineConcerns, undefined, "no mark_concern_lines call ⇒ no lineConcerns");
+});
+
 test("bash tool returns clear error on empty command in perform", async () => {
   const reg = newRegistryWithBuiltins();
   const all = reg.selectPhaseTools("perform", undefined);
@@ -535,7 +768,7 @@ test("prepare only exposes read plus memory tools", () => {
   assert.ok(!all.find((t) => t.name === "grep"), "prepare should not expose grep");
   assert.ok(!all.find((t) => t.name === "bash_readonly"), "prepare should not expose bash_readonly");
   assert.ok(!all.find((t) => t.name === "bash"), "prepare should not expose mutating bash");
-  assert.ok(!all.find((t) => t.name === "activity_monitor"), "prepare should not expose activity_monitor");
+  assert.ok(!all.find((t) => t.name === "activity_search"), "prepare should not expose the activity tools");
 });
 
 test("plan has bash_readonly and excludes mutating bash", () => {
@@ -545,10 +778,14 @@ test("plan has bash_readonly and excludes mutating bash", () => {
   assert.ok(!all.find((t) => t.name === "bash"), "plan should not expose mutating bash");
 });
 
-test("perfect exposes activity_monitor for log verification", () => {
+test("perfect exposes the activity tools individually, MCP-style", () => {
   const reg = newRegistryWithBuiltins();
-  const all = reg.selectPhaseTools("perfect", undefined);
-  assert.ok(all.find((t) => t.name === "activity_monitor"), "perfect should expose activity_monitor");
+  const all = reg.selectPhaseTools("perfect", undefined).map((t) => t.name);
+  // One tool per step, so each debugging step is its own visible tool call.
+  for (const name of ["activity_search", "activity_study", "activity_trace_start", "activity_collect", "activity_cleanup"]) {
+    assert.ok(all.includes(name), `perfect should expose ${name}`);
+  }
+  assert.ok(!all.includes("activity_monitor"), "the monolithic action-switch tool is gone");
 });
 
 test("bash_readonly blocks mutating shell patterns", async () => {
@@ -579,6 +816,32 @@ test("bash_readonly allows read-only shell inspection", async () => {
   const r = await bashReadonly.execute("x", { command: "printf inspect-ok" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
   assert.equal(r.isError, undefined);
   assert.equal(r.output, "inspect-ok");
+});
+
+test("bash_readonly allows /dev/null output suppression (it is not a file write)", async () => {
+  // `cat f 2>/dev/null | head` was blocked as "redirection writes" because the `2>`
+  // matched the write heuristic. Redirecting to /dev/null discards output — it never
+  // writes a file — so it must read as the read-only inspection it is.
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("plan", undefined);
+  const bashReadonly = all.find((t) => t.name === "bash_readonly");
+  assert.ok(bashReadonly, "bash_readonly should be present");
+  const r = await bashReadonly.execute("x", { command: "printf suppress-ok 2>/dev/null | head -1" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
+  assert.equal(r.isError, undefined, JSON.stringify(r));
+  assert.equal(r.output, "suppress-ok");
+});
+
+test("bash_readonly accepts the `cmd` alias for `command`", async () => {
+  // The "empty bash" calls seen in the field were the model naming the field `cmd`,
+  // not omitting it: { cmd: "..." } arrived, `command` read as empty, the call was
+  // rejected and retried — which looked like duplicate tool calls. Accept the alias.
+  const reg = newRegistryWithBuiltins();
+  const all = reg.selectPhaseTools("plan", undefined);
+  const bashReadonly = all.find((t) => t.name === "bash_readonly");
+  assert.ok(bashReadonly, "bash_readonly should be present");
+  const r = await bashReadonly.execute("x", { cmd: "printf alias-ok" }, { cwd: process.cwd(), log: () => {}, llm: undefined, registry: reg });
+  assert.equal(r.isError, undefined, JSON.stringify(r));
+  assert.equal(r.output, "alias-ok");
 });
 
 test("write tool returns clear error when path or content missing", async () => {
@@ -679,14 +942,18 @@ test("Perform prompt: WRITE EFFICIENCY + LEAVE PROJECT RUNNABLE + RETRY BEHAVIOR
   assert.match(PHASE_PROMPTS.perform, /VERIFICATION FEEDBACK/);
 });
 
-test("Perfect prompt: explicit mobile_* MCP-first + reject bash as UI verifier", () => {
+test("Perfect prompt: explicit mobile_* toolkit first + reject bash as UI verifier", () => {
   assert.match(PHASE_PROMPTS.perfect, /graph_memory/);
   assert.match(PHASE_PROMPTS.perfect, /USER-FACING UI SUMMARY STYLE/);
   assert.match(PHASE_PROMPTS.perfect, /first sentence must name the concrete reason/);
-  assert.match(PHASE_PROMPTS.perfect, /mobile_list_available_devices/);
-  assert.match(PHASE_PROMPTS.perfect, /mobile_install_app/);
-  assert.match(PHASE_PROMPTS.perfect, /mobile_launch_app/);
-  assert.match(PHASE_PROMPTS.perfect, /mobile_take_screenshot/);
+  assert.match(PHASE_PROMPTS.perfect, /mobile \{ action: "devices" \}/);
+  // One tool, addressed by action — not fifteen tool names.
+  assert.match(PHASE_PROMPTS.perfect, /mobile \{ action: "launch"/);
+  assert.match(PHASE_PROMPTS.perfect, /mobile \{ action: "look"/);
+  assert.match(PHASE_PROMPTS.perfect, /mobile \{ action: "tap"/);
+  assert.match(PHASE_PROMPTS.perfect, /action: "apps"/);
+  // The one rule that makes its coordinates land.
+  assert.match(PHASE_PROMPTS.perfect, /exact coordinates/);
   assert.match(PHASE_PROMPTS.perfect, /TOOLS AVAILABLE THIS PHASE/);
   assert.match(PHASE_PROMPTS.perfect, /DO NOT substitute bash/);
   assert.match(PHASE_PROMPTS.perfect, /Bash CANNOT drive a simulator/);
@@ -698,14 +965,48 @@ test("Perfect prompt: explicit mobile_* MCP-first + reject bash as UI verifier",
 // Presets
 // ---------------------------------------------------------------------------
 
-test("mobile preset: perform excludes bash, perfect includes mobile + ui_screen_auditor", () => {
+test("mobile preset: perform excludes bash, perfect includes mobile + media_analysis", () => {
   const m = PROJECT_PRESETS.mobile.phaseTools;
   assert.ok(m.perform);
   assert.ok(m.perform.exclude?.includes("bash"), "mobile.perform should exclude bash");
   assert.ok(m.perfect);
   const prov = m.perfect.providers ?? [];
-  assert.ok(prov.includes("mobile"), "mobile.perfect should include mobile provider");
-  assert.ok(prov.includes("ui_screen_auditor"), "mobile.perfect should include ui_screen_auditor");
+  // Built-in provider ids: the device toolkit is no longer a spawned MCP.
+  // These must be the registry's real ids — `providers` is an exact-id lookup
+  // that silently no-ops on a miss, so a stale name here disables the toolkit
+  // without failing anything.
+  assert.ok(prov.includes("builtin:mobile"), "mobile.perfect should include the built-in mobile toolkit");
+  assert.ok(prov.includes("builtin:media_analysis"), "mobile.perfect should include media_analysis");
+});
+
+test("the mobile preset spawns no device MCP — mobilecli is built in", () => {
+  const ids = (PROJECT_PRESETS.mobile.mcp ?? []).map((e) => e.id);
+  assert.ok(!ids.includes("mobile"), "the external device-MCP server must be gone");
+  assert.deepEqual(ids, ["context7"], "context7 is the only MCP the mobile preset still needs");
+});
+
+test("preset provider ids all resolve against the real registry", async () => {
+  // The bug this pins: `providers: [...]` is an exact-id lookup into the
+  // registry that silently returns nothing on a miss. `providers: ["mobile"]`
+  // and `["media_analysis"]` were BOTH dead names once the ids became
+  // `builtin:*` — the phase simply lost those tools with no error anywhere.
+  const { Registry } = await import("../dist/registry/registry.js");
+  const { registerBuiltins } = await import("../dist/tools/index.js");
+  const registry = new Registry();
+  registerBuiltins(registry, { logStore: { append() {}, search: () => [], tagHistogram: () => [] } });
+  const known = new Set(registry.list().map((p) => p.id));
+
+  for (const [name, preset] of Object.entries(PROJECT_PRESETS)) {
+    const mcpIds = new Set((preset.mcp ?? []).map((e) => e.id));
+    for (const [phase, spec] of Object.entries(preset.phaseTools ?? {})) {
+      for (const pid of spec?.providers ?? []) {
+        assert.ok(
+          known.has(pid) || mcpIds.has(pid),
+          `${name}.${phase} names provider "${pid}", which is neither a built-in provider id nor an MCP this preset declares`,
+        );
+      }
+    }
+  }
 });
 
 test("frontend preset: perform excludes bash, perfect has playwright + chrome-devtools", () => {
@@ -737,20 +1038,42 @@ test("PHASE_DEFAULT_TOOLS has all four phases", () => {
   assert.ok(PHASE_DEFAULT_TOOLS.perfect.includes("graph_memory"));
 });
 
-test("default harness models and preset models use poolside/laguna-xs-2.1", () => {
+test("default harness models and preset models use xiaomi/mimo-v2.5", () => {
+  const DRIVER = "xiaomi/mimo-v2.5";
   for (const [phase, slug] of Object.entries(DEFAULT_PHASE_MODELS)) {
-    assert.equal(slug, "poolside/laguna-xs-2.1", `${phase} default model should be Laguna`);
+    assert.equal(slug, DRIVER, `${phase} default model should be the driver`);
   }
   for (const [category, preset] of Object.entries(PROJECT_PRESETS)) {
     for (const [phase, slug] of Object.entries(preset.models)) {
-      assert.equal(slug, "poolside/laguna-xs-2.1", `${category}.${phase} preset model should be Laguna`);
+      assert.equal(slug, DRIVER, `${category}.${phase} preset model should be the driver`);
     }
   }
 
   const harness = new Harness();
   const session = harness.createSession();
   const agent = session.createAgent();
-  assert.equal(agent.state.model, "poolside/laguna-xs-2.1", "agent fallback model should be Laguna");
+  assert.equal(agent.state.model, DRIVER, "agent fallback model should be the driver");
+});
+
+test("the driver model is registered, and text-only", () => {
+  // An UNREGISTERED slug resolves to the permissive unknown-model default, which
+  // claims image support. The modality list is what decides whether an image is
+  // serialised into a request, so a blind driver advertised as sighted sends a
+  // screenshot straight into a provider rejection and loses the whole turn —
+  // which is exactly how a browser session died once already.
+  const driver = resolveModel(DEFAULT_PHASE_MODELS.perform);
+  assert.equal(driver.id, "xiaomi/mimo-v2.5");
+  assert.deepEqual(driver.input, ["text"], "registered explicitly, not falling through to the default");
+});
+
+test("the fallback escalation tiers are never weaker than the driver", () => {
+  // The staged read escalates a hard file to a stronger model. Its no-candidates
+  // fallback pool must not name something smaller than the model doing the
+  // reading: the ids would differ, so the `escalated === current` short-circuit
+  // would not fire, and a file judged BEYOND the driver would be explained by
+  // something weaker than the driver.
+  const picked = selectModel({ complexity: { score: 1, signals: {} } }).model;
+  assert.equal(picked.openRouterSlug ?? picked.id, DEFAULT_PHASE_MODELS.perform);
 });
 
 // ---------------------------------------------------------------------------
@@ -878,7 +1201,7 @@ function makeProfileStub() {
       yield {
         type: "done",
         message: msg(
-          `CATEGORY: frontend\nPROJECT: static HTML site (no package.json) -> static file server; do NOT use npm/expo/vite\nRUN: python3 -m http.server 8080\nSTOP: pkill -f "http.server 8080"\nVERIFY: browser MCP at http://127.0.0.1:8080\nCAPABILITIES:\n- browser MCP: verify rendered pages\nPROVIDER ASSIGNMENTS:\nPLAN => builtin:file_memory\nPERFORM => builtin:assets_generator\nPERFECT => builtin:ui_screen_auditor\nFILE SEARCH:\n${path.join(process.cwd(), "index.html")} | complexity=medium | why=landing page entrypoint | blast=files=${path.join(process.cwd(), "index.html")}; notes=entrypoint\nTOOL TRANSCRIPT:\nfile_memory | target=landing page | summary=Found the main page entrypoint\nMEMORY UPDATES:\n- static site served with python3 -m http.server 8080\nFILE MEMORY UPDATES:\nnone\nSUMMARY: a static site`,
+          `CATEGORY: frontend\nPROJECT: static HTML site (no package.json) -> static file server; do NOT use npm/expo/vite\nRUN: python3 -m http.server 8080\nSTOP: pkill -f "http.server 8080"\nVERIFY: browser MCP at http://127.0.0.1:8080\nCAPABILITIES:\n- browser MCP: verify rendered pages\nPROVIDER ASSIGNMENTS:\nPLAN => builtin:file_memory\nPERFORM => builtin:assets_generator\nPERFECT => builtin:media_analysis\nFILE SEARCH:\n${path.join(process.cwd(), "index.html")} | complexity=medium | why=landing page entrypoint | blast=files=${path.join(process.cwd(), "index.html")}; notes=entrypoint\nTOOL TRANSCRIPT:\nfile_memory | target=landing page | summary=Found the main page entrypoint\nMEMORY UPDATES:\n- static site served with python3 -m http.server 8080\nFILE MEMORY UPDATES:\nnone\nSUMMARY: a static site`,
         ),
       };
       return;
@@ -1062,7 +1385,7 @@ test("Orchestrator.runChain: PROJECT PROFILE + RUNBOOK + structured provider/fil
     assert.match(opening, /browser MCP/);
     assert.match(opening, /PHASE PROVIDER ASSIGNMENTS/);
     assert.match(opening, /PLAN: builtin:file_memory/);
-    assert.match(opening, /PERFECT: builtin:ui_screen_auditor/);
+    assert.match(opening, /PERFECT: builtin:media_analysis/);
     assert.match(opening, /RELEVANT FILES FROM PREPARE/);
     assert.match(opening, /complexity=medium/);
     assert.match(opening, /PREPARE TOOL TRANSCRIPT|PLAN READ TRANSCRIPT/);
@@ -1075,7 +1398,7 @@ test("Orchestrator.runChain: PROJECT PROFILE + RUNBOOK + structured provider/fil
   assert.deepEqual(result.phases.plan?.providerAssignments, {
     plan: ["builtin:file_memory"],
     perform: ["builtin:assets_generator"],
-    perfect: ["builtin:ui_screen_auditor"],
+    perfect: ["builtin:media_analysis"],
   });
   assert.equal(result.phases.plan?.relevantFiles?.[0]?.complexity, "medium");
   assert.match(result.phases.plan?.toolTranscript?.[0]?.summary ?? "", /Found the main page entrypoint/);
@@ -1197,7 +1520,7 @@ test("Session.runChain merges structured provider assignments into downstream ph
   await session.runChain("verify provider assignment merge");
   assert.ok(session.toolsForPhase("plan").some((tool) => tool.name === "read"), "built-in plan tools should remain");
   assert.ok(session.toolsForPhase("plan").some((tool) => tool.name === "docs_lookup"));
-  assert.ok(session.toolsForPhase("perfect").some((tool) => tool.name === "activity_monitor"), "built-in perfect tools should remain");
+  assert.ok(session.toolsForPhase("perfect").some((tool) => tool.name === "activity_search"), "built-in perfect tools should remain");
   assert.ok(session.toolsForPhase("perfect").some((tool) => tool.name === "browser_verify"));
 });
 
@@ -1469,13 +1792,13 @@ test("prepare backfills provider assignments and relevant files when the model e
     }],
   });
   session.addProvider({
-    id: "openwaggle:mcp:mobile-mcp",
+    id: "openwaggle:mcp:device-tools",
     kind: "mcp",
     source: "external",
-    name: "mobile_mcp",
+    name: "device_tools",
     description: "Drive iOS/Android simulators and devices for mobile app verification",
     tools: [{
-      name: "mobile_list_available_devices",
+      name: "mobile_devices",
       description: "List simulators",
       mutates: false,
       phases: ["perform", "perfect"],
@@ -1491,8 +1814,8 @@ test("prepare backfills provider assignments and relevant files when the model e
   assert.ok(result.relevantFiles?.[0]?.complexity, "prepare should backfill a file complexity");
   assert.deepEqual(result.providerAssignments, {
     plan: ["skill:docs-helper"],
-    perform: ["openwaggle:mcp:mobile-mcp"],
-    perfect: ["openwaggle:mcp:mobile-mcp"],
+    perform: ["openwaggle:mcp:device-tools"],
+    perfect: ["openwaggle:mcp:device-tools"],
   });
 });
 

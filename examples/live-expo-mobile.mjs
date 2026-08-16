@@ -2,10 +2,10 @@
  * Live run: "create a small Expo (React Native) mobile app and run it on
  * the iOS simulator for verification".
  *
- * Uses the `mobile` project preset, which connects Mobile MCP
- * (`@mobilenext/mobile-mcp@latest`) for the Perfect phase. Mobile MCP can
- * boot the iOS simulator, install the Expo dev build, and capture a
- * screenshot we can audit with `ui_screen_auditor`.
+ * Uses the `mobile` project preset. Device automation is the harness's
+ * built-in `mobile_*` toolkit (backed by the `mobilecli` binary), so nothing
+ * is spawned per run: it boots/drives the iOS simulator, loads the Expo dev
+ * build, and captures a screenshot we audit with `media_analysis`.
  *
  * Run:
  *   OPENROUTER_API_KEY=... node examples/live-expo-mobile.mjs
@@ -156,12 +156,12 @@ async function main() {
     `         nohup npx expo start --port 8081 --offline > metro.log 2>&1 &\n` +
     `       Then ` + "`sleep 8`" + ` and read metro.log; confirm Metro is up (look for "Waiting on" or "Metro waiting" or "Bundling").\n` +
     `    c. IMPORTANT: start Metro at most ONCE. If port 8081 is already serving Metro, REUSE it — do not restart. Never run ` + "`pkill node`" + ` or ` + "`pkill -f expo`" + `; that kills the test harness itself. Do not pass a ` + "`--dev`" + ` flag (it does not exist); the valid flags are ` + "`--no-dev`" + ` and ` + "`--offline`" + `.\n` +
-    `  Mobile MCP (drive the simulator):\n` +
-    `    1. mobile_list_available_devices — pick the first available iOS simulator. Capture its ` + "`deviceId`" + `.\n` +
+    `  Device toolkit (drive the simulator):\n` +
+    `    1. mobile_devices — pick the booted iOS simulator. Capture its ` + "`deviceId`" + `.\n` +
     `    2. Load the app via the Expo dev URL: mobile_open_url device=<id> url=exp://127.0.0.1:8081 (this opens the app in Expo Go on the simulator). If that errors, fall back to mobile_open_url with url=http://127.0.0.1:8081.\n` +
     `    3. Wait for the JS bundle to load (bash: ` + "`sleep 8`" + `).\n` +
-    `    4. mobile_save_screenshot device=<id> saveTo=${path.join(OUT, "counterplus-simulator.png")} — use mobile_save_screenshot (NOT mobile_take_screenshot; take_screenshot only returns the image inline and does not write a file). The saveTo path MUST be this absolute .png path so the screenshot persists in the project.\n` +
-    `    5. ui_screen_auditor on ${path.join(OUT, "counterplus-simulator.png")} — ask it to confirm a "CounterPlus" title, the count label, and three buttons (Increment, Decrement, Reset) are visible.\n` +
+    `    4. mobile_screenshot device=<id> saveTo=${path.join(OUT, "counterplus-simulator.png")} — pass saveTo so the capture is written to disk (without it the image only comes back inline and media_analysis, which reads by path, cannot see it). The saveTo path MUST be this absolute .png path so the screenshot persists in the project.\n` +
+    `    5. media_analysis on ${path.join(OUT, "counterplus-simulator.png")} — ask it to confirm a "CounterPlus" title, the count label, and three buttons (Increment, Decrement, Reset) are visible.\n` +
     `Preconditions for "VERDICT: PASS": (a) Metro is up, (b) ${path.join(OUT, "counterplus-simulator.png")} exists and is non-empty, (c) the auditor confirms all required UI elements. End with "VERDICT: PASS" only if all three are true. If any precondition fails, end with "VERDICT: FAIL" and a "FIX:" section explaining what to try.`;
 
   const result = await session.runChain(task);

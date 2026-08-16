@@ -83,7 +83,7 @@ Suite: `examples/project-presets.mjs` (🟢).
 
 | ID | Type | Prompt / Action | Expect |
 |----|------|-----------------|--------|
-| **PRE-1** | 🟢 | `createProjectSession({ cwd: "acme/apps/web" })` (category from memory) | `session.toolsForPhase("perfect")` policy references `playwright`/`chrome-devtools` providers; Perfect includes `bash` + `ui_screen_auditor`; Perform includes `write`/`edit`. |
+| **PRE-1** | 🟢 | `createProjectSession({ cwd: "acme/apps/web" })` (category from memory) | `session.toolsForPhase("perfect")` policy references `playwright`/`chrome-devtools` providers; Perfect includes `bash` + `media_analysis`; Perform includes `write`/`edit`. |
 | **PRE-2** | 🟢 | Backend preset models | open `apps/api`, inspect resolved phase models | Plan → opus, Perform → sonnet, Perfect → sonnet (per `PROJECT_PRESETS.backend.models`). |
 | **PRE-3** | 🟢 | Mobile/games use a vision Perfect model | open `apps/mobile` / `apps/arcade` | Perfect model === `google/gemini-2.5-pro`. |
 | **PRE-4** | 🟢 | Explicit override wins | `createProjectSession("frontend", { cwd, models: { perform: "anthropic/claude-haiku-4.5" } })` | Perform runs with haiku (explicit beats preset). |
@@ -139,7 +139,7 @@ Suite: covered within `examples/multi-session.mjs` (🟢).
 
 | ID | Type | Prompt / Action | Expect |
 |----|------|-----------------|--------|
-| **REG-1** | 🟢 | Get list | `harness.listCapabilities()` | Returns internal providers (coding, assets_generator, ui_screen_auditor, activity_monitor) each with `source`, `kind`, aggregated `description`, `phases`, and full tool defs. |
+| **REG-1** | 🟢 | Get list | `harness.listCapabilities()` | Returns internal providers (coding, assets_generator, media_analysis, activity_monitor) each with `source`, `kind`, aggregated `description`, `phases`, and full tool defs. |
 | **REG-2** | 🟢 | Filter | `listCapabilities({ phase: "perfect", source: "internal" })` | Only internal providers whose tools serve Perfect. |
 | **REG-3** | 🟣 | Add an MCP | `await session.addMcpServer({ id: "playwright", command: "npx", args: ["@playwright/mcp@latest"] })` | Spawns, handshakes, lists tools; each becomes an `AgentTool`; `listCapabilities({source:"external"})` shows it; `added` event fired. |
 | **REG-4** | 🟢 | Add a skill | `harness.addSkill({ id, name, source: "external", tools })` | Registered as `kind:"skill"`; categorized; appears in list. |
@@ -158,7 +158,7 @@ Suite: `examples/custom-phases.mjs` (🟢).
 | ID | Type | Prompt / Action | Expect |
 |----|------|-----------------|--------|
 | **CUST-1** | 🟢 | Pin exact toolset | `phaseTools: { perfect: [playwrightTool, auditorTool, bashTool] }` | `toolsForPhase("perfect")` is exactly those three. |
-| **CUST-2** | 🟢 | Filter over category | `perfect: { fromCategory: true, exclude: ["ui_screen_auditor"], include: ["bash"] }` | Auditor removed, bash added, other Perfect tools kept. |
+| **CUST-2** | 🟢 | Filter over category | `perfect: { fromCategory: true, exclude: ["media_analysis"], include: ["bash"] }` | Auditor removed, bash added, other Perfect tools kept. |
 | **CUST-3** | 🟢 | Resolver function | `prepare: (registry) => registry.allTools().filter(t => !t.mutates)` | Prepare gets only non-mutating tools. |
 | **CUST-4** | 🟢 | Custom categorizer | `categorizer: (t, def) => t.name.endsWith("_check") ? ["perfect"] : def` | `*_check` tools land in Perfect regardless of default heuristic. |
 | **CUST-5** | 🟢 | Runtime reassignment | `session.setToolPhases("write", ["plan","perform"])`; `session.setProviderPhases("playwright", ["perfect"])`; `session.setPhaseTools("perfect", spec)` | Each takes effect immediately; `setPhaseTools(phase, undefined)` reverts to config/category. |
@@ -198,10 +198,13 @@ Suite: `examples/multi-session.mjs` (🟢).
 |----|------|-----------------|--------|
 | **TOOL-1** | 🟢 | assets_generator (placeholder) | call with `{ kind: "image", prompt: "app icon" }`, no backend | Writes a deterministic placeholder (SVG) under `<cwd>/assets`; returns a `MediaRef` (path + summary), **not** inline bytes. |
 | **TOOL-2** | 🔵 | assets_generator (real backend) | configure `assets.backends.image`; *(arcade)* "Generate a pixel-art coin sprite." | Backend invoked; asset file written; ref flows into `PhaseResult.refs`. |
-| **TOOL-3** | 🔵 | ui_screen_auditor | provide a screenshot + criteria "primary button must be teal and not clipped" | Returns `{ pass, score, findings[] }`; `pass:false` when a criterion is unmet. |
-| **TOOL-4** | 🟢 | activity_monitor — tag search | after a run, `activity_monitor{action:"search", anyTags:["mutation"]}` | Returns only mutation log lines; `action:"tags"` returns the tag histogram. |
-| **TOOL-5** | 🔵 | activity_monitor — study | `{action:"study", anyTags:["verify:fail"]}` | Model summarizes the failing slice; root-cause style output. |
-| **TOOL-6** | 🟢 | activity_monitor — tail file | *(api)* `{action:"tail_file", file:"server.log", text:"ERROR"}` | Returns only matching lines from the external log file. |
+| **TOOL-3** | 🟢 | media_analysis | `{ file: screenshot, prompt: "is the primary button teal and un-clipped?" }`; repeat with a `.pdf`, `.mp3`, `.mp4` | Returns `details.analysis` grounded in the attachment; `details.analyzed[]` reports the inferred `kind`/`mimeType` and `inline` (false for video). |
+| **TOOL-4** | 🟢 | activity_search | after a run, `activity_search{anyTags:["mutation"]}` | Returns only mutation log lines; `activity_tags{}` returns the tag histogram. |
+| **TOOL-5** | 🔵 | activity_study | `{anyTags:["verify:fail"]}`, and `{traceId}` after a trace | Model summarizes the failing slice; root-cause style output. |
+| **TOOL-6** | 🟢 | activity_tail_file | *(api)* `{file:"server.log", text:"ERROR"}` | Returns only matching lines from the external log file. |
+| **TOOL-7** | 🟢 | web_search | `{query:"vite 7 breaking changes", site:"vite.dev"}`, with and without a browser MCP attached | Navigates the browser MCP to the search URL and scrapes hits (`{url,title?,snippet?}`); with no browser MCP, a clear "needs a browser MCP" error rather than a bash/curl fallback. |
+| **TOOL-8** | 🟢 | web_fetch | a docs page, a long page, a nav failure, a server with no `browser_evaluate` | Returns the RENDERED text (client-side pages included); truncation reported; falls back to the accessibility snapshot when evaluate is missing; a blank render is explained, not returned empty. |
+| **TOOL-9** | 🟢 | trace workflow | `activity_trace_start` → model's own `read`/`edit` inserting `__t()` → `activity_collect{traceId, waitMs}` → `activity_study{traceId}` → `activity_cleanup` | Each step is a SEPARATE tool call in the transcript; `activity_collect` emits `tool_execution_update` while waiting. No hidden sub-loop edits files. |
 
 ---
 

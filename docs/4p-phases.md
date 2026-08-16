@@ -1,13 +1,22 @@
 # The 4P phases
 
-The 4P model splits a coding operation into four phases with distinct jobs and toolsets. Prompts live in `phases/prompts.ts` (`PHASE_PROMPTS`) and default toolsets in `PHASE_DEFAULT_TOOLS`; both are exported so you can inspect or override them. Every phase shares one authoritative definition of the four jobs (`PHASE_DEFINITIONS`, injected into all four prompts) so provider/tool routing and handoffs are grounded in the same contract.
+> **Note:** The 4P decomposition is the **legacy** path. The primary entry point
+> is now the flat loop driver — see [`loop.md`](./loop.md). The 4P
+> `runChain`/`runPhase` methods remain as back-compat shims and still behave as
+> documented here; new code should call `run`.
+
+The 4P model splits a coding operation into four phases with distinct jobs and toolsets. Prompts live in `phases/prompts.ts` and default toolsets in `PHASE_DEFAULT_TOOLS`; both are exported so you can inspect or override them.
+
+A phase's system prompt is **assembled from the tools that phase actually resolved**: `buildPhaseSystemPrompt(phase, toolNames)` (and `buildLoopSystemPrompt(toolNames)` for the flat loop) keeps the situational guidance blocks whose tools are attached and drops the rest — no `assets_generator` means no generated-media guidance, no browser/web tools means no scraping ladder. Guidance for a tool the run does not have cannot be acted on, and it dilutes the guidance that can; for Perform this typically halves the system prompt. `PHASE_PROMPTS` / `LOOP_SYSTEM_PROMPT` remain exported as the **full** text (every block included) for inspection and for hosts that assemble their own.
+
+One thing is never situational: `COMPLEXITY_CONTRACT`, the single definition of the `low`/`medium`/`high` scale and the `ui`/`svg`/`code` category, is injected into Prepare, Plan, Perform and the loop. All three produce ratings that the next stage **inherits** (Prepare rates each file → Plan rates each task → Perform declares per `write`/`edit` call, and the rating pins the authoring model), so the word has to mean the same thing in every producer. Every phase shares one authoritative definition of the four jobs (`PHASE_DEFINITIONS`, injected into all four prompts) so provider/tool routing and handoffs are grounded in the same contract.
 
 ## The shared contract
 
 - **Prepare** — prepare the run for this directory. Search the folder, find the files relevant to the task, walk **graph memory** to collect dependent / blast-radius files, and choose which MCPs/skills each later phase should receive. Read-only. Every kept file carries a **reasoning** (`why`) and a **complexity** rating (`low`/`medium`/`high`). Its handover is the shortlist of relevant file addresses + reasoning + complexity + the per-phase provider routing — **not** every read it performed.
 - **Plan** — read the handed-over files and chalk out an executable plan of **ordered steps**. A single-repo task produces **one** plan; a complex / multi-repo task produces **multiple** plans with an explicit **execution order**. Read-only, plus any MCP/skill Prepare assigned to Plan.
 - **Perform** — execute the plan's tasks **in order** with `read`/`write`/`edit` (plus any assigned MCP/skill). When Plan produced multiple plans, Perform runs **once per plan** in execution order.
-- **Perfect** — quality assurance. It receives the changed files, derives a **QA plan** from the tech stack, and verifies — API calls via `bash`, a browser/mobile MCP to drive & screenshot the app (handing the screenshot to `ui_screen_auditor` when present, else checking element dimensions), tests, or typecheck. PASS ⇒ done. FAIL ⇒ it emits a **plan-like `FIX`** describing exactly what broke, which the next Perform run repairs.
+- **Perfect** — quality assurance. It receives the changed files, derives a **QA plan** from the tech stack, and verifies — API calls via `bash`, a browser/mobile MCP to drive & screenshot the app (handing the screenshot to `media_analysis` when present, else checking element dimensions), tests, or typecheck. PASS ⇒ done. FAIL ⇒ it emits a **plan-like `FIX`** describing exactly what broke, which the next Perform run repairs.
 
 ## The shared output contract (every phase)
 
@@ -26,7 +35,7 @@ Each phase's own **payload** (below) precedes this trailer.
 
 **Job:** as above. Read-only, memory-first.
 
-**Default tools:** `read`, `project_memory`, `file_memory`, `graph_memory` (no shell/`ls`/`grep`).
+**Default tools:** `read`, `mark_concern_lines`, `project_memory`, `file_memory`, `graph_memory` (no shell/`ls`/`grep`).
 
 **Discovery order:** project memory → `file_memory.search` → `graph_memory` blast-radius → `read` to confirm.
 
@@ -43,7 +52,7 @@ r.uiSummary;          // user-facing status
 
 **Job:** turn the Prepare briefing into one or more ordered implementation plans. Read-only.
 
-**Default tools:** `read`, `bash_readonly`, `file_memory`, `graph_memory`, plus any MCP/skill Prepare assigned to Plan (mutating `bash` is blocked).
+**Default tools:** `read`, `mark_concern_lines`, `bash_readonly`, `file_memory`, `graph_memory`, plus any MCP/skill Prepare assigned to Plan (mutating `bash` is blocked).
 
 **Output contract:**
 - `PLAN_JSON` — **single-repo tasks.** A JSON array of ordered task objects: `{ id, title, summary, files, fileMutations, changes, complexity, tools, verification, risks }`. `complexity` is `low|medium|high` and is inherited by Perform's edits/writes.
@@ -62,9 +71,11 @@ r.artifacts?.planJson;     // raw legacy array (single-plan back-compat)
 
 **Job:** execute the plan's tasks in order. Reads **and** mutations. Multiple plans ⇒ one Perform pass per plan (see below).
 
-**Default tools:** `read`, `write`, `edit`, `bash`, `assets_generator`, `file_memory`, `graph_memory`.
+**Default tools:** `read`, `mark_concern_lines`, `write`, `edit`, `bash`, `assets_generator`, `file_memory`, `graph_memory`.
 
 **Complexity inheritance:** when a task marks a file `high`, the read/edit/write on that file inherits that rating — the permission request's `complexityRating` / `complexitySource` reflect it and per-call model selection honors it (see [Complexity inheritance](#complexity-inheritance)).
+
+**Authoring model (host opt-in):** a host may pin a *different* model to author a `write`/`edit` call by returning `authorModel` from the permission callback. By the time the callback runs, the requesting model has already emitted its draft args — so Model B authors the on-disk bytes via an internal LLM call inside the tool, given the task, PLAN_JSON, and surrounding file snippets. `write`: B's content replaces the draft. `edit`: B authors the replacement; Model A's `oldString` anchor is kept. Contrast with `model`, which only swaps the model that *processes* the result on the next turn. See `PermissionDecision.authorModel` in `docs/api-reference.md`.
 
 **Output contract:** payload `CHANGES` (every file/asset created or modified, by address), then the shared trailer `SUMMARY` / `UI SUMMARY` / `TOOL CHAIN`. Generated assets flow forward as `PhaseResult.refs`.
 
@@ -72,7 +83,7 @@ r.artifacts?.planJson;     // raw legacy array (single-plan back-compat)
 
 **Job:** verify — adversarially — that Perform met the acceptance criteria, using a QA plan derived from the tech stack.
 
-**Default tools:** `bash` (tests/typecheck/API probes), `read`, `ui_screen_auditor`, `graph_memory`, plus any Perfect-categorized MCPs you add (browser, mobile, sqlite).
+**Default tools:** `bash` (tests/typecheck/API probes), `read`, `mark_concern_lines`, `media_analysis`, `graph_memory`, plus any Perfect-categorized MCPs you add (browser, mobile, sqlite).
 
 **Output contract:** payload `QA_PLAN` (JSON: `{ stack, checks: [{ id, description, method, targets, passed, evidence }] }`), `VERDICT: PASS|FAIL`, and on FAIL a plan-like `FIX:` with per-check file paths and observed-vs-expected evidence; then the shared trailer `SUMMARY` / `UI SUMMARY` / `TOOL CHAIN`.
 
@@ -130,7 +141,12 @@ if (!res.success) {
 }
 ```
 
-Tune with `maxChainIterations` (default 3) and per-phase `maxSteps`.
+Tune with `maxChainIterations` (default 3). Per-phase `maxSteps` is optional and
+unset by default: a phase runs until its model stops calling tools, and a loop
+that stops making progress (repeating calls, or every call failing) is ended by
+the stall guard — see [the loop](loop.md#stall-detection). A tool that keeps
+failing is escalated first: bash fallback → `ask_user_question` → an honest report
+of the blocker ([the ladder](loop.md#when-a-tool-keeps-failing-bash--the-user--honest-stop)).
 
 ## Phases as composable tools (req #3/#4)
 
@@ -156,7 +172,7 @@ tool = { name: "smoke_check", phases: ["perfect"], /* ... */ };
 **2. `phaseTools` as an exact pinned list** — replace a phase's toolset entirely:
 
 ```ts
-new Harness({ phaseTools: { perfect: [myPlaywrightAudit, uiAuditorTool, bashTool] } });
+new Harness({ phaseTools: { perfect: [myPlaywrightAudit, mediaAnalysisTool, bashTool] } });
 ```
 
 **3. `phaseTools` as a filter** — include/exclude on top of the 4P category:
@@ -164,7 +180,7 @@ new Harness({ phaseTools: { perfect: [myPlaywrightAudit, uiAuditorTool, bashTool
 ```ts
 new Harness({
   phaseTools: {
-    perfect: { fromCategory: true, exclude: ["ui_screen_auditor"], include: ["bash"], providers: ["playwright"] },
+    perfect: { fromCategory: true, exclude: ["media_analysis"], include: ["bash"], providers: ["playwright"] },
   },
 });
 ```

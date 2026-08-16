@@ -307,11 +307,27 @@ function renderSymbols(symbols: SymbolGraphNode[]): string[] {
   return symbols.length ? symbols.map((node) => `- ${node.qualifiedName} (${node.symbolKind}) in ${node.filePath}${node.capabilityLevel ? ` [${node.capabilityLevel}]` : ""}`) : ["(none)"];
 }
 
+/**
+ * "Where is this symbol?" answered with the location, not a count.
+ *
+ * This summary used to be `Matches: 1` plus a bare name and kind — everything
+ * except the one fact the question was about. A real run asked for
+ * `showDeleteConfirmationModal`, got back `Matches: 1 / Preview:
+ * showDeleteConfirmationModal (function)`, learned nothing it did not already
+ * know, and went back to grepping. The path was sitting in `details` the whole
+ * time, where the model never sees it: only `output` reaches the conversation.
+ */
 function summarizeFindSymbol(nodes: SymbolGraphNode[]): string {
   if (!nodes.length) return "(no matching symbols)";
-  const preview = nodes
-    .slice(0, 5)
-    .map((node) => `${node.qualifiedName} (${node.symbolKind})`)
-    .join(", ");
-  return `Matches: ${nodes.length}\nPreview: ${preview}${nodes.length > 5 ? ", ..." : ""}`;
+  const lines = nodes
+    .slice(0, 10)
+    .map((node) => {
+      const where = node.range?.start ? `${node.filePath}:${node.range.start}` : node.filePath;
+      return `- ${node.qualifiedName} (${node.symbolKind}) — ${where}`;
+    });
+  return [
+    `Matches: ${nodes.length}`,
+    ...lines,
+    ...(nodes.length > 10 ? [`(+${nodes.length - 10} more)`] : []),
+  ].join("\n");
 }

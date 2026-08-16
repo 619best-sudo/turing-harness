@@ -33,7 +33,7 @@ const { session: s, memory } = await harness.createProjectSession({ cwd: "/repos
 
 ## What each preset sets up
 
-All categories keep the shared internal tools (`bash`, `read`, `write`, `edit`, `ls`, `grep`, `assets_generator`, `ui_screen_auditor`, `activity_monitor`) mapped across the phases, and add category MCPs:
+All categories keep the shared internal tools (`bash`, `read`, `write`, `edit`, `ls`, `grep`, `assets_generator`, `media_analysis`, `activity_monitor`) mapped across the phases, and add category MCPs:
 
 ### 🖥️ frontend
 | Phase | Adds (MCP) |
@@ -49,7 +49,7 @@ Models: Prepare haiku · Plan opus · Perform sonnet · Perfect sonnet.
 | Phase | Adds (MCP) |
 |-------|-----------|
 | Prepare / Plan | Context7 |
-| Perfect | mobile-mcp (mobile-next: simulators/devices, screenshots, vision element-finding) |
+| Perfect | built-in `mobile_*` toolkit over [mobilecli](https://github.com/mobile-next/mobilecli) (simulators/devices, native-resolution screenshots, element tree, input) |
 
 Models: Prepare haiku · Plan opus · Perform sonnet · **Perfect gemini-2.5-pro** (vision for device screenshots).
 
@@ -83,7 +83,7 @@ The exact servers in each preset (2026):
 | `figma` | Figma (`figma-developer-mcp`) | plan, perform | `env.FIGMA_API_KEY` |
 | `playwright` | Playwright (`@playwright/mcp`) | perfect | — |
 | `chrome-devtools` | Chrome DevTools (`chrome-devtools-mcp`) | perfect | — |
-| `mobile` | mobile-mcp (`@mobilenext/mobile-mcp`) | perfect | simulator/device |
+| `mobile` | none — device automation is built in (`mobilecli` binary) | perform, perfect | simulator/device |
 | `godot` | Godot MCP | all | editor + bridge |
 | `postgres` | Postgres (`@modelcontextprotocol/server-postgres`) | all | `dbUrl` |
 | `filesystem` | Filesystem (`@modelcontextprotocol/server-filesystem`) | prepare, perform | — |

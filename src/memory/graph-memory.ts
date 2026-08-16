@@ -32,38 +32,13 @@ import type {
   SymbolGraphNode,
 } from "./graph-adapters/base.js";
 import { createFrameworkOverlays } from "./graph-overlays/conventions.js";
+import { IGNORED_PROJECT_DIRS } from "../project-tree.js";
 
 export const GRAPH_MEMORY_VERSION = 1;
 const DEFAULT_DIR = ".turing";
 const DEFAULT_MAX_FILE_SIZE = 512 * 1024;
 const MAX_RENDER_ITEMS = 120;
-const IGNORED_DIRS = new Set([
-  ".astro",
-  ".build",
-  ".dart_tool",
-  ".expo",
-  ".git",
-  ".gradle",
-  ".idea",
-  ".next",
-  ".nuxt",
-  ".pytest_cache",
-  ".svelte-kit",
-  ".turing",
-  ".tox",
-  ".venv",
-  ".zig-cache",
-  "bin",
-  "coverage",
-  "DerivedData",
-  "dist",
-  "node_modules",
-  "obj",
-  "out",
-  "target",
-  "vendor",
-  "venv",
-]);
+const IGNORED_DIRS = new Set(IGNORED_PROJECT_DIRS);
 const MOBILE_ARTIFACT_DIRS_BY_ROOT = new Map<string, Set<string>>([
   ["android", new Set([".cxx", ".gradle", "build"])],
   ["ios", new Set([".symlinks", "Flutter", "Pods", "build", "xcuserdata"])],

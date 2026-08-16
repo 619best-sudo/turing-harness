@@ -227,6 +227,72 @@ test("Perfect emits a normalized QA plan; every phase emits uiSummary + toolChai
   assert.equal(perfect?.qaPlan?.checks?.[0]?.passed, true);
 });
 
+test("every phase emits a lightweight phase_summary event with uiSummary + handoff (2-plan single iteration)", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-mp-"));
+  const fileA = path.join(tmp, "service.ts");
+  const fileB = path.join(tmp, "config.ts");
+  await fs.writeFile(fileA, "old-a");
+  await fs.writeFile(fileB, "old-b");
+
+  const { llm } = makeMultiPlanStub({ fileA, fileB });
+  const orch = new Orchestrator({
+    cwd: tmp, llm, registry: newRegistryWithBuiltins(),
+    permission: new PermissionGate("bypass"), logStore: new LogStore(),
+    maxChainIterations: 1,
+  });
+  const summaries = [];
+  orch.subscribe((e) => {
+    if (e.type === "phase_summary") summaries.push(e);
+  });
+  await orch.runChain("update both repos");
+
+  // prepare(1) + plan(1) + perform(2, one per plan) + perfect(1) = 5 phase ends.
+  assert.equal(summaries.length, 5, "phase_summary fires once per phase end (2 plans ⇒ 2 perform passes)");
+  assert.deepEqual(
+    summaries.map((s) => s.phase),
+    ["prepare", "plan", "perform", "perform", "perfect"],
+    "phase order is correct",
+  );
+
+  // Each carries the user-facing uiSummary from the stub's UI SUMMARY: section.
+  assert.equal(summaries[0].uiSummary, "Found the two files that matter.");
+  assert.equal(summaries[2].uiSummary, "Updated one file.");
+  assert.equal(summaries[4].uiSummary, "Everything verified.");
+
+  // Each carries a structured handoff with correct from→to wiring.
+  assert.equal(summaries[0].handoff?.from, "prepare");
+  assert.equal(summaries[0].handoff?.to, "plan");
+  assert.equal(summaries[3].handoff?.from, "perform");
+  assert.equal(summaries[3].handoff?.to, "perfect");
+  assert.equal(summaries[4].handoff?.from, "perfect");
+  assert.equal(summaries[4].handoff?.to, undefined, "perfect has no next phase");
+});
+
+test("phase_summary.handoff.reasoning carries the next-phase briefing (SUMMARY), NOT the UI card", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-mp-"));
+  const fileA = path.join(tmp, "service.ts");
+  const fileB = path.join(tmp, "config.ts");
+  await fs.writeFile(fileA, "old-a");
+  await fs.writeFile(fileB, "old-b");
+
+  const { llm } = makeMultiPlanStub({ fileA, fileB });
+  const orch = new Orchestrator({
+    cwd: tmp, llm, registry: newRegistryWithBuiltins(),
+    permission: new PermissionGate("bypass"), logStore: new LogStore(),
+    maxChainIterations: 1,
+  });
+  const result = await orch.runChain("update both repos");
+
+  const prepare = result.phases.prepare;
+  // Regression guard: handoff.reasoning is the SUMMARY briefing, not the
+  // UI SUMMARY card (which flows separately via uiSummary / phase_summary).
+  assert.equal(prepare?.handoff?.reasoning, prepare?.summary);
+  assert.equal(prepare?.handoff?.reasoning, "prepared a two-repo change");
+  assert.notEqual(prepare?.handoff?.reasoning, prepare?.uiSummary);
+  // The UI card still reaches the host via the dedicated field/event.
+  assert.equal(prepare?.uiSummary, "Found the two files that matter.");
+});
+
 test("prompts define the 4P contract, multi-plan output, QA plan, and common handoff params", () => {
   for (const p of ["prepare", "plan", "perform", "perfect"]) {
     assert.match(PHASE_PROMPTS[p], /THE 4P CONTRACT/, `${p} carries the shared 4P contract`);

@@ -35,9 +35,26 @@ function or(
  * overridden by the consumer. Modalities gate model selection for attachments.
  */
 export const MODEL_CATALOG: Record<string, Model> = {
-  "poolside/laguna-xs-2.1": or("poolside/laguna-xs-2.1", "Laguna XS 2.1", {
-    input: ["text", "image", "file"],
-    contextWindow: 256_000,
+  "xiaomi/mimo-v2.5": or("xiaomi/mimo-v2.5", "Xiaomi MiMo v2.5", {
+    // TEXT ONLY — driver/study/summarizer model. Registered explicitly so an
+    // UNREGISTERED slug does not fall through to the permissive unknown-model
+    // default (which claims image support): the modality list gates whether an
+    // image is serialised into a request, so a blind model advertised as sighted
+    // sends a screenshot into a provider rejection and kills the turn. Text-only is
+    // the safe direction to be wrong in. Verify against OpenRouter before widening.
+    input: ["text"],
+    contextWindow: 1_048_576,
+    maxTokens: 32_000,
+  }),
+  "tencent/hy3": or("tencent/hy3", "Tencent Hy3", {
+    // TEXT ONLY — verified against OpenRouter (`input_modalities: ["text"]`).
+    // Registered explicitly (rather than falling through to the permissive
+    // unknown-slug default, which claims image support) so the harness's vision
+    // guard correctly treats hy3 as blind: an image-bearing write escalated to
+    // hy3 falls through to a vision-capable candidate instead of being sent to a
+    // model that would reject the whole request.
+    input: ["text"],
+    contextWindow: 262_144,
     maxTokens: 32_000,
   }),
   "bytedance-seed/seed-2.0-mini": or("bytedance-seed/seed-2.0-mini", "Seed 2.0 Mini", {
@@ -64,7 +81,8 @@ export const MODEL_CATALOG: Record<string, Model> = {
     maxTokens: 32_000,
   }),
   "openai/gpt-5": or("openai/gpt-5", "GPT-5", {
-    input: ["text", "image", "audio", "file"],
+    // No audio input — verified against OpenRouter.
+    input: ["text", "image", "file"],
     cost: { input: 2.5e-6, output: 10e-6, cacheRead: 0.25e-6, cacheWrite: 0 },
   }),
   "google/gemini-2.5-pro": or("google/gemini-2.5-pro", "Gemini 2.5 Pro", {
@@ -77,15 +95,25 @@ export const MODEL_CATALOG: Record<string, Model> = {
     cost: { input: 0.3e-6, output: 2.5e-6, cacheRead: 0.075e-6, cacheWrite: 0 },
     contextWindow: 1_000_000,
   }),
+  "google/gemini-3.7-flash": or("google/gemini-3.7-flash", "Gemini 3.7 Flash", {
+    input: ["text", "image", "audio", "video", "file"],
+    cost: { input: 0.3e-6, output: 2.5e-6, cacheRead: 0.075e-6, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+  }),
 };
 
 /** Default models used per 4P phase when nothing else is specified. */
 export const DEFAULT_PHASE_MODELS = {
-  prepare: "poolside/laguna-xs-2.1",
-  plan: "poolside/laguna-xs-2.1",
-  perform: "poolside/laguna-xs-2.1",
-  perfect: "poolside/laguna-xs-2.1",
-  orchestrator: "poolside/laguna-xs-2.1",
+  prepare: "xiaomi/mimo-v2.5",
+  plan: "xiaomi/mimo-v2.5",
+  perform: "xiaomi/mimo-v2.5",
+  perfect: "xiaomi/mimo-v2.5",
+  // NOTE: `phaseModelSlug` never indexes this key — it resolves a phase, then
+  // falls back to a HOST-supplied `models.orchestrator`, then to the per-phase
+  // entry above. So this entry is documentation of the default driver, not a
+  // switch: changing it alone changes nothing, which is why the four phases
+  // above moved with it.
+  orchestrator: "xiaomi/mimo-v2.5",
 } as const;
 
 /**

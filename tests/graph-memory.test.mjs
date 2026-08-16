@@ -77,13 +77,20 @@ function makeSummaryLlm() {
   };
 }
 
-function makeHarness() {
-  return new Harness({ permissionMode: "bypass", llm: makeSummaryLlm() });
+function makeHarness(t) {
+  const harness = new Harness({ permissionMode: "bypass", llm: makeSummaryLlm() });
+  // Dispose even when the test throws. The harness holds a recursive fs watcher
+  // per project, and an assertion failure that skips the explicit dispose() at
+  // the end of a test leaves that handle open — which does not fail the run, it
+  // HANGS it: every test reports its result and then the process never exits.
+  // Registering the teardown here means a future failure stays a failure.
+  t.after(() => harness.dispose());
+  return harness;
 }
 
-test("createProjectSession creates and loads graph memory", async () => {
+test("createProjectSession creates and loads graph memory", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const first = await harness.createProjectSession({ cwd, connectMcp: false });
   assert.ok(first.graphMemory, "graphMemory should be attached");
   assert.equal(first.graphMemory.wasCreated, true, "graphMemory should be created on first open");
@@ -99,9 +106,9 @@ test("createProjectSession creates and loads graph memory", async () => {
   await harness.dispose();
 });
 
-test("graph_memory returns file deps, symbol deps, and blast radius in one call", async () => {
+test("graph_memory returns file deps, symbol deps, and blast radius in one call", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
   const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
   assert.ok(tool, "graph_memory tool should exist");
@@ -127,10 +134,10 @@ test("graph_memory returns file deps, symbol deps, and blast radius in one call"
   await harness.dispose();
 });
 
-test("graph memory stale detection and refresh work", async () => {
+test("graph memory stale detection and refresh work", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "b.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const initial = await harness.createProjectSession({ cwd, connectMcp: false });
   assert.equal(initial.graphMemory?.getFileNode(target)?.stale, false, "file graph should start fresh");
 
@@ -148,10 +155,10 @@ test("graph memory stale detection and refresh work", async () => {
   await harness.dispose();
 });
 
-test("project watcher refreshes graph memory immediately after file changes", async () => {
+test("project watcher refreshes graph memory immediately after file changes", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "b.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const first = await harness.createProjectSession({ cwd, connectMcp: false });
   const second = await harness.createProjectSession({ cwd, connectMcp: false });
 
@@ -170,9 +177,9 @@ test("project watcher refreshes graph memory immediately after file changes", as
   await harness.dispose();
 });
 
-test("memory:false disables graph memory", async () => {
+test("memory:false disables graph memory", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session, graphMemory } = await harness.createProjectSession({ cwd, memory: false, connectMcp: false });
   assert.equal(graphMemory, undefined, "graphMemory should be disabled");
   await assert.rejects(fs.access(path.join(cwd, ".turing", "graph.json")));
@@ -180,7 +187,7 @@ test("memory:false disables graph memory", async () => {
   await harness.dispose();
 });
 
-test("graph memory supports representative non-TS ecosystems at file graph level", async () => {
+test("graph memory supports representative non-TS ecosystems at file graph level", async (t) => {
   const pythonCwd = await mkFiles({
     "pyproject.toml": "[project]\nname='demo'\n",
     "app/main.py": "from app.routes import router\nfrom app.services import do_work\n",
@@ -198,7 +205,7 @@ test("graph memory supports representative non-TS ecosystems at file graph level
     "internal/service/service.go": "package service\nfunc Run() {}\n",
   }, "graph-go-");
 
-  const harness = makeHarness();
+  const harness = makeHarness(t);
 
   const py = await harness.createProjectSession({ cwd: pythonCwd, connectMcp: false });
   const pyMain = path.join(pythonCwd, "app", "main.py");
@@ -220,7 +227,7 @@ test("graph memory supports representative non-TS ecosystems at file graph level
   await harness.dispose();
 });
 
-test("graph memory preserves per-language identity and resolves suffix-based module layouts across the extended matrix", async () => {
+test("graph memory preserves per-language identity and resolves suffix-based module layouts across the extended matrix", async (t) => {
   const kotlinCwd = await mkFiles({
     "build.gradle.kts": "plugins { kotlin('jvm') version '2.0.0' }\n",
     "src/main/kotlin/com/demo/Application.kt": "import com.demo.service.UserService\nfun main() { UserService().run() }\n",
@@ -249,7 +256,7 @@ test("graph memory preserves per-language identity and resolves suffix-based mod
     "src/service.zig": "pub fn run() void {}\n",
   }, "graph-misc-");
 
-  const harness = makeHarness();
+  const harness = makeHarness(t);
 
   const kotlin = await harness.createProjectSession({ cwd: kotlinCwd, connectMcp: false });
   const kotlinMain = path.join(kotlinCwd, "src", "main", "kotlin", "com", "demo", "Application.kt");
@@ -278,7 +285,7 @@ test("graph memory preserves per-language identity and resolves suffix-based mod
   await harness.dispose();
 });
 
-test("graph memory builds symbol graphs for parser-backed non-TS language adapters", async () => {
+test("graph memory builds symbol graphs for parser-backed non-TS language adapters", async (t) => {
   const pythonCwd = await mkFiles({
     "pyproject.toml": "[project]\nname='demo'\n",
     "app/service.py": "class Service:\n    def run(self):\n        return helper()\n\ndef helper():\n    return 1\n",
@@ -304,7 +311,7 @@ test("graph memory builds symbol graphs for parser-backed non-TS language adapte
     "Sources/App/Service.swift": "struct Service {\n  func run() {\n    helper()\n  }\n}\nfunc helper() {}\n",
   }, "graph-symbol-swift-");
 
-  const harness = makeHarness();
+  const harness = makeHarness(t);
 
   const python = await harness.createProjectSession({ cwd: pythonCwd, connectMcp: false });
   assert.ok(python.graphMemory?.findSymbol({ filePath: path.join(pythonCwd, "app", "service.py"), symbol: "run" }).length);
@@ -339,7 +346,7 @@ test("graph memory builds symbol graphs for parser-backed non-TS language adapte
   await harness.dispose();
 });
 
-test("graph memory ignores Android/iOS build artifacts but keeps native source files", async () => {
+test("graph memory ignores Android/iOS build artifacts but keeps native source files", async (t) => {
   const cwd = await mkFiles({
     "android/app/src/main/java/com/demo/MainActivity.java": "package com.demo;\npublic class MainActivity {}\n",
     "android/build/generated/source/buildConfig/debug/com/demo/BuildConfig.java": "package com.demo;\npublic class BuildConfig {}\n",
@@ -349,7 +356,7 @@ test("graph memory ignores Android/iOS build artifacts but keeps native source f
     "ios/Flutter/Generated.xcconfig": "// generated\n",
     "ios/Pods/Pods.xcodeproj/project.pbxproj": "// pods project\n",
   }, "graph-mobile-ignore-");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { graphMemory } = await harness.createProjectSession({ cwd, connectMcp: false });
 
   assert.ok(graphMemory?.getFileNode(path.join(cwd, "android", "app", "src", "main", "java", "com", "demo", "MainActivity.java")));
@@ -366,7 +373,7 @@ test("graph memory ignores Android/iOS build artifacts but keeps native source f
   await harness.dispose();
 });
 
-test("framework overlays add convention edges and capability-aware query notes", async () => {
+test("framework overlays add convention edges and capability-aware query notes", async (t) => {
   const cwd = await mkFiles({
     "package.json": JSON.stringify({ dependencies: { next: "15", react: "19" } }),
     "app/page.tsx": "export default function Page() { return null; }\n",
@@ -375,7 +382,7 @@ test("framework overlays add convention edges and capability-aware query notes",
     "routes/web.php": "<?php\n",
     "app/Http/Controllers/HomeController.php": "<?php\nclass HomeController {}\n",
   }, "graph-overlay-");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { graphMemory, session } = await harness.createProjectSession({ cwd, connectMcp: false });
   const nextPage = path.join(cwd, "app", "page.tsx");
   const nextDeps = graphMemory?.fileDeps(nextPage, "outbound");
@@ -388,7 +395,10 @@ test("framework overlays add convention edges and capability-aware query notes",
     path: path.join(cwd, "routes", "web.php"),
     symbol: "missing",
   }, toolCtx(cwd, harness));
-  assert.ok(Array.isArray(phpSymbol.details.notes), "partial ecosystems should surface notes");
+  // symbol_deps returns a lazy detail envelope, so the payload has to be read
+  // back through it — `details.notes` is undefined by construction.
+  const phpSymbolResult = await readLazyGraphResult(phpSymbol);
+  assert.ok(Array.isArray(phpSymbolResult.notes), "partial ecosystems should surface notes");
 
   await harness.dispose();
 });

@@ -41,9 +41,9 @@ async function main() {
   assert(s2.toolsForPhase("perform").some((t) => t.name === "migrate"), "categorizer routed mutation → perform");
 
   // ---- 3. phaseTools as an exact pinned list -----------------------------
-  const only = [tool("playwright"), tool("mobile_mcp")];
+  const only = [tool("playwright"), tool("mobile_tap")];
   const s3 = harness.createSession({ phaseTools: { perfect: only } });
-  assert.deepEqual(s3.toolsForPhase("perfect").map((t) => t.name).sort(), ["mobile_mcp", "playwright"], "exact pinned list");
+  assert.deepEqual(s3.toolsForPhase("perfect").map((t) => t.name).sort(), ["mobile_tap", "playwright"], "exact pinned list");
   // built-ins still exist for other phases
   assert(s3.toolsForPhase("perform").some((t) => t.name === "write"), "other phases untouched");
 
@@ -51,12 +51,12 @@ async function main() {
   const s4 = harness.createSession({
     phaseTools: {
       // start from the perfect category, drop the auditor, add bash + a custom tool
-      perfect: { fromCategory: true, exclude: ["ui_screen_auditor"], include: ["bash"] },
+      perfect: { fromCategory: true, exclude: ["media_analysis"], include: ["bash"] },
     },
     providers: [{ id: "extra", kind: "tool", source: "external", name: "extra", tools: [tool("db_check", { phases: ["perfect"] })] }],
   });
   const p4 = s4.toolsForPhase("perfect").map((t) => t.name);
-  assert(!p4.includes("ui_screen_auditor"), "filter excluded auditor");
+  assert(!p4.includes("media_analysis"), "filter excluded auditor");
   assert(p4.includes("bash") && p4.includes("db_check"), "filter included bash + kept category tool");
 
   // ---- 5. phaseTools as a resolver function ------------------------------
@@ -73,8 +73,8 @@ async function main() {
   assert(!s6.toolsForPhase("plan").some((t) => t.name === "write"), "write not in plan initially");
   s6.setToolPhases("write", ["plan", "perform"]);         // move a tool
   assert(s6.toolsForPhase("plan").some((t) => t.name === "write"), "tool moved into plan at runtime");
-  s6.setProviderPhases("builtin:ui_screen_auditor", ["plan"]); // move a whole provider
-  assert(s6.toolsForPhase("plan").some((t) => t.name === "ui_screen_auditor"), "provider moved into plan");
+  s6.setProviderPhases("builtin:media_analysis", ["plan"]); // move a whole provider
+  assert(s6.toolsForPhase("plan").some((t) => t.name === "media_analysis"), "provider moved into plan");
   s6.setPhaseTools("perform", [tool("only_this", { mutates: true })]); // swap phase toolset live
   assert.deepEqual(s6.toolsForPhase("perform").map((t) => t.name), ["only_this"], "runtime setPhaseTools");
   s6.setPhaseTools("perform", undefined);                 // revert

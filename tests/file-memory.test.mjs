@@ -135,13 +135,20 @@ function makeSummaryLlm() {
   };
 }
 
-function makeHarness() {
-  return new Harness({ permissionMode: "bypass", llm: makeSummaryLlm() });
+function makeHarness(t) {
+  const harness = new Harness({ permissionMode: "bypass", llm: makeSummaryLlm() });
+  // Dispose even when the test throws. The harness holds a recursive fs watcher
+  // per project, and an assertion failure that skips the explicit dispose() at
+  // the end of a test leaves that handle open — which does not fail the run, it
+  // HANGS it: every test reports its result and then the process never exits.
+  // Registering the teardown here means a future failure stays a failure.
+  t.after(() => harness.dispose());
+  return harness;
 }
 
-test("createProjectSession creates and loads file memory for large projects", async () => {
+test("createProjectSession creates and loads file memory for large projects", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
 
   const first = await harness.createProjectSession({ cwd, connectMcp: false });
   assert.ok(first.fileMemory, "fileMemory should be attached");
@@ -162,9 +169,9 @@ test("createProjectSession creates and loads file memory for large projects", as
   await harness.dispose();
 });
 
-test("file_memory search returns ranked results in one call across 100+ files", async () => {
+test("file_memory search returns ranked results in one call across 100+ files", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
   const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
@@ -178,9 +185,9 @@ test("file_memory search returns ranked results in one call across 100+ files", 
   await harness.dispose();
 });
 
-test("file_memory search supports typo-aware fuzzy fallback for misspellings", async () => {
+test("file_memory search supports typo-aware fuzzy fallback for misspellings", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
   const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
@@ -202,9 +209,9 @@ test("file_memory search supports typo-aware fuzzy fallback for misspellings", a
   await harness.dispose();
 });
 
-test("file_memory keeps exact matches ahead of fuzzy neighbors when direct ranking is strong", async () => {
+test("file_memory keeps exact matches ahead of fuzzy neighbors when direct ranking is strong", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
   const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
@@ -226,9 +233,9 @@ test("file_memory keeps exact matches ahead of fuzzy neighbors when direct ranki
   await harness.dispose();
 });
 
-test("file_memory tags and summaries cover representative non-JS ecosystems", async () => {
+test("file_memory tags and summaries cover representative non-JS ecosystems", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session, fileMemory } = await harness.createProjectSession({ cwd, connectMcp: false });
   const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
@@ -249,9 +256,9 @@ test("file_memory tags and summaries cover representative non-JS ecosystems", as
   await harness.dispose();
 });
 
-test("file_memory exposes semantic summaries and expanded framework tags without reading the source file", async () => {
+test("file_memory exposes semantic summaries and expanded framework tags without reading the source file", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { fileMemory } = await harness.createProjectSession({
     cwd,
     connectMcp: false,
@@ -288,7 +295,7 @@ test("file_memory exposes semantic summaries and expanded framework tags without
   await harness.dispose();
 });
 
-test("file_memory ignores Android/iOS build artifacts but keeps native source files", async () => {
+test("file_memory ignores Android/iOS build artifacts but keeps native source files", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "file-memory-mobile-"));
   const files = {
     "android/app/src/main/java/com/demo/MainActivity.java": "package com.demo;\npublic class MainActivity {}\n",
@@ -305,7 +312,7 @@ test("file_memory ignores Android/iOS build artifacts but keeps native source fi
     await fs.writeFile(file, content);
   }
 
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { fileMemory } = await harness.createProjectSession({ cwd: dir, connectMcp: false });
   assert.ok(fileMemory.get(path.join(dir, "android", "app", "src", "main", "java", "com", "demo", "MainActivity.java")));
   assert.ok(fileMemory.get(path.join(dir, "ios", "App", "AppDelegate.swift")));
@@ -318,10 +325,10 @@ test("file_memory ignores Android/iOS build artifacts but keeps native source fi
   await harness.dispose();
 });
 
-test("external edits become stale on reopen and refresh clears staleness", async () => {
+test("external edits become stale on reopen and refresh clears staleness", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
 
   const initial = await harness.createProjectSession({ cwd, connectMcp: false });
   assert.equal(initial.fileMemory?.get(target)?.stale, false, "fresh file should not start stale");
@@ -354,9 +361,9 @@ test("external edits become stale on reopen and refresh clears staleness", async
   await harness.dispose();
 });
 
-test("memory:false disables file memory", async () => {
+test("memory:false disables file memory", async (t) => {
   const cwd = await mkproject();
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const { session, fileMemory } = await harness.createProjectSession({ cwd, memory: false, connectMcp: false });
   assert.equal(fileMemory, undefined, "fileMemory should be disabled when memory:false");
   await assert.rejects(fs.access(path.join(cwd, ".turing", "files.json")));
@@ -364,10 +371,10 @@ test("memory:false disables file memory", async () => {
   await harness.dispose();
 });
 
-test("background hydration upgrades summaries and watcher refreshes changed files", async () => {
+test("background hydration upgrades summaries and watcher refreshes changed files", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const first = await harness.createProjectSession({ cwd, connectMcp: false });
 
   await first.fileMemoryRuntime?.drain();
@@ -401,6 +408,13 @@ test("project watcher defers file-memory refresh while a session run is active",
   const watcher = new ProjectWatcherRuntime({ cwd });
   const seen = [];
   try {
+    // `mkproject()` writes a hundred-odd files immediately before this, and the
+    // watcher keeps receiving their trailing fs events for a beat afterwards.
+    // Subscribe only once those have drained, so the deferred batch under test
+    // contains the file this test actually edited and nothing else — otherwise
+    // the assertion below is a race against project setup.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
     watcher.subscribe("session-1", {
       fileMemoryRuntime: {
         onExternalFileChange: async (filePath) => {
@@ -431,10 +445,10 @@ test("project watcher defers file-memory refresh while a session run is active",
   }
 });
 
-test("manual refresh mode delays full LLM sync until explicitly requested and persists project sync state", async () => {
+test("manual refresh mode delays full LLM sync until explicitly requested and persists project sync state", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const first = await harness.createProjectSession({
     cwd,
     connectMcp: false,
@@ -468,10 +482,10 @@ test("manual refresh mode delays full LLM sync until explicitly requested and pe
   await harness.dispose();
 });
 
-test("watcher does not run llm before enablement and resumes changed-file llm refresh after enablement", async () => {
+test("watcher does not run llm before enablement and resumes changed-file llm refresh after enablement", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
-  const harness = makeHarness();
+  const harness = makeHarness(t);
   const first = await harness.createProjectSession({
     cwd,
     connectMcp: false,

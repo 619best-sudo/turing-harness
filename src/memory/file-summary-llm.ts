@@ -1,7 +1,7 @@
 import type { AssistantMessage, Context, LLMBridge } from "../types.js";
 import { FILE_MEMORY_SUMMARY_VERSION, cleanSummary, dedupeStrings } from "./file-memory.js";
 
-export const DEFAULT_FILE_SUMMARIZER_MODEL = "poolside/laguna-xs-2.1";
+export const DEFAULT_FILE_SUMMARIZER_MODEL = "xiaomi/mimo-v2.5";
 
 export interface FileSummaryLlmInput {
   llm: LLMBridge;
@@ -97,6 +97,10 @@ export async function summarizeFileWithLlm(input: FileSummaryLlmInput): Promise<
     temperature: 0,
     signal: input.signal,
     maxTokens: Math.min(model.maxTokens ?? 2048, 800),
+    // The 800-token ceiling is for the JSON body. Without a reasoning bound a
+    // reasoning model spends all 800 thinking, returns no content, and the
+    // resulting parse failure re-queues the file forever.
+    reasoningMaxTokens: 200,
   });
   const text = assistantText(message);
   const parsed = parseJsonObject(text);

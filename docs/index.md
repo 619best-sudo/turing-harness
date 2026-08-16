@@ -12,6 +12,18 @@ A coding-agent orchestration library built on the **4P model** — **Prepare →
 | [The 4P phases](./4p-phases.md) | Deep dive on each phase, the chain, and verify/retry |
 | [Project presets](./project-presets.md) | Ready-made frontend / mobile / games / backend setups |
 | [Project memory](./project-memory.md) | Durable per-project memory; auto-detects tech stack on first init |
+| [File search](./file-search.md) | The memory-first search ladder: project → file → graph memory, shell only as a fallback |
+| [Web, scraping & automation](./web-and-scraping.md) | Version-first debugging research, scraping/automation as first-class work, capturing a UI to rebuild |
+| [Reading & changing code](./code-changes.md) | The complexity gate (low proceeds, medium/high escalate) and the six places edits break |
+| [The plan tool](./plan-tool.md) | `create_plan`: per-file task breakdown, approval/revision, attachments, the isCompleted ledger |
+| [Assets](./assets.md) | `assets_generator`: generate pixels, author vectors, and why an animated SVG is declined |
+| [Inspiration](./inspiration.md) | `inspiration_generator`: section blueprints when there is no reference, and borrowing a layout without borrowing a brand |
+| [Media analysis](./media-analysis.md) | `media_analysis`: OCR / UI / component / QA lenses, screenshotting a live page, and analysing before planning |
+| [Tool coverage](./tool-coverage.md) | Which tools carry guidance, which are still bare, and how "defaults, not policy" works |
+| [Asking the user](./asking-the-user.md) | `ask_user_question`: which decisions are theirs, which are yours, and how to ask in one click |
+| [Debugging](./debugging.md) | `activity_*`: who runs the app, where to instrument, browser logs that survive, fix→prove→revert |
+| [The QA sequence](./qa-sequence.md) | log → build → run → inspect → logs → decide; why QA belongs to the verify pass, reaching the right device, and the refusals that enforce it |
+| [Shell execution](./shell-execution.md) | The environment commands run in, project-pinned toolchains (fvm/gradlew/.venv), and capturing a booted simulator with no MCP |
 | [API reference](./api-reference.md) | Every exported class, function, and type |
 | [Test plan](./test-plan.md) | Real-project, real-prompt test cases for every feature |
 | [Guides & recipes](./guides.md) | Add an MCP server, custom asset backend, permission policies, per-phase models, logging, Electron |
@@ -46,7 +58,7 @@ The library was built to a specific 7-point spec; each maps to code as follows.
 | 3 | MCP/skills registry with get/add/delete + 4P category | `registry/registry.ts`, `registry/categorize.ts`, `mcp/client.ts` |
 | 4 | 4P chain; standalone phases; Perfect→Perform retry | `orchestrator/orchestrator.ts`, `orchestrator/phase-runner.ts` |
 | 5 | Customizable per-phase & per-tool models over OpenRouter | `llm/openrouter.ts`, `llm/models.ts`, `orchestrator` model resolution |
-| 6 | Internal tools: assets_generator, ui_screen_auditor, activity_monitor | `tools/builtin/*` |
+| 6 | Internal tools: assets_generator, media_analysis, activity_monitor | `tools/builtin/*` |
 | 7 | No orchestrator file-reasoning/writes; permission gate + model selection by complexity/attachments | `orchestrator/phase-runner.ts`, `orchestrator/permission.ts`, `llm/model-selector.ts` |
 
 See [architecture](./architecture.md) for the full picture.

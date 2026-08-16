@@ -80,7 +80,7 @@ async function main() {
   assert(session.memory === memory, "memory attached to session");
   // mobile preset policy is applied from the memory-derived category.
   await session.runChain("build");
-  assert(session.toolsForPhase("perfect").some((t) => t.name === "ui_screen_auditor"), "mobile preset verification tool applied from memory-derived category");
+  assert(session.toolsForPhase("perfect").some((t) => t.name === "media_analysis"), "mobile preset verification tool applied from memory-derived category");
   // project_memory tool registered
   assert(session.toolsForPhase("prepare").some((t) => t.name === "project_memory"), "project_memory tool available");
 

@@ -1,0 +1,2728 @@
+/**
+ * The flat tool loop — a pi-agent-style, phase-agnostic work loop.
+ *
+ * Each call runs a completion-driven turn loop: stream a model turn, walk its tool calls,
+ * route each through the permission gate (permission callback fires here),
+ * estimate complexity + select the per-call model, execute the tool, and feed
+ * the result back into one growing message history — until the model produces a
+ * turn with no tool calls (the normal end: the work is done), stalls, aborts, or
+ * hard-errors. There is no step cap by default; `maxSteps` is opt-in.
+ *
+ * All four callbacks are honored inside this loop:
+ *   - permission: `permission.evaluate(req)` before every tool call.
+ *   - model:      `decision.model` / `decision.authorModel` re-pin the driver.
+ *   - complexity: `estimateComplexity` per call; inherited ratings honored.
+ *   - category:   the `phase` field on PermissionRequest (kept for back-compat).
+ *
+ * This is the loop core extracted from the old phase-runner; it carries no
+ * phase-specific guards, opening scaffolding, or extraction — those live in the
+ * caller. The orchestrator drives one sub-loop per plan step (or one for a
+ * planless run) plus a final summary turn.
+ */
+import { PROBE_MARKER_RE } from "../probe-marker.js";
+import type {
+  ImageContent,
+  AgentEvent,
+  AgentTool,
+  AskUserQuestionRequest,
+  AskUserQuestionResult,
+  AssistantMessage,
+  AuthoringContext,
+  Complexity,
+  ComplexityRating,
+  ComplexitySource,
+  Context,
+  LLMBridge,
+  MediaRef,
+  LiveImage,
+  Message,
+  Model,
+  Phase,
+  ReadFileContent,
+  Tool,
+  ToolResultMessage,
+  Usage,
+} from "../types.js";
+import {
+  asComplexityCategory,
+  asComplexityRating,
+  emptyUsage,
+  ratingToScore,
+  scoreToRating,
+} from "../types.js";
+import type { LogStore } from "../logging/logger.js";
+import type { Registry } from "../registry/registry.js";
+import { isMalformedToolArgs, MALFORMED_TOOL_ARGS_KEY } from "../llm/bridge.js";
+import { classify } from "../exec/run-commands.js";
+import { PermissionGate } from "./permission.js";
+import { StallGuard, STEP_BUDGET_EXHAUSTED } from "./stall-guard.js";
+import { ReproductionGate, instrumentationTarget, parseReproduceDeclaration } from "./reproduction-gate.js";
+import { ClarifyGate } from "./clarify-gate.js";
+import { QaGate } from "./qa-gate.js";
+import { VerificationGate } from "./verification-gate.js";
+import type { VerifyStageTracker } from "./verify-stages.js";
+import { ToolFallbackAdvisor, type FallbackAdvice } from "./tool-fallback.js";
+import { SearchLadderAdvisor, type SearchAdvice } from "./search-ladder.js";
+import { nameBeforeFraming, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage } from "./tool-suggest.js";
+import { coerceStringArgs, coercionNote, type CoercedArg } from "./tool-arg-coercion.js";
+import { isSourceFile } from "./straightforward-assessor.js";
+import { estimateComplexity, selectModel } from "../llm/model-selector.js";
+import { compactHistory, historySize, pruneHistoricalMedia, resolveCompactionThreshold } from "./compaction.js";
+import { designReferenceFromBrief } from "../tools/builtin/design-skill.js";
+import { generateAssetsFromReference } from "./asset-generation.js";
+import type { GeneratedAssetRef } from "../types.js";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+/** Inputs to a single loop invocation. */
+export interface ToolLoopInput {
+  /** The originating task (for authoring context + logging). */
+  task: string;
+  /**
+   * What THIS loop invocation was asked to do, when that is narrower than `task`.
+   *
+   * `task` is run-level and outlives every turn in the run ("build a solar system
+   * animation"). The authoring model is handed one anchor and asked what should
+   * replace it, so a run-level string is the wrong altitude: on a follow-up turn
+   * ("now rename the title to ToottyFruity") it states an intent that has already
+   * been satisfied, and B authors toward the stale goal instead of the live one.
+   * The observed failure was B rewriting a title to describe the run task while
+   * the actual instruction never appeared in its prompt at all.
+   *
+   * Set this to the current step's / turn's instruction; `task` remains the
+   * fallback for callers that have nothing narrower. This is the ONLY intent
+   * channel that works under `authorOnlyWrites`, where the schema gives Model A
+   * no `content`/`newString` field in which to express the change.
+   */
+  authoringTask?: string;
+  /** Optional system prompt; defaults to a minimal work prompt. */
+  systemPrompt?: string;
+  /** Initial user message content (text or text+image blocks). */
+  userMessage: string | import("../types.js").UserContent[];
+  /** Optional prior context to seed the conversation (follow-up continuity). */
+  priorMessages?: Message[];
+  /** Executable tools available this loop. */
+  tools: AgentTool[];
+  /**
+   * Optional dynamic tool resolver. When provided, the loop calls this at the
+   * start of every turn to refresh the tool set — allowing MCP servers that
+   * connect mid-run to surface their tools without restarting the loop.
+   * When omitted, the static `tools` array is used for the entire loop.
+   */
+  resolveTools?: () => AgentTool[];
+  /** The model driving the loop turns. */
+  model: Model;
+  /** Candidate model slugs the permission layer may pick from for tool calls. */
+  toolModelCandidates?: string[];
+  /**
+   * Multimodal model used to DESCRIBE images a tool returns when the run's own
+   * model cannot read them. Without it a blind run loses tool screenshots
+   * entirely; with it, it gets them as text.
+   */
+  visionModel?: string;
+  /**
+   * Host-owned escalation routing: (kind, rating) → model slug. Consulted for
+   * write/edit authoring here, and handed to tools via `ctx.routeModel` so the
+   * staged `read` resolves its comprehension model from the same table.
+   */
+  routeModel?: import("../types.js").ModelRouter;
+  llm: LLMBridge;
+  permission: PermissionGate;
+  registry?: Registry;
+  logStore: LogStore;
+  emit: (e: AgentEvent) => void;
+  cwd: string;
+  signal?: AbortSignal;
+  /**
+   * Optional hard cap on turns. Unset by default: the loop runs until the model
+   * stops calling tools, and `StallGuard` ends it if it stops making progress.
+   * When set, the loop also injects a wind-down note as the cap nears.
+   */
+  maxSteps?: number;
+  /**
+   * Characters of conversation above which older turns are summarised away.
+   *
+   * Defaults to the `TURING_COMPACT_THRESHOLD_CHARS` env var, then to 300k
+   * (~75k tokens). Pass `Infinity` to disable for one loop. This exists because
+   * bounding each tool result stops ONE result from ending a run, but forty
+   * bounded results still add up to a request the provider refuses.
+   */
+  compactThresholdChars?: number;
+  temperature?: number;
+  /** Reasoning effort for the loop's turns. */
+  reasoning?: import("../types.js").ThinkingLevel;
+  transcriptMode?: import("../types.js").TranscriptMode;
+  /**
+   * When set, overrides what `transcriptMode` would imply for reasoning blocks.
+   * `transcriptMode: "compact"` otherwise seeds this off — which is a real trap:
+   * emission can only be turned back on by a TOOL CALL's permission decision, so
+   * a compact run silently discards the whole first turn's thinking, and discards
+   * it entirely on a turn that calls no tools. A host that wants the model's
+   * reasoning in a compact transcript must be able to say so up front.
+   */
+  emitReasoning?: boolean;
+  /** Same, for assistant text. Defaults to `false` under `transcriptMode: "compact"`. */
+  emitText?: boolean;
+  /**
+   * Optional host callback for `ask_user_question`; when provided the tool blocks
+   * in-place for the answer and the model continues in the same conversation.
+   */
+  askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>;
+  /** Host callback for `create_plan` review (approve / re-plan with comments). */
+  planApproval?: import("../types.js").PlanApprovalCallback;
+  /**
+   * The run's live attachment set — forwarded to write/edit authoring, and to
+   * `ctx.images` for every tool that reads it.
+   *
+   * `LiveImage` rather than a bare path/mime pair so each entry keeps the ROLE
+   * attachment triage assigned it. Visual verification depends on that role: a
+   * live capture is compared against the run's design mockup, never against an
+   * `informational` attachment that merely happened to be listed first.
+   */
+  images?: LiveImage[];
+  /** Per-path complexity inherited from a plan task (raises the call's floor). */
+  complexityByPath?: Record<string, ComplexityRating>;
+  /** Where the inherited per-path complexity came from. */
+  complexitySource?: "prepare-file" | "plan-task";
+  /**
+   * The phase label stamped onto PermissionRequest.phase for back-compat. The
+   * loop is phase-agnostic, but the client may still key on `phase`; a step
+   * sub-loop reports "perform" so existing policies keep working.
+   */
+  phase?: Phase;
+  /**
+   * Whether this run is fixing a REPORTED BUG.
+   *
+   * Turns on the reproduce-before-you-edit gate: the first `write`/`edit` is
+   * refused until something has actually observed the broken behaviour. Off by
+   * default, because a greenfield feature has nothing to reproduce.
+   */
+  isBugFix?: boolean;
+  /**
+   * The reproduce-before-you-edit gate, threaded in by the orchestrator so a
+   * multi-step bug fix reproduces ONCE (not once per step). When omitted, the
+   * loop creates a fresh one scoped to this single invocation — the original
+   * behavior, preserved for standalone `runToolLoop` callers.
+   */
+  reproductionGate?: ReproductionGate;
+  /**
+   * The verify-what-you-wrote gate, threaded in by the orchestrator so the same
+   * instance observes every work loop of a run. Passive here: the loop only
+   * feeds it writes and tool results; enforcement (the verify sub-loops and the
+   * summary hold) lives in the orchestrator.
+   */
+  verificationGate?: VerificationGate;
+  /**
+   * The ask-before-you-invent gate, threaded in by the orchestrator so one
+   * refusal covers the whole run rather than one per step. When omitted the loop
+   * creates an INERT one (no task ⇒ never active), so standalone `runToolLoop`
+   * callers are unaffected.
+   */
+  clarifyGate?: ClarifyGate;
+  /**
+   * The staged-verify tracker, threaded in by the orchestrator for the verify
+   * sub-loops. Passive here: the loop feeds it the same write/probe/capture
+   * signals it already feeds the gates; the orchestrator reads its `stage()` to
+   * pick the next round's message. Omitted for work loops and standalone callers.
+   */
+  verifyStageTracker?: VerifyStageTracker;
+  /**
+   * The QA sequencing gate, threaded in by the orchestrator so the writes a WORK
+   * loop made are the writes the VERIFY pass's freshness rule measures against.
+   * It enforces three things prose could not: QA belongs to the verify pass, a
+   * capture must be of a surface running the new code, and a run going in
+   * circles on a screen should ask the user instead. Omitted ⇒ inert (the loop
+   * creates one with no writes recorded, so nothing can trip).
+   */
+  qaGate?: QaGate;
+  /** Optional plan JSON handed to the authoring context. */
+  planJson?: unknown[];
+  /** Optional surrounding-file snippets handed to the authoring context. */
+  attachedFileContents?: ReadFileContent[];
+  attachedContextFiles?: ReadFileContent[];
+  /**
+   * The detected project category, threaded live so the post-Prepare correction
+   * is seen here. Drives the non-UI skip: when `"backend"`, the
+   * inspiration/design-skill reference ladder is bypassed (no UI to design) and
+   * the inspiration/assets tools decline when the model invokes them directly.
+   */
+  projectCategory?: import("../presets/project-presets.js").ProjectCategory;
+  /**
+   * Initial media fact seed: informational OCR/text lifted out of attachments by
+   * the orchestrator's triage pre-pass, so the very first write/edit already
+   * carries it as known context (the loop would otherwise only learn a media
+   * fact from a mid-run media_analysis call). The loop's `mediaFact`
+   * accumulator is seeded with this and appended to across the run.
+   */
+  mediaFact?: string;
+  /**
+   * Optional callback to triage an image a user supplies MID-RUN (in answer to
+   * `ask_user_question`). Without it, such images join `images` un-enriched (the
+   * legacy behavior). When provided, the loop runs the same describe→ocr pre-pass
+   * the orchestrator runs on initial attachments and folds the extracted `fact`
+   * into the `mediaFact` accumulator, so a spec/screenshot dropped after the run
+   * started is understood exactly like one attached up front. A triage failure
+   * resolves to `undefined` and the image is kept as a raw live image.
+   */
+  triageAttachment?: (img: { path: string; mimeType: string }) => Promise<{ fact?: string; note?: string; category?: string } | undefined>;
+  /** Label for logging only. */
+  label?: string;
+}
+
+/** Result of a single loop invocation. */
+export interface ToolLoopResult {
+  /** The final assistant message (last streamed turn). */
+  finalMessage?: AssistantMessage;
+  /** The full message history produced by this loop. */
+  messages: Message[];
+  /** Concatenated text of the final assistant message. */
+  finalText: string;
+  /** Aggregated token usage across all turns. */
+  usage: Usage;
+  /** Media/artifact refs accumulated. */
+  refs: MediaRef[];
+  /** Max complexity score observed across tool calls. */
+  maxComplexity: number;
+  /** Files actually written/edited during this loop (success-only). */
+  writtenPaths: string[];
+  /**
+   * Files that had activity-monitor probe markers (`__t()`/`__TRACE` etc.)
+   * written into them this loop. Tracked so the orchestrator can refuse run
+   * completion while instrumentation remains, and so `activity_cleanup` can
+   * name the files to strip. A superset-tracking best-effort: markers a model
+   * writes into a file we never see the content of are missed, but the common
+   * case (the loop-mediated write/edit that inserted `__t()`) is caught.
+   */
+  instrumentedPaths: string[];
+  /** Files successfully read during this loop (success-only). */
+  readPaths: string[];
+  /** All confirmed paths touched by tool calls. */
+  discoveredPaths: string[];
+  /** A pending clarifying question that paused the loop, if any. */
+  pendingUserQuestion?: AskUserQuestionRequest;
+  /**
+   * A plan produced by the `create_plan` tool during this loop. Surfaced here so
+   * the orchestrator can execute a TOOL-authored plan the same way it executes
+   * one scraped from the planning turn's text.
+   */
+  planSet?: import("../types.js").PlanSet;
+  /** Hard error (LLM/transport/tool) that ended the loop early, if any. */
+  error?: string;
+}
+
+/**
+ * Run the tool loop to completion. Returns the accumulated history + final message.
+ * Throws never — aborts and hard errors are captured in the result.
+ */
+export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult> {
+  const { llm, permission, emit, cwd, signal, logStore } = input;
+  // No step cap by default: the loop runs until the model stops calling tools.
+  // A fixed number was always the wrong control — it cut real multi-file work
+  // mid-edit (with no summary, so the run looked "complete") while doing nothing
+  // about a model that had genuinely gone in circles. Non-convergence is caught
+  // by `StallGuard` (repetition / all-calls-failed) instead. A host may still set
+  // `maxSteps` explicitly; when it does, the wind-down below applies.
+  const maxSteps = input.maxSteps ?? Infinity;
+  // Characters of history above which the loop summarises its older turns. Env
+  // configurable so a host on a small-context model can lower it without a code
+  // change; see `resolveCompactionThreshold`.
+  const compactThreshold = input.compactThresholdChars ?? resolveCompactionThreshold();
+  const boundedSteps = Number.isFinite(maxSteps);
+  const stallGuard = new StallGuard();
+  // Use the run-scoped gate if the orchestrator threaded one in (so a multi-step
+  // bug fix reproduces once, not per step). Otherwise create a single-invocation
+  // gate — the original behavior for standalone callers.
+  const reproductionGate = input.reproductionGate ?? new ReproductionGate({ enabled: input.isBugFix === true });
+  // An unarmed gate by default: without the router's verdict there is nothing to
+  // enforce, so a standalone `runToolLoop` caller behaves exactly as before.
+  const clarifyGate = input.clarifyGate ?? new ClarifyGate();
+  // Same run-scoped shape, and it MUST be run-scoped to work at all: the
+  // freshness rule compares "when did you last write" against "when did you last
+  // deploy", and those two happen in different loops. A per-loop gate would
+  // start the verify pass believing nothing had been written and wave through
+  // the capture of a stale build — the exact failure it exists to stop.
+  const qaGate = input.qaGate ?? new QaGate();
+  // Populated as source files are read below; consumed by the gate's block-time
+  // assessment, registered once COMPLEXITY_BY_PATH exists (see below).
+  const readContentByPath = new Map<string, string>();
+  const fallbackAdvisor = new ToolFallbackAdvisor();
+  // Enforces the file-search order — memory index first, shell search only after
+  // memory has actually been tried and come back empty.
+  const searchLadder = new SearchLadderAdvisor();
+  // When only this many steps remain, inject a system note telling the model to
+  // stop calling tools and produce its summary. Graceful wind-down beats a hard
+  // cut that leaves the run looking "complete" but unfinished.
+  const wrapUpRemaining = 5;
+  let toolByName = new Map(input.tools.map((t) => [t.name, t]));
+  const phase = input.phase ?? "perform";
+
+  logStore.append({
+    tags: ["loop", ...(input.label ? [`loop:${input.label}`] : [])],
+    level: "info",
+    message: input.label ? `start loop: ${input.label}` : "start loop",
+  });
+
+  const userContent = input.userMessage;
+  const messages: Message[] = input.priorMessages ? [...input.priorMessages] : [];
+  messages.push({ role: "user", content: userContent, timestamp: Date.now() });
+
+  const context: Context = {
+    systemPrompt: input.systemPrompt,
+    messages,
+    tools: toToolDefs(input.tools),
+  };
+
+  let usage = emptyUsage();
+  // Latest inspiration lookup this loop; the last call wins, since a second
+  // lookup means the model rejected the first reference.
+  let designReference: unknown[] | undefined;
+  // Assets the harness generated to fulfill the media roles `designReference`
+  // described (image/video/audio). Threaded into authoring so a fresh UI write
+  // embeds real paths instead of placeholders. Set alongside designReference.
+  let generatedAssets: GeneratedAssetRef[] | undefined;
+  // Informational facts lifted from a `media_analysis` result (OCR text of an
+  // `informational` attachment). Append-only: a run may triage several images,
+  // each contributing a fact the authoring pass should know. Mirror of
+  // `designReference` — captured from a tool result, fed to the next write/edit.
+  // Seeded from the orchestrator's attachment triage pre-pass (`input.mediaFact`)
+  // so the first write/edit carries triaged info without a mid-run analysis.
+  let mediaFact: string | undefined = input.mediaFact;
+  // A resolved `ask_user_question` carries the user's answer in its tool result.
+  // The driver sees it in conversation, but the authoring model does not — and
+  // under `authorOnlyWrites` the driver has no `content`/`newString` field in
+  // which to express the answer, so the bytes are authored without it. Fold the
+  // Q&A into the authoring intent, exactly as `mediaFact`/`designReference` are
+  // folded, so the next write/edit authors toward the clarified instruction
+  // rather than the run-level goal. Append-only: a run may ask more than once.
+  let clarification: string | undefined;
+  // The run's LIVE attachment set. Seeded from what the host supplied, and grown
+  // when the user hands a file over mid-run via `ask_user_question`.
+  //
+  // A fixed `input.images` was the reason asking for a file achieved nothing:
+  // the agent could request the mockup, the user could send it, and the very
+  // next write would still author from prose — the file was named in a tool
+  // result and never looked at again. An attachment that arrives mid-run has to
+  // reach the same places one attached up front does, or asking for it is a
+  // round trip that costs the user an interruption and buys nothing.
+  const liveImages: LiveImage[] = [...(input.images ?? [])];
+  const LIVE_IMAGE_PATHS = new Set(liveImages.map((i) => i.path));
+  const refs: MediaRef[] = [];
+  const discoveredPaths: string[] = [];
+  const readPaths: string[] = [];
+  const writtenPaths: string[] = [];
+  // Paths seen to contain activity-monitor probe markers this loop. Tracked for
+  // the orchestrator's post-verify "strip instrumentation" check and for
+  // `activity_cleanup`. Deduped via INSTRUMENTED_WITH like writtenPaths.
+  const instrumentedPaths: string[] = [];
+  const PATHS_WITH = new Set<string>();
+  const READ_WITH = new Set<string>();
+  const WRITTEN_WITH = new Set<string>();
+  const INSTRUMENTED_WITH = new Set<string>();
+  // Seeded from the plan step's ratings, then MUTATED during the run as tools
+  // measure the artifacts they touch (see `measuredComplexity` below).
+  const COMPLEXITY_BY_PATH = new Map<string, ComplexityRating>();
+  // Register the read-files provider so the gate can run the straightforwardness
+  // assessor at BLOCK TIME (when a mutation is about to be refused), seeing the
+  // FULL read set. Lifting after each read instead would lift on a synchronous
+  // first file before the model reads the file carrying the async marker.
+  //
+  // Each entry carries the MEASURED rating from the staged read that loaded it.
+  // Without it the assessor judges "is this fix straightforward?" on file COUNT
+  // and async tokens alone — and the count is derived from what has been read so
+  // far, so reading LESS makes a bug look simpler. That gradient points the wrong
+  // way: read-one-file-then-edit is the pattern the gate exists to stop, and it
+  // was the pattern earning the lift. Registered here, after the map it reads.
+  reproductionGate.setReadFilesProvider(() =>
+    [...readContentByPath.entries()].map(([p, content]) => {
+      const rating = COMPLEXITY_BY_PATH.get(normalizeToolPath(cwd, p));
+      return { path: p, content, ...(rating ? { rating } : {}) };
+    }),
+  );
+  for (const [filePath, rating] of Object.entries(input.complexityByPath ?? {})) {
+    COMPLEXITY_BY_PATH.set(normalizeToolPath(cwd, filePath), rating);
+  }
+  /** Paths whose rating came from a tool measuring the file, not from the plan.
+   *  Tracked so the permission request can report the honest `complexitySource`. */
+  const MEASURED_PATHS = new Set<string>();
+  const MUTATING_TOOLS = new Set(["write", "edit"]);
+  const READ_TOOLS = new Set(["read", "ls", "grep", "cat"]);
+  const ATTACHED_FILE_CONTENTS = new Map(
+    [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])].map((file) => [
+      normalizeToolPath(cwd, file.path),
+      file.content,
+    ] as const),
+  );
+  const readCache = new Map<string, string>();
+  let maxComplexity = 0;
+  let lastAssistant: AssistantMessage | undefined;
+  let error: string | undefined;
+  let pendingUserQuestion: AskUserQuestionRequest | undefined;
+  let producedPlanSet: import("../types.js").PlanSet | undefined;
+
+  // Live UI-emission axes + reasoning effort + driver model (same semantics as
+  // the old phase runner: a TOOL decision may flip them for subsequent turns).
+  // An explicit seed wins over what transcriptMode implies. Without this, the
+  // only way emission ever turns on is the permission decision inside the tool
+  // loop below — i.e. after the first turn has already streamed and been
+  // dropped, and never at all on a turn that calls no tools.
+  const seedCompact = input.transcriptMode === "compact";
+  let liveEmitText = input.emitText ?? !seedCompact;
+  let liveEmitReasoning = input.emitReasoning ?? !seedCompact;
+  let liveReasoningLevel = input.reasoning;
+  let liveModel = input.model;
+  // Did ANY turn actually come back with thinking? See the end-of-loop check.
+  let sawThinkingContent = false;
+
+  // Log the starting toolset by name. "The model only used bash" has two very
+  // different causes — the tool was never registered, or it was registered and
+  // the model didn't pick it — and they are indistinguishable from the outside.
+  // Only refreshes were logged before, so a run that never gained or lost a tool
+  // left no record of what it started with. Memory tools are called out
+  // separately because they are the ones that go missing: `registerBuiltins`
+  // does NOT include them (see tools/index.ts), so they exist only when the host
+  // went through `Harness.createProjectSession` with memory enabled.
+  {
+    const names = [...toolByName.keys()].sort();
+    const memoryTools = names.filter((n) => n.endsWith("_memory"));
+    logStore.append({
+      tags: ["loop", "tools"],
+      level: memoryTools.length === 0 ? "warn" : "info",
+      message:
+        `loop starting with ${names.length} tools` +
+        (memoryTools.length === 0
+          ? "; NO memory tools registered — the search ladder will fall through to the shell " +
+            "(project_memory/file_memory/graph_memory are registered only by createProjectSession)"
+          : `; memory: ${memoryTools.join(", ")}`),
+      data: { tools: names, memoryTools },
+    });
+  }
+
+  // Per-tool streak of consecutive calls rejected for missing/empty required
+  // arguments. A model that emits empty tool calls (e.g. `bash {}`) burns turns
+  // one rejected call at a time, because the rejections are interspersed with
+  // successful reads and so never trip the all-error stall guard. This escalates
+  // the nudge as the streak grows so the model stops flailing.
+  const missingArgStreak = new Map<string, number>();
+  // TOTAL empty-argument rejections per tool this loop, which the consecutive
+  // streak above cannot see. The streak resets on every well-formed call, so a
+  // model that alternates good call / `bash {}` / good call / `bash {}` never
+  // gets past streak 1 — which is exactly what one run did, eight times, each
+  // one a wasted call answered with the same message it had already ignored.
+  const missingArgTotal = new Map<string, number>();
+
+  try {
+    for (let step = 0; step < maxSteps; step++) {
+      if (signal?.aborted) throw new DOMExceptionLike("aborted");
+
+      // Prune old inlined media BEFORE sizing/compacting. Captures (screenshots,
+      // audio, video, file bytes) arrive as base64 blocks that otherwise
+      // accumulate one per turn and balloon every subsequent request; keeping
+      // only the most recent captures also stops them from tripping compaction
+      // (which summarises away load-bearing text context — a user's ask_user
+      // answer, completed edits — and is how a run "forgets" what it just did
+      // and re-asks the same question).
+      pruneHistoricalMedia(context.messages);
+
+      // Compact BEFORE the turn, so the request about to be sent is the smaller
+      // one. Doing it after a failed send would be too late — the provider has
+      // already rejected it and the turn is lost.
+      if (historySize(context.messages) > compactThreshold) {
+        const compaction = await compactHistory({
+          messages: context.messages,
+          llm,
+          model: liveModel ?? input.model,
+          threshold: compactThreshold,
+          ...(signal ? { signal } : {}),
+        });
+        if (compaction.compacted) {
+          context.messages = compaction.messages;
+          usage = addUsage(usage, compaction.usage);
+          logStore.append({
+            timestamp: Date.now(),
+            level: "info",
+            tags: ["loop", "loop:compacted"],
+            message:
+              `compacted history at step ${step + 1}: freed ${compaction.savedChars.toLocaleString("en-US")} chars ` +
+              `(threshold ${compactThreshold.toLocaleString("en-US")})`,
+            ...(input.label ? { data: { label: input.label } } : {}),
+          });
+        }
+      }
+
+      // Dynamic tool resolution: re-resolve the tool set each turn so MCP servers
+      // that connected mid-run become visible to the model without restarting.
+      if (input.resolveTools) {
+        const fresh = input.resolveTools();
+        const prevNames = new Set([...toolByName.keys()]);
+        const newNames = new Set(fresh.map((t) => t.name));
+        const added = [...newNames].filter((n) => !prevNames.has(n));
+        const removed = [...prevNames].filter((n) => !newNames.has(n));
+        if (added.length || removed.length) {
+          toolByName = new Map(fresh.map((t) => [t.name, t]));
+          context.tools = toToolDefs(fresh);
+          logStore.append({
+            tags: ["loop", "tools"],
+            level: "info",
+            message: `loop tool refresh: ${added.length} added, ${removed.length} removed`,
+            data: { added, removed },
+          });
+        }
+      }
+
+      emit({ type: "turn_start" });
+      const assistant = await streamToMessage(llm, liveModel, context, emit, {
+        temperature: input.temperature,
+        reasoning: liveReasoningLevel,
+        signal,
+        emitText: liveEmitText,
+        emitReasoning: liveEmitReasoning,
+      });
+      lastAssistant = assistant;
+      if (assistant.content.some((c) => c.type === "thinking")) sawThinkingContent = true;
+      usage = addUsage(usage, assistant.usage);
+      context.messages.push(assistant);
+      liveModel = input.model;
+
+      // A straightforward-fix declaration travels in the assistant text that
+      // accompanies (or precedes) the write/edit call. Parse it before the
+      // per-call gate check so the declaration lifts the gate for THIS call,
+      // not the next one. A skip is recorded by the gate and surfaces in its
+      // report, so it is auditable rather than a silent give-up.
+      const assistantText = assistant.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const reproDecl = parseReproduceDeclaration(assistantText);
+      if (reproDecl) reproductionGate.declareStraightforward(reproDecl.reason);
+
+      if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
+        error = assistant.errorMessage ?? (assistant.stopReason === "aborted" ? "aborted" : undefined);
+        emit({ type: "turn_end", message: assistant, toolResults: [] });
+        break;
+      }
+      if (signal?.aborted) break;
+
+      const toolCalls = assistant.content.filter((c) => c.type === "toolCall");
+      if (toolCalls.length === 0) {
+        emit({ type: "turn_end", message: assistant, toolResults: [] });
+        break;
+      }
+
+      const toolResults: Message[] = [];
+      for (const call of toolCalls) {
+        if (call.type !== "toolCall") continue;
+
+        // ---- recover a call whose NAME carries leaked provider framing ----
+        // Some endpoints delimit tool calls with sentinel tokens, and a
+        // mis-segmented stream puts them in the `name` field:
+        // `read<|channel|>clipboard`, `bash<|tool_call_begin|>…`. The arguments
+        // usually survive intact, and when they do the call is fully recoverable
+        // — the model asked for a real tool with real arguments and the
+        // transport mangled one field.
+        //
+        // It was not being recovered. The whole call was rejected as an unknown
+        // tool, with a message asserting the arguments were empty — which in the
+        // observed run was FALSE: `read<|channel|>clipboard` arrived with
+        // `{path, offset: 670, limit: 50}` and was refused anyway. The model
+        // re-issued it three different ways across three turns before getting
+        // through. Repairing the name costs nothing and cannot change intent:
+        // only the leading identifier is trusted, and only when it names a tool
+        // that actually exists.
+        if (!toolByName.has(call.name) && !isMalformedToolArgs(call.arguments)) {
+          const recovered = nameBeforeFraming(call.name, toolByName.keys());
+          if (recovered && call.arguments && Object.keys(call.arguments).length > 0) {
+            logStore.append({
+              tags: ["loop", "tools", "tools:framing-recovered"],
+              level: "warn",
+              message: `tool name arrived with provider framing; recovered "${recovered}" and ran the call`,
+              data: { requested: call.name, recovered, ...(input.label ? { label: input.label } : {}) },
+            });
+            call.name = recovered;
+          }
+        }
+
+        const tool = toolByName.get(call.name);
+        const mutates = tool?.mutates ?? true;
+        const argPath = (call.arguments as { path?: unknown } | undefined)?.path;
+
+        // ---- argument validation: reject empty/missing required args up front ----
+        // Unknown argument keys are detected here but surfaced as a non-blocking
+        // warning appended to the tool RESULT (after it runs), so the call still
+        // executes under the lenient historic contract while the model learns the
+        // tool's real schema. Hoisted so it is in scope at the result-assembly.
+        let unknownArgs: Array<{ key: string; suggestion?: string }> = [];
+        // ---- argument COERCION, before validation ----
+        // A string argument that arrived as an array of lines, an array of
+        // content blocks, or a one-field wrapper object is a serialisation
+        // difference, not a misunderstanding — the model said exactly what it
+        // wanted written. Rejecting it burns a turn; `String(["a","b"])` (what
+        // `edit` used to do) writes "a,b" into the user's file. Join it and say
+        // so. Anything ambiguous is left for the validation below to reject.
+        let coercedArgs: CoercedArg[] = [];
+        if (tool) {
+          const fixed = coerceStringArgs(tool, call.arguments);
+          if (fixed.coerced.length) {
+            call.arguments = fixed.args;
+            coercedArgs = fixed.coerced;
+            logStore.append({
+              tags: ["loop", "tools", "tools:arg-coerced"],
+              level: "warn",
+              message: `${call.name}: ${fixed.coerced.map((c) => `${c.key} arrived as ${c.from}`).join("; ")}; joined into a string`,
+              data: { tool: call.name, ...(input.label ? { label: input.label } : {}) },
+            });
+          }
+        }
+        if (tool) {
+          const missing = missingRequiredArgs(tool, call.arguments);
+          // Unparseable argument buffer: the model DID send arguments, they just
+          // could not be decoded (a call cut off mid-JSON is the usual cause).
+          // Reporting them as "missing" is false and unactionable — the model
+          // re-sends the same call and fails the same way. Say what is wrong.
+          const malformed = isMalformedToolArgs(call.arguments);
+          if (malformed) {
+            const truncated = assistant.stopReason === "length";
+            const msg =
+              `${call.name}: the arguments for this call were not valid JSON, so none of them could be read` +
+              (truncated
+                ? " — the response hit its token limit mid-arguments. Re-issue the call with SHORTER arguments"
+                : ". Re-issue the call with complete, valid JSON") +
+              `. Do not repeat the call unchanged; it will fail identically.`;
+            emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+            const invalid = makeToolResult(call.id, call.name, msg, true);
+            emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: invalid.content, isError: true });
+            logStore.append({
+              tags: ["loop", "tools"],
+              level: "warn",
+              message: `tool call ${call.name} had unparseable arguments`,
+              data: { toolName: call.name, truncated, rawLength: String((call.arguments as Record<string, unknown>)[MALFORMED_TOOL_ARGS_KEY] ?? "").length },
+            });
+            context.messages.push(invalid);
+            toolResults.push(invalid);
+            continue;
+          }
+          if (missing.length) {
+            const plural = missing.length > 1;
+            const streak = (missingArgStreak.get(call.name) ?? 0) + 1;
+            missingArgStreak.set(call.name, streak);
+            const base =
+              `${call.name}: missing required argument${plural ? "s" : ""} ` +
+              `${missing.map((m) => `'${m}'`).join(", ")}. ` +
+              `Do not call ${call.name} without ${plural ? "them" : "it"} — provide the argument${plural ? "s" : ""} and retry, or skip the call if it isn't needed.`;
+            // Escalate once the model has repeated the same empty-arg rejection:
+            // a single miss is normal, but a streak means it is stuck emitting
+            // malformed calls (observed: 8 `bash {}` calls in one run). Name the
+            // streak and tell it to stop calling tools if it cannot form the call.
+            const total = (missingArgTotal.get(call.name) ?? 0) + 1;
+            missingArgTotal.set(call.name, total);
+            // Two counters, two different problems. A STREAK means the model is
+            // wedged on one malformed shape right now. A TOTAL means it keeps
+            // coming back to the same mistake between successful calls, which
+            // the streak resets away and which no amount of re-explaining has
+            // fixed — so that message stops explaining and shows the literal
+            // JSON instead.
+            // How to describe the repetition: consecutive is a different problem
+            // from recurring, and the model should be told which one it has.
+            const howOften =
+              streak >= 2 && streak === total
+                ? `${streak} times in a row`
+                : streak >= 2
+                  ? `${streak} times in a row (and ${total} times in this run)`
+                  : `${total} times in this run`;
+            const names = missing.map((m) => `'${m}'`).join(" and ");
+            const escalation =
+              streak < 2 && total < 3
+                ? ""
+                : `\n\nYou have now called \`${call.name}\` ${howOften} with missing/empty required arguments, ` +
+                  `and it was rejected each time. Re-issue ONE well-formed call with ${names} filled in, or ` +
+                  `STOP calling tools and say in plain text what you are trying to do.` +
+                  // From the third rejection, stop explaining the rule and show
+                  // the shape. Re-wording the same instruction had already failed
+                  // twice by this point in the run that prompted it.
+                  (total >= 3
+                    ? `\nA valid call is EXACTLY this, with your own values substituted:\n` +
+                      `  ${JSON.stringify(Object.fromEntries(missing.map((m) => [m, `<the ${m}>`])))}`
+                    : "");
+            const msg = base + escalation;
+            emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+            const invalid = makeToolResult(call.id, call.name, msg, true);
+            emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: invalid.content, isError: true });
+            context.messages.push(invalid);
+            toolResults.push(invalid);
+            continue;
+          }
+          // A well-formed call: clear this tool's missing-arg streak.
+          missingArgStreak.delete(call.name);
+          // Unknown ARGUMENT keys (computed but NOT blocking): the model sent a
+          // field this tool does not accept — a hallucination, a typo
+          // (`comand`), or cross-tool conflation (`bash({url})`). The call still
+          // runs (the unknown key is ignored, matching the lenient historic
+          // contract), but the warning is appended to the result so the model
+          // sees the closest real field and the tool's accepted fields and can
+          // self-correct on the next call. Blocking here broke legitimate calls
+          // that carry a sibling tool's fields.
+          unknownArgs = unknownArgumentKeys(call.name, tool.parameters, call.arguments, mutates);
+        }
+
+
+        // ---- attached-file short-circuit: serve cached file content ----
+        if (typeof argPath === "string" && ["read", "cat"].includes(call.name)) {
+          const requested = normalizeToolPath(cwd, argPath);
+          const attached = ATTACHED_FILE_CONTENTS.get(requested);
+          if (attached != null) {
+            const attachedResult = makeToolResult(
+              call.id,
+              call.name,
+              `${attached}\n\n(note: returned from the handoff cache; this file content was already available from earlier work in the same session.)`,
+              false,
+            );
+            context.messages.push(attachedResult);
+            toolResults.push(attachedResult);
+            if (!READ_WITH.has(requested)) {
+              readPaths.push(requested);
+              READ_WITH.add(requested);
+            }
+            continue;
+          }
+        }
+
+        // ---- dedup: identical read-only call already answered this loop ----
+        //
+        // The path is normalised into the key rather than taken verbatim: the same
+        // file reached as `lib/x.dart` and as `/abs/path/lib/x.dart` is the same
+        // read, and keying on the raw argument made those two misses. Every OTHER
+        // argument still participates, so a genuine re-read at a different
+        // `offset`/`limit` is correctly treated as a different call.
+        const callSig = readCacheKey(cwd, call.name, call.arguments);
+        if (tool && !mutates && READ_TOOLS.has(call.name) && readCache.has(callSig)) {
+          const cached = readCache.get(callSig)!;
+          const dup = makeToolResult(
+            call.id,
+            call.name,
+            `${cached}\n\n(note: an identical ${call.name} call already returned this earlier in this loop — reusing the cached result. Do not repeat the same read.)`,
+            false,
+          );
+          context.messages.push(dup);
+          toolResults.push(dup);
+          continue;
+        }
+
+        // ---- ask-before-you-invent ----
+        // Ordered before the reproduce gate because it is the cheaper question:
+        // "do you even know what to write" precedes "have you seen the bug".
+        const clarify = clarifyGate.check(call.name, call.arguments);
+        if (clarify.kind === "block") {
+          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+          const refused = makeToolResult(call.id, call.name, clarify.message, true);
+          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
+          logStore.append({
+            tags: ["loop", "clarify-gate"],
+            level: "warn",
+            message: `${call.name} refused: the request names no new value and the user has not been asked`,
+          });
+          context.messages.push(refused);
+          toolResults.push(refused);
+          continue;
+        }
+
+        // ---- reproduce-before-you-edit ----
+        const repro = reproductionGate.check(call.name, call.arguments);
+        if (repro.kind === "block") {
+          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+          const refused = makeToolResult(call.id, call.name, repro.message, true);
+          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
+          logStore.append({
+            tags: ["loop", "repro-gate"],
+            level: "warn",
+            message: `${call.name} refused: no reproduction evidence yet in this bug-fix run`,
+          });
+          context.messages.push(refused);
+          toolResults.push(refused);
+          continue;
+        }
+
+        // ---- staged-verify: refuse a premature strip ----
+        // `activity_cleanup` / `remove_log {all:true}` before ANY capture destroys
+        // the probes the model still needs to RUN the app and INSPECT what it did.
+        // That is the exact derailment this guard prevents: instrument → immediate
+        // cleanup → "verified" on the analyzer with nothing ever captured. The
+        // tracker lifts the block once a capture exists; a single `remove_log
+        // {logId}` to reposition a probe is allowed through.
+        const prematureStrip = input.verifyStageTracker?.blockPrematureStrip(call.name, call.arguments);
+        if (prematureStrip) {
+          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+          const refused = makeToolResult(call.id, call.name, prematureStrip, true);
+          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
+          logStore.append({
+            tags: ["loop", "verify-stage", "verify-stage:premature-strip"],
+            level: "warn",
+            message: `${call.name} refused: no capture yet — stripping belongs at DECIDE`,
+          });
+          context.messages.push(refused);
+          toolResults.push(refused);
+          continue;
+        }
+
+        // ---- staged-verify: refuse a premature capture ----
+        // The mirror of the strip guard: while the INSTRUMENT stage is owed (a
+        // runtime gap path carries no probe), a screenshot verifies nothing about
+        // what the code DID — it is exactly how a real run skipped the LOG step
+        // end to end: trace session opened, zero `add_log` calls, screenshot
+        // "verification", then cleanup of probes that never existed.
+        const prematureCapture = input.verifyStageTracker?.blockPrematureCapture(call.name);
+        if (prematureCapture) {
+          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+          const refused = makeToolResult(call.id, call.name, prematureCapture, true);
+          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
+          logStore.append({
+            tags: ["loop", "verify-stage", "verify-stage:premature-capture"],
+            level: "warn",
+            message: `${call.name} refused: instrument stage still owed (unprobed runtime gaps)`,
+          });
+          context.messages.push(refused);
+          toolResults.push(refused);
+          continue;
+        }
+
+        // ---- QA sequencing: scope + build freshness ----
+        // Ordered last of the gates because it is the narrowest: it only has an
+        // opinion about calls that drive or photograph a surface. Two refusals:
+        // a raw drive/capture tool in a WORK loop after the run has already
+        // written code (QA is the verify pass's job — finish and build), and any
+        // capture of a surface that is not running the bytes just written (a
+        // device app that was never rebuilt, a web url with no server behind it).
+        // Sync rules (scope, build freshness) first, then the async one that has
+        // to ask the machine what is actually booted. Ordered that way so the
+        // cheap judgement runs before the I/O, not because either subsumes the
+        // other.
+        const sync = qaGate.check(call.name, call.arguments);
+        const qa = sync.kind === "block"
+          ? sync
+          : await qaGate.checkDeviceTarget(call.name, call.arguments);
+        if (qa.kind === "block") {
+          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+          const refused = makeToolResult(call.id, call.name, qa.message, true);
+          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
+          logStore.append({
+            tags: ["loop", "qa-gate", `qa-gate:${qa.reason}`],
+            level: "warn",
+            message: `${call.name} refused: ${QA_REFUSAL_REASON[qa.reason]}`,
+            data: { tool: call.name, ...(input.label ? { label: input.label } : {}) },
+          });
+          context.messages.push(refused);
+          toolResults.push(refused);
+          // Each refusal hands back a concrete next call (build it, start the
+          // server, use activity_inspect), so it must never be the turn the
+          // stall guard decides to end the loop on.
+          stallGuard.grantGrace();
+          continue;
+        }
+
+        // ---- complexity estimate → model selection ----
+        const inheritedKey =
+          typeof argPath === "string" && argPath.trim() ? normalizeToolPath(cwd, argPath) : undefined;
+        const inheritedRating = inheritedKey ? COMPLEXITY_BY_PATH.get(inheritedKey) : undefined;
+        const complexity = estimateComplexity({
+          toolCount: input.tools.length,
+          contextChars: JSON.stringify(context.messages).length,
+          mutates,
+          refs,
+          bias: tool?.complexityHint ? tool.complexityHint - 0.3 : 0,
+        });
+        // ---- model-DECLARED rating + category (mutations only) ----
+        // A write/edit call already carries the target path and the code, so the
+        // model can rate the work at zero extra token cost — the read half has to
+        // spend a rater call because there is nothing to judge until the bytes
+        // exist. Where a rating is declared it is AUTHORITATIVE, not a floor: the
+        // arithmetic estimate cannot produce `low` for a mutation at all (the
+        // `mutates` term alone clears the threshold), so treating a declaration as
+        // a floor would discard the only signal able to route a genuinely trivial
+        // edit back to the cheap model.
+        //
+        // Absent ⇒ nothing happens and the arithmetic stands, which is why this
+        // needs no feature flag: a model that never populates the field behaves
+        // exactly as before.
+        const declaredRating = canDeclareComplexity(call.name, mutates)
+          ? asComplexityRating(call.arguments?.complexity)
+          : undefined;
+        const declaredCategory = canDeclareComplexity(call.name, mutates)
+          ? asComplexityCategory(call.arguments?.category)
+          : undefined;
+        // A call that carries images is building FROM a design, and the arithmetic
+        // estimate already weighted those attachments. Overwriting the score with a
+        // declaration would throw that signal away — so a mockup floors the rating
+        // at `medium`. "Here is the mockup, build it" is never mechanical work, and
+        // a `low` there would author the driver's text-only draft and quietly lose
+        // the image.
+        const callImageCount =
+          (Array.isArray(call.arguments?.images) ? call.arguments.images.length : 0) +
+          liveImages.length;
+        if (declaredRating) {
+          const effective =
+            declaredRating === "low" && callImageCount > 0 ? "medium" : declaredRating;
+          complexity.score = ratingToScore(effective);
+          complexity.signals.declaredComplexity = declaredRating;
+          if (effective !== declaredRating) complexity.signals.imageFloor = effective;
+          if (declaredCategory) complexity.signals.declaredCategory = declaredCategory;
+        }
+        // The measured floor is applied AFTER the declaration on purpose. A rating
+        // produced by a tool that actually read the file is evidence; a self-report
+        // is not. So a model may talk its way UP but never down past what a read
+        // already established for this path.
+        if (inheritedRating) {
+          const floor = ratingToScore(inheritedRating);
+          if (complexity.score < floor) {
+            complexity.score = floor;
+            complexity.signals.inheritedComplexity = inheritedRating;
+          }
+        }
+        maxComplexity = Math.max(maxComplexity, complexity.score);
+
+        // ---- permission gate ----
+        const req = {
+          kind: "tool" as const,
+          name: call.name,
+          mutates,
+          args: call.arguments,
+          complexity,
+          complexityRating: scoreToRating(complexity.score),
+          // A rating a tool measured off the real file is reported as such, rather
+          // than being mislabeled as inherited from the plan.
+          complexitySource: (!inheritedRating
+            ? "estimated"
+            : inheritedKey && MEASURED_PATHS.has(inheritedKey)
+              ? "tool-measured"
+              : input.complexitySource ?? "plan-task") as ComplexitySource,
+          refs,
+          phase,
+        };
+        emit({ type: "permission_request", request: req });
+        const decision = await permission.evaluate(req);
+        emit({ type: "permission_decision", request: req, decision });
+
+        if (typeof decision.transcript === "boolean") liveEmitText = decision.transcript;
+        if (typeof decision.reasoning === "boolean") liveEmitReasoning = decision.reasoning;
+
+        if (!decision.allowed) {
+          const denied = makeToolResult(call.id, call.name, `Permission denied by policy: ${decision.reason ?? ""}`, true);
+          context.messages.push(denied);
+          toolResults.push(denied);
+          continue;
+        }
+        if (!tool) {
+          const missing = makeToolResult(call.id, call.name, unknownToolMessage(call.name, toolByName.keys()), true);
+          context.messages.push(missing);
+          toolResults.push(missing);
+          logStore.append({
+            tags: ["loop", "tools"],
+            level: "warn",
+            message: `model called unknown tool "${call.name}"`,
+            data: { requested: call.name, available: [...toolByName.keys()] },
+          });
+          continue;
+        }
+
+        if (typeof decision.thinkingLevel === "string") {
+          liveReasoningLevel = decision.thinkingLevel;
+        }
+        if (decision.model) {
+          liveModel = llm.resolveModel(decision.model);
+        }
+
+        const { model: callModel } = selectModel({
+          preferred: decision.model,
+          candidates: input.toolModelCandidates,
+          complexity,
+          refs,
+          mutates,
+        });
+
+        // Authoring model (Model B) for write/edit — optional, image-aware.
+        // An explicit `decision.authorModel` is a per-call instruction and wins.
+        // Otherwise consult the host's routing table with the rating this call
+        // actually carries, so write escalation follows the same stated policy as
+        // read escalation instead of every host re-deriving it in its permission
+        // callback. `low` is never routed: it authors on the loop's own model.
+        const canAuthor = mutates && (call.name === "write" || call.name === "edit");
+        const callRating = scoreToRating(complexity.score);
+        const routedAuthorSlug =
+          canAuthor && !decision.authorModel && callRating !== "low"
+            ? input.routeModel?.({
+                kind: "write",
+                rating: callRating,
+                // The model's own read of what this work IS, so the host can pick
+                // for spatial reasoning on `ui`/`svg` rather than inferring intent
+                // from the file extension (a `.tsx` may be pure logic, and often
+                // is).
+                ...(declaredCategory ? { category: declaredCategory } : {}),
+                // Third axis, independent of the other two: authoring FROM a design
+                // has a ground truth to match, and the host may want a different
+                // model for it at the same rating and category.
+                ...(callImageCount > 0 ? { hasAttachment: true } : {}),
+                ...(typeof call.arguments?.path === "string" ? { path: call.arguments.path } : {}),
+              })
+            : undefined;
+        const authorSlug = decision.authorModel ?? routedAuthorSlug;
+        const authorModel = canAuthor && authorSlug ? llm.resolveModel(authorSlug) : undefined;
+
+        // ---- reference sourcing for a UI write/edit with no reference yet ----
+        //
+        // The reference-sourcing ladder, by case:
+        //   1. the model attached an IMAGE — it replicates directly via
+        //      `REPLICATE_FROM_IMAGE` in `authoring.ts`. Nothing to source here;
+        //      `callImageCount > 0` is the explicit skip of this block.
+        //   2. no image, but `inspiration_generator` is registered — auto-invoke
+        //      it on the model's behalf. The model is told to call it in the
+        //      prompt, but prompt advice does not bind (see `reproduction-gate.ts`
+        //      for the same lesson): a rule the model can silently skip is a
+        //      suggestion, and the observed failure was UI writes authoring blind
+        //      because the model never called the tool. Invoking it here
+        //      guarantees a reference when one is achievable.
+        //   3. no image, no inspiration match (or no tool registered) — the design
+        //      SKILL (`design-skill.ts`) designs a coherent page from the brief,
+        //      emitting the same `InspirationJson[]` shape so the existing
+        //      threading carries it behind the SAME `DESIGN_REUSE_BOUNDARY`.
+        //
+        // Engagement is deliberately NARROW, because a design skeleton only helps
+        // when authoring a screen FROM SCRATCH:
+        //   - UI/SVG path only — a logic write with no reference is the normal case.
+        //   - no image attached — an image is handled by rung 1 above.
+        //   - the file does NOT already exist — overwriting an existing file has
+        //     its structure on disk already; a design reference there competes with
+        //     the file's own layout (and would re-fire on every edit to a UI file,
+        //     which is not what "only where ui development is happening" means).
+        const isFreshUiBuild =
+          canAuthor &&
+          !designReference?.length &&
+          callImageCount === 0 &&
+          call.name === "write" &&
+          typeof argPath === "string" &&
+          isUiOrSvgPath(argPath) &&
+          input.projectCategory !== "backend";
+        if (isFreshUiBuild) {
+          // Existence check: a `write` to a path that already exists is a
+          // whole-file rewrite of known structure, not a fresh build. The design
+          // reference would argue with the file's own layout.
+          let fileExists = true;
+          try {
+            const abs = path.isAbsolute(argPath) ? argPath : path.join(cwd, argPath);
+            await fs.stat(abs);
+          } catch {
+            fileExists = false;
+          }
+          if (!fileExists) {
+            const refTask = input.authoringTask ?? input.task;
+            // --- rung 2: auto-invoke inspiration_generator ---
+            let invokable: AgentTool | undefined;
+            try {
+              invokable = input.registry?.getTool("inspiration_generator");
+            } catch {
+              invokable = undefined;
+            }
+            let matched = false;
+            if (invokable) {
+              const inspireArgs = inspirationArgsFromBrief(refTask, argPath);
+              // A minimal tool context: the inspiration tool only reads
+              // `cwd`/`signal`/`llm`/`registry` (and its own backend), none of
+              // which depend on the write's authoring context that is assembled
+              // below. Building the full `toolCtx` would require the very
+              // `designReference` this block exists to populate.
+              const inspireCtx = {
+                cwd,
+                log: (e: import("../types.js").LogEntry) => logStore.append(e),
+                ...(signal ? { signal } : {}),
+                llm,
+                ...(input.registry ? { registry: input.registry } : {}),
+              };
+              try {
+                const res = await invokable.execute(
+                  `inspiration-auto-${call.id}`,
+                  inspireArgs,
+                  inspireCtx,
+                );
+                const blueprints = designReferenceFromToolResult(res.details);
+                if (blueprints) {
+                  designReference = blueprints;
+                  matched = true;
+                  if (res.usage) usage = addUsage(usage, res.usage);
+                  logStore.append({
+                    timestamp: Date.now(),
+                    level: "info",
+                    tags: ["loop", "inspiration", "inspiration:auto-invoked"],
+                    message:
+                      `no reference image on ${argPath}; auto-invoked inspiration_generator ` +
+                      `→ ${blueprints.length} section(s)`,
+                  });
+                }
+              } catch {
+                // A tool failure forgoes the lookup, not the write; fall through
+                // to the design skill.
+              }
+            }
+            // --- rung 3: the design skill, when nothing matched above ---
+            if (!matched) {
+              const skillModel = resolveAuthorModelForSkill({
+                decision,
+                routedAuthorSlug,
+                loop: input,
+              });
+              if (skillModel) {
+                const designed = await designReferenceFromBrief({
+                  llm,
+                  model: skillModel,
+                  ...(refTask ? { task: refTask } : {}),
+                  path: argPath,
+                  ...(signal ? { signal } : {}),
+                });
+                if (designed?.sections.length) {
+                  designReference = designed.sections;
+                  if (designed.usage) usage = addUsage(usage, designed.usage);
+                  logStore.append({
+                    timestamp: Date.now(),
+                    level: "info",
+                    tags: ["loop", "design-reference", "design-reference:skill"],
+                    message:
+                      `no inspiration match for ${argPath}; design skill produced ` +
+                      `${designed.sections.length} section(s) via ${skillModel.openRouterSlug ?? skillModel.id}`,
+                  });
+                }
+              }
+            }
+            // rung 4: fulfill the media roles the reference describes. Generate
+            // the image/video/audio assets the blueprint calls for so the write
+            // embeds real paths instead of placeholders or authoring blind. No-op
+            // when there are no media needs or `assets_generator` is unavailable;
+            // a missing backend yields a flagged placeholder, never a failed build.
+            if (designReference?.length && input.registry && !signal?.aborted) {
+              const gen = await generateAssetsFromReference({
+                sections: designReference,
+                task: refTask,
+                registry: input.registry,
+                cwd,
+                llm,
+                logStore,
+                ...(signal ? { signal } : {}),
+              });
+              if (gen.assets.length) {
+                generatedAssets = gen.assets;
+                if (gen.usage) usage = addUsage(usage, gen.usage);
+                logStore.append({
+                  timestamp: Date.now(),
+                  level: "info",
+                  tags: ["loop", "assets", "assets:auto-generated"],
+                  message:
+                    `design reference for ${argPath} described ${gen.assets.length} media role(s); ` +
+                    `generated via assets_generator`,
+                });
+              }
+            }
+          }
+        }
+
+        // Assemble the authoring context whenever this call CAN author — NOT only
+        // when a slug was pinned or routed.
+        //
+        // Gating this on a resolved `authorModel` was a starvation bug. The tool
+        // does not author only when the runner resolved a model: under
+        // `authorOnlyWrites` there is no `content`/`newString` draft at all, so
+        // write/edit author UNCONDITIONALLY, falling back to the driver model
+        // (`coding.ts`, `driver-fallback`). Routing meanwhile never fires for a
+        // `low` rating by design (see `routedAuthorSlug`). So every unrouted low
+        // call — "change the title", the most ordinary edit there is — reached the
+        // authoring helper with `authoringContext: undefined`: no task, no plan, no
+        // snippets. Model B saw the current file and an anchor, was asked for a
+        // replacement, and had no statement of intent anywhere in its prompt, so it
+        // invented one from the file's own contents. The driver then re-edited the
+        // same region against a different invention each round.
+        //
+        // `canAuthor` is the honest predicate: it is exactly the condition under
+        // which the bytes may be authored by a second pass.
+        const authoringTask = input.authoringTask ?? input.task;
+        // The clarification is appended to the intent because it is the most
+        // live statement of what THIS edit should do — a run-level or step task
+        // states a goal that may already be satisfied, while a just-answered
+        // question names the exact change. The base task still frames it; the
+        // clarification specializes it. Under authorOnlyWrites this is the ONLY
+        // way a clarification answer reaches the authoring model.
+        const taskWithClarification = clarification
+          ? authoringTask
+            ? `${authoringTask}\n\n${clarification}`
+            : clarification
+          : authoringTask;
+        const authoringContext: AuthoringContext | undefined =
+          canAuthor && (taskWithClarification || input.planJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length || liveImages.length)
+            ? {
+                task: taskWithClarification,
+                ...(input.planJson?.length ? { planJson: input.planJson } : {}),
+                ...buildAuthoringSnippets(input),
+                ...(liveImages.length ? { images: liveImages } : {}),
+                ...(designReference?.length ? { designReference } : {}),
+                ...(mediaFact ? { mediaFact } : {}),
+                ...(generatedAssets?.length ? { generatedAssets } : {}),
+              }
+            : undefined;
+
+        const toolCtx = {
+          cwd,
+          signal,
+          // The live statement of intent, on EVERY call — not only the mutating
+          // ones that build an `authoringContext`. A tool that escalates to a
+          // second model needs to be able to tell it what the run is doing; see
+          // `ToolContext.task` for the run that proved what happens when it
+          // cannot.
+          ...(taskWithClarification ? { task: taskWithClarification } : {}),
+          ...(input.phase ? { phase: input.phase } : {}),
+          model: decision.model ? llm.resolveModel(decision.model) : callModel ?? input.model,
+          ...(authorModel ? { authorModel } : {}),
+          ...(authoringContext ? { authoringContext } : {}),
+          ...(liveImages.length ? { images: liveImages } : {}),
+          // Candidate pool + any rating we already hold for this path, so a staged
+          // tool can escalate INTERNALLY (rate the artifact → pick the tier that
+          // rating deserves) without a host round-trip, and can skip re-rating a
+          // file this run has already judged.
+          ...(input.toolModelCandidates?.length ? { toolModelCandidates: input.toolModelCandidates } : {}),
+          ...(input.routeModel ? { routeModel: input.routeModel } : {}),
+          ...(inheritedRating ? { knownComplexity: inheritedRating } : {}),
+          // The self-report travels separately from `knownComplexity` (which means
+          // MEASURED, and gates whether a staged read spends a rater call). The
+          // authoring escalation inside write/edit needs the effective rating for
+          // this call — including the image floor above — so a vision escalation
+          // tiers on what this call actually is rather than defaulting to `medium`.
+          ...(declaredRating ? { declaredComplexity: callRating } : {}),
+          ...(declaredCategory ? { declaredCategory } : {}),
+          log: (e: import("../types.js").LogEntry) => logStore.append(e),
+          // Progress from inside the call, correlated to this call's id so a host
+          // can render it against the right tool card. Disarmed once the call
+          // settles — an update after `tool_execution_end` is an ordering bug.
+          progress: (update: import("../types.js").ToolProgress) => {
+            if (settled) return;
+            emit({ type: "tool_execution_update", toolCallId: call.id, toolName: call.name, progress: update });
+          },
+          llm,
+          registry: input.registry,
+          ...(input.projectCategory ? { projectCategory: input.projectCategory } : {}),
+          ...(input.askUserQuestion ? { askUserQuestion: input.askUserQuestion } : {}),
+          ...(input.planApproval ? { planApproval: input.planApproval } : {}),
+        };
+
+        let settled = false;
+        emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+        let resultMsg: ToolResultMessage;
+        try {
+          const res = await tool.execute(call.id, call.arguments, toolCtx);
+          resultMsg = {
+            role: "toolResult",
+            toolCallId: call.id,
+            toolName: call.name,
+            content: boundResultContent(res.content ?? [{ type: "text", text: res.output ?? "" }], call.name),
+            details: res.details,
+            isError: res.isError ?? false,
+            timestamp: Date.now(),
+          };
+          if (res.output && !(res.content ?? []).some((c) => c.type === "text")) {
+            resultMsg.content = boundResultContent(
+              [{ type: "text", text: res.output }, ...(res.content ?? [])],
+              call.name,
+            );
+          }
+          // Surface unknown argument keys as a non-blocking warning PREPENDED to
+          // the result. The call already ran (the unknown keys were ignored); the
+          // warning tells the model which fields it invented or typo'd and what
+          // the tool actually accepts, so it self-corrects on the next call.
+          //
+          // Prepended, not appended, because appending made the warning
+          // unreadable exactly where it mattered most. A `read` returns the file,
+          // so a note placed after the content sits ~20k characters down, past the
+          // point any of it is being attended to — a live run typo'd `read`'s
+          // window argument three times and never once acted on the warning that
+          // was sitting at the bottom of each result. A correction belongs before
+          // the thing it corrects.
+          // Same placement, same reason: a coerced call SUCCEEDED, so without a
+          // note the model has no signal that its argument shape was wrong and
+          // keeps sending it.
+          if (coercedArgs.length) {
+            resultMsg.content = boundResultContent(
+              [{ type: "text", text: coercionNote(coercedArgs, call.name) }, ...(resultMsg.content ?? [])],
+              call.name,
+            );
+          }
+          if (unknownArgs.length && tool) {
+            const warning = unknownArgumentMessage(call.name, tool.parameters, unknownArgs);
+            resultMsg.content = boundResultContent(
+              [{ type: "text", text: warning }, ...(resultMsg.content ?? [])],
+              call.name,
+            );
+            logStore.append({
+              tags: ["loop", "tools"],
+              level: "warn",
+              message: `tool call ${call.name} carried unknown argument key${unknownArgs.length > 1 ? "s" : ""}: ${unknownArgs.map((u) => u.key).join(", ")}`,
+              data: { toolName: call.name, unknown: unknownArgs },
+            });
+          }
+          if (res.usage) usage = addUsage(usage, res.usage);
+
+          // ---- fold a tool-MEASURED rating into the per-path floor ----
+          // A tool that actually looked at the artifact knows more than our
+          // pre-flight estimate did. Recording it here means the NEXT call on this
+          // path (typically the edit that follows a read) arrives at the permission
+          // gate already carrying the rating, so the host can escalate `authorModel`
+          // on evidence rather than on a guess. Ratings only ever ratchet UP — a
+          // later cheap read must not erase a `high` we already established.
+          if (res.measuredComplexity) {
+            const measuredTarget = res.measuredPath ?? (typeof argPath === "string" ? argPath : undefined);
+            if (measuredTarget) {
+              const key = normalizeToolPath(cwd, measuredTarget);
+              const known = COMPLEXITY_BY_PATH.get(key);
+              if (!known || ratingToScore(res.measuredComplexity) > ratingToScore(known)) {
+                COMPLEXITY_BY_PATH.set(key, res.measuredComplexity);
+                MEASURED_PATHS.add(key);
+              }
+            }
+          }
+        } catch (err) {
+          resultMsg = makeToolResult(call.id, call.name, `Tool threw: ${(err as Error).message}`, true);
+        }
+        settled = true;
+        emit({
+          type: "tool_execution_end",
+          toolCallId: call.id,
+          toolName: call.name,
+          result: toolExecutionEventResult(resultMsg),
+          isError: resultMsg.isError,
+        });
+
+        const ref = refFromToolResult(resultMsg);
+        if (ref) {
+          refs.push(ref);
+          // A generated asset (assets_generator) writes its file to disk and
+          // reports the path back as `details.uri` — but unlike `write`/`edit`
+          // it is not a MUTATING_TOOLS call and its path is in the RESULT, not a
+          // `file_path` argument. So the arg-based capture below never sees it,
+          // the generated asset was absent from `writtenPaths`, and the run
+          // summary + the next prompt's thread context silently dropped every
+          // generation the run did. The ref's `uri` IS that path when it points
+          // at the local filesystem (a remote URL is media the tool read, not a
+          // file it produced), so capture it here on the same success path.
+          if (
+            !resultMsg.isError &&
+            typeof ref.uri === "string" &&
+            !/^(https?|data|blob):/i.test(ref.uri)
+          ) {
+            const assetAbs = path.isAbsolute(ref.uri) ? ref.uri : path.join(cwd, ref.uri);
+            if (!WRITTEN_WITH.has(assetAbs)) {
+              writtenPaths.push(assetAbs);
+              WRITTEN_WITH.add(assetAbs);
+              if (writtenPaths.length > 50) writtenPaths.splice(0, writtenPaths.length - 50);
+            }
+          }
+        }
+        const questionRequest = askUserQuestionRequestFromResult(resultMsg.details);
+        if (questionRequest) pendingUserQuestion = questionRequest;
+        // A `create_plan` result carries the structured plan; the last one wins
+        // so a re-plan supersedes an earlier draft within the same loop.
+        const planFromTool = planSetFromToolResult(resultMsg.details);
+        if (planFromTool) producedPlanSet = planFromTool;
+        // Blueprints from `inspiration_generator`, held for the authoring pass.
+        // The driver sees this tool result in its conversation; the model that
+        // writes the bytes does not, so without this the run looks up a design
+        // reference and then authors the UI without it.
+        const blueprints = designReferenceFromToolResult(resultMsg.details);
+        if (blueprints) designReference = blueprints;
+        // An `informational` media_analysis result carries OCR/reference text the
+        // task should know at authoring time but the authoring model won't see
+        // (it only gets task + file + anchors). Fold it into `mediaFact` so a
+        // later write/edit carries it as known context. `ui-replicate`/`ui-bug`
+        // images travel as pixels via `images`, not as text — they are skipped
+        // here on purpose.
+        const fact = mediaFactFromToolResult(resultMsg.details);
+        if (fact) mediaFact = mediaFact ? `${mediaFact}\n${fact}` : fact;
+        // A resolved `ask_user_question` folds its Q&A into the authoring intent.
+        // The driver already saw the answer in conversation; this is what carries
+        // it to Model B, which otherwise authors from the run-level task alone.
+        const resolvedClarification = clarificationFromToolResult(resultMsg.details, resultMsg.content);
+        if (resolvedClarification) {
+          clarification = clarification ? `${clarification}\n${resolvedClarification}` : resolvedClarification;
+        }
+
+        // Files the USER just handed over in answer to `ask_user_question`.
+        // Images join the run's live attachment set so the next write/edit
+        // authors from the pixels, exactly as it would for a file attached to
+        // the prompt. Non-image files are named in the tool output (which the
+        // driver reads) and left to `media_analysis`/`read` — inventing a vision
+        // input from a CSV would be worse than pointing at the right tool.
+        for (const file of answerAttachmentsFromToolResult(resultMsg.details)) {
+          if (!file.mimeType.startsWith("image/")) continue;
+          if (LIVE_IMAGE_PATHS.has(file.path)) continue;
+          LIVE_IMAGE_PATHS.add(file.path);
+          liveImages.push({ path: file.path, mimeType: file.mimeType });
+          // Triage the answered image the SAME way initial attachments are
+          // triaged up front, so a spec/screenshot the user drops mid-run has
+          // its text lifted into `mediaFact` (and its role logged) instead of
+          // reaching the authoring pass as undifferentiated pixels. Skipped when
+          // no callback is wired (legacy behavior) and resilient to triage
+          // failure — the image stays as a raw live image either way.
+          let triageNote: string | undefined;
+          if (input.triageAttachment) {
+            try {
+              const triaged = await input.triageAttachment({ path: file.path, mimeType: file.mimeType });
+              if (triaged?.fact && triaged.fact.trim()) {
+                const fact = triaged.fact.trim();
+                mediaFact = mediaFact ? `${mediaFact}\n${fact}` : fact;
+              }
+              triageNote = triaged?.note;
+            } catch {
+              // triage is enrichment; a failure leaves the image un-enriched.
+            }
+          }
+          logStore.append({
+            timestamp: Date.now(),
+            level: "info",
+            tags: ["loop", "attachment", "attachment:from-user"],
+            message: triageNote
+              ? `user attached ${file.path} in answer to a question; triaged — ${triageNote}`
+              : `user attached ${file.path} in answer to a question; added to the run's images`,
+          });
+        }
+
+        // ---- success-only handover capture ----
+        if (!resultMsg.isError) {
+          let absPath: string | undefined;
+          if (typeof argPath === "string" && argPath.trim()) {
+            absPath = path.isAbsolute(argPath) ? argPath : path.join(cwd, argPath);
+            if (!PATHS_WITH.has(absPath)) {
+              discoveredPaths.push(absPath);
+              PATHS_WITH.add(absPath);
+            }
+            if (MUTATING_TOOLS.has(call.name)) {
+              // Invalidate only what this write actually changed. Clearing the
+              // WHOLE cache meant one edit forced a re-read of every other file
+              // the run had already loaded — and a re-read is not cheap here: it
+              // re-runs the staged rating and, for anything non-trivial, a fresh
+              // escalation to the big model. Files this write did not touch are
+              // still exactly as they were read.
+              invalidateReadCache(readCache, cwd, absPath);
+              ATTACHED_FILE_CONTENTS.delete(normalizeToolPath(cwd, absPath));
+              if (!WRITTEN_WITH.has(absPath)) {
+                writtenPaths.push(absPath);
+                WRITTEN_WITH.add(absPath);
+                if (writtenPaths.length > 50) writtenPaths.splice(0, writtenPaths.length - 50);
+              }
+              // Feed the verify gate: a successful write/edit is a path the run
+              // owes verification evidence for (re-writing resets it). The diff
+              // is handed to the verify loop so its check can focus on what changed.
+              //
+              // An instrumentation edit is the exception, and it must be, or the two
+              // gates work against each other: placing `__t()` probes would open a
+              // verification debt on a file whose change is about to be STRIPPED, so
+              // the run would be held open to prove out logging it is going to
+              // delete. The reproduce gate certifies these (probe delta, nothing else
+              // moved) and `instrumentedPaths` below still records them, so they are
+              // tracked for stripping — just not owed evidence.
+              const diffText = (resultMsg.details as { diff?: unknown } | undefined)?.diff;
+              if (!instrumentationTarget(call.name, call.arguments)) {
+                input.verificationGate?.observeWritten(absPath, typeof diffText === "string" ? diffText : undefined);
+                // A real edit invalidates the staged-verify progress for this path
+                // (and the global capture): the bytes the capture proved are gone.
+                input.verifyStageTracker?.onWritten(absPath);
+              }
+              // Detect activity-monitor probe markers in what was just written,
+              // so the orchestrator can refuse completion while `__t()` calls
+              // remain and `activity_cleanup` can name the files to strip. Scan
+              // the diff first (cheapest, most precise); fall back to the tool
+              // output for a write whose content isn't surfaced as a diff.
+              const probeHaystack =
+                typeof diffText === "string" ? diffText : typeof resultMsg.content === "string" ? resultMsg.content : "";
+              if (probeHaystack && PROBE_MARKER_RE.test(probeHaystack) && !INSTRUMENTED_WITH.has(absPath)) {
+                instrumentedPaths.push(absPath);
+                INSTRUMENTED_WITH.add(absPath);
+              }
+              // An up-front per-file classification travels ON the write/edit call
+              // itself (a `verify` arg), declared at the moment the model knows
+              // most about the change — not retroactively in the verify phase. A
+              // `method: "none"` with a reason is the auditable bypass for a tiny
+              // change that needs no runtime check.
+              const verifyDecl = readVerifyDeclaration(call.arguments?.verify, absPath);
+              if (verifyDecl) input.verificationGate?.declare([verifyDecl]);
+            }
+            if (READ_TOOLS.has(call.name) && !READ_WITH.has(absPath)) {
+              readPaths.push(absPath);
+              READ_WITH.add(absPath);
+              if (readPaths.length > 50) readPaths.splice(0, readPaths.length - 50);
+            }
+          }
+
+          const outText = (resultMsg.content ?? [])
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map((c) => c.text)
+            .join("\n")
+            .trim();
+          // A tool that instrumented a file says so in its details (`add_log`).
+          // Probe tracking otherwise works by scanning write/edit diffs, which never
+          // sees a tool that writes files itself — so these would escape the
+          // pre-summary strip check and ship whenever cleanup was skipped.
+          const instrumentedByTool = (resultMsg.details as { instrumented?: unknown; path?: unknown } | undefined);
+          if (instrumentedByTool?.instrumented === true && typeof instrumentedByTool.path === "string") {
+            const probed = normalizeToolPath(cwd, instrumentedByTool.path);
+            if (!INSTRUMENTED_WITH.has(probed)) {
+              instrumentedPaths.push(probed);
+              INSTRUMENTED_WITH.add(probed);
+            }
+            // A probe landed (`add_log`) → the instrument stage advanced for this path.
+            input.verifyStageTracker?.onInstrumented(probed);
+          }
+          // A question to the user satisfies the clarify gate for the rest of the
+          // run: the value is no longer being guessed.
+          if (!resultMsg.isError) clarifyGate.observe(call.name);
+          // Feed the QA gate: a real write opens a freshness debt, a build+install
+          // or dev-server start closes it, and a question resets the stuck counter.
+          qaGate.observe(
+            call.name,
+            call.arguments,
+            Boolean(resultMsg.isError),
+            resultMsg.details as Record<string, unknown> | undefined,
+          );
+          // Feed the stage tracker's BUILD debt: a successful build/install/launch
+          // means the running app now contains the write(s) the spine is trying to
+          // verify. Recognized from either side — a `bash` command the classifier
+          // reads as device/build/dev-server (the project's own launch or build),
+          // a device install tool, or `activity_trace_start` reporting the app
+          // READY (it launches the startCommand itself and waits for readiness).
+          if (!resultMsg.isError && input.verifyStageTracker) {
+            const isTool = (t: string) => call.name === t || call.name.endsWith(`__${t}`);
+            const buildDetails = resultMsg.details as Record<string, unknown> | undefined;
+            let buildOk = false;
+            if (isTool("activity_trace_start")) {
+              buildOk = buildDetails?.ready === true;
+            } else if (isTool("mobile_install_app")) {
+              buildOk = true;
+            } else if (isTool("bash")) {
+              const cmd = call.arguments?.command;
+              const cmdText = Array.isArray(cmd) ? cmd.join(" ") : typeof cmd === "string" ? cmd : "";
+              if (cmdText) {
+                const kind = classify(cmdText);
+                buildOk = kind === "device" || kind === "build" || kind === "dev-server";
+              }
+            }
+            if (buildOk) input.verifyStageTracker.onBuildOk();
+          }
+          // Feed every completed call to the reproduction gate, so a capture or a
+          // question to the user lifts it for the rest of the loop.
+          reproductionGate.observe(
+            call.name,
+            Boolean(resultMsg.isError),
+            outText.length,
+            // The tool's own counts, so a capture that found NOTHING cannot lift
+            // the gate on the strength of the paragraph explaining that it found
+            // nothing. See ReproductionGate.observe.
+            resultMsg.details as Record<string, unknown> | undefined,
+          );
+          // Feed the verify gate: a qualifying successful capture/test/media pass
+          // grants evidence to the runtime paths the run owes it (matched by method).
+          input.verificationGate?.observeCheck(call.name, Boolean(resultMsg.isError), outText.length, outText);
+          // A capture/check ran (collect/inspect/study/media/tail/curl) → the run
+          // stage produced something to reason over at the inspect stage. The gate
+          // decides whether it SATISFIES a gap; this only marks that one happened.
+          if (!resultMsg.isError && outText.length > 0) input.verifyStageTracker?.onCapture();
+          if (outText) {
+            if (!mutates && READ_TOOLS.has(call.name)) {
+              readCache.set(callSig, outText);
+            }
+          }
+
+          // Accumulate source-file content by path for the gate's block-time
+          // straightforwardness assessment. The assessor runs when the gate is
+          // about to block an edit (via the provider), so it sees ALL read files
+          // — not lifted early on the first sync file before an async file is read.
+          if (
+            !resultMsg.isError &&
+            READ_TOOLS.has(call.name) &&
+            typeof absPath === "string" &&
+            isSourceFile(absPath) &&
+            outText
+          ) {
+            readContentByPath.set(absPath, outText);
+          }
+        }
+
+        // Materialise any inlined audio/video/file bytes to disk and replace them
+        // with a path BEFORE the result enters history — so non-image media travels
+        // as a `uri`, not megabytes of base64 that bloat every later turn. (Images
+        // are handled by the re-surface + prune path below.)
+        await materializeInlinedMedia(resultMsg.content, call.name, call.id, cwd);
+
+        context.messages.push(resultMsg);
+        toolResults.push(resultMsg);
+
+        // The tool role can't carry images, so an image a tool produced is
+        // re-surfaced as a follow-up user message.
+        //
+        // Which FORM it takes depends on what the run's model can actually read.
+        // Handing an image to a text-only model does not degrade — the provider
+        // rejects the entire request, killing a browser session on its first
+        // screenshot. So a blind model gets a vision model's description instead,
+        // and the work continues.
+        const images = resultMsg.content.filter((c) => c.type === "image");
+        if (images.length) {
+          // Persist the captures to files and name the paths to the model, so it
+          // can pass them to media_analysis and so the history need not carry the
+          // base64 once pruned (the path text is a sibling of the image block and
+          // survives pruning). See persistToolImages / buildToolMediaMessage.
+          const savedPaths = await persistToolImages(
+            images as ImageContent[],
+            call.name,
+            call.id,
+            cwd,
+          );
+          const mediaMsg = await buildToolMediaMessage({
+            toolName: call.name,
+            images: images as ImageContent[],
+            model: liveModel,
+            llm,
+            visionModel: input.visionModel,
+            ...(savedPaths.length ? { savedPaths } : {}),
+            log: (message, data) =>
+              logStore.append({ tags: ["loop", "media"], level: "info", message, data }),
+          });
+          context.messages.push(mediaMsg);
+          toolResults.push(mediaMsg);
+        }
+        if (pendingUserQuestion) break;
+      }
+      emit({ type: "turn_end", message: assistant, toolResults });
+      if (pendingUserQuestion) break;
+
+      const turnCalls = toolCalls.filter((c): c is Extract<typeof c, { type: "toolCall" }> => c.type === "toolCall");
+      const turnResults = toolResults.filter((m): m is ToolResultMessage => m.role === "toolResult");
+
+      // Escalation ladder for a tool that keeps failing: bash recipe → ask the
+      // user → honest stop. Evaluated BEFORE the stall verdict, and the two
+      // actionable rungs buy a grace turn, so advice the loop just gave is never
+      // advice the model never got to act on.
+      for (const advice of fallbackAdvisor.observe(turnCalls, turnResults, toolByName.keys())) {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: advice.note }],
+          timestamp: Date.now(),
+        });
+        if (advice.kind !== "abandon") stallGuard.grantGrace();
+        logStore.append({
+          tags: ["loop", "loop:fallback", `fallback:${advice.kind}`],
+          level: "warn",
+          message: `${advice.tool} kept failing; advised ${ADVICE_LABEL[advice.kind]}`,
+          data: { tool: advice.tool, ...(input.label ? { label: input.label } : {}) },
+        });
+      }
+
+      // File-search ladder: memory index → better query → shell search. Unlike the
+      // fallback advisor this needs each tool's OUTPUT, because "found nothing" is
+      // a successful call and no error flag will ever reveal it.
+      for (const advice of searchLadder.observe(
+        turnCalls,
+        turnResults.map((r) => ({
+          toolCallId: r.toolCallId,
+          isError: r.isError,
+          text: r.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map((c) => c.text)
+            .join("\n"),
+        })),
+        toolByName.keys(),
+      )) {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: advice.note }],
+          timestamp: Date.now(),
+        });
+        // Every rung hands the model a concrete next call, so none of them should
+        // be the turn the stall guard chooses to stop on.
+        stallGuard.grantGrace();
+        logStore.append({
+          tags: ["loop", "loop:search", `search:${advice.kind}`],
+          level: "info",
+          message: `${advice.tool}: advised ${SEARCH_ADVICE_LABEL[advice.kind]}`,
+          data: { tool: advice.tool, ...(input.label ? { label: input.label } : {}) },
+        });
+      }
+
+      // Stuck-on-a-screen nudge: enough drive/capture calls with no write, no
+      // rebuild and no question is the shape of a run tapping at a login wall.
+      // A nudge rather than a refusal — the model may be three taps from the
+      // target — pointing at the one move that actually crosses the wall:
+      // `ask_user_question`, which the user can answer with a value OR an
+      // attachment. Fires once per streak.
+      const stuckNote = qaGate.stuckNote();
+      if (stuckNote) {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: stuckNote }],
+          timestamp: Date.now(),
+        });
+        stallGuard.grantGrace();
+        logStore.append({
+          tags: ["loop", "qa-gate", "qa-gate:stuck"],
+          level: "warn",
+          message: "driving the UI with no progress; advised asking the user",
+          data: { ...(input.label ? { label: input.label } : {}) },
+        });
+      }
+
+      // Stall detection: the loop has no step cap, so the only thing standing
+      // between it and a model that cannot converge is this. A repeating or
+      // wholly-failing turn is nudged first; a persistent one ends the loop with
+      // a reason that names the pattern.
+      const verdict = stallGuard.observe(turnCalls, turnResults);
+      if (verdict.kind === "stop") {
+        error = verdict.reason;
+        logStore.append({
+          tags: ["loop", "loop:stalled"],
+          level: "warn",
+          message: verdict.reason,
+          ...(input.label ? { data: { label: input.label } } : {}),
+        });
+        break;
+      }
+      if (verdict.kind === "nudge") {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: verdict.note }],
+          timestamp: Date.now(),
+        });
+      }
+
+      // Graceful wind-down, only when a host explicitly configured a step cap:
+      // inject a note so the model stops calling tools and writes its summary
+      // instead of being hard-cut on the next iteration (which previously left
+      // runs looking "complete" but unfinished — mid-edit, no summary). And if
+      // this WAS the last step, surface a clear truncation error rather than a
+      // silent success-looking end.
+      if (!boundedSteps) continue;
+      const remaining = maxSteps - (step + 1);
+      if (remaining === 0) {
+        error = `${STEP_BUDGET_EXHAUSTED} (${maxSteps} steps) before the model finished; last turn was a tool call`;
+        logStore.append({
+          tags: ["loop", "loop:truncated"],
+          level: "warn",
+          message: `loop hit maxSteps (${maxSteps}) mid-tool; ending with truncation error`,
+          ...(input.label ? { data: { label: input.label } } : {}),
+        });
+        break;
+      }
+      if (remaining <= wrapUpRemaining) {
+        context.messages.push({
+          role: "user",
+          content: [{
+            type: "text",
+            text: `NOTE: only ${remaining} step${remaining === 1 ? "" : "s"} remaining in this run's budget. ` +
+              `Stop calling tools now (unless one is essential to finish) and reply with your summary of what you've done so far and what remains. ` +
+              `Prefer a partial summary over being cut off mid-action.`,
+          }],
+          timestamp: Date.now(),
+        });
+      }
+    }
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+
+  const finalText = lastAssistant
+    ? lastAssistant.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n")
+    : "";
+
+  logStore.append({
+    tags: ["loop", ...(error ? ["loop:error"] : [])],
+    level: error ? "error" : "info",
+    message: input.label ? `end loop: ${input.label}${error ? ` error=${error}` : ""}` : `end loop${error ? ` error=${error}` : ""}`,
+  });
+
+  // Reasoning was ASKED FOR and never ARRIVED. Almost always the model: a slug
+  // without the capability just returns deltas of `content`/`role` with no
+  // `reasoning` field, so the bridge has nothing to turn into thinking blocks.
+  // Nothing errors, nothing warns, and the host renders an empty reasoning pane
+  // forever — the single most expensive silent failure in this stack, because it
+  // looks identical to an emission bug. Say so, and name the model.
+  if (liveReasoningLevel && liveReasoningLevel !== "off" && !sawThinkingContent && !error) {
+    logStore.append({
+      tags: ["loop", "reasoning"],
+      level: "warn",
+      message:
+        `reasoning="${liveReasoningLevel}" was requested but no turn returned any thinking. ` +
+        `Model "${liveModel.openRouterSlug ?? liveModel.id}" most likely has no reasoning capability ` +
+        `(a proxy backend may have routed this elsewhere than the slug you set). ` +
+        `Emission is a separate axis: check this BEFORE suspecting transcriptMode/emitReasoning.`,
+      data: { model: liveModel.openRouterSlug ?? liveModel.id, reasoning: liveReasoningLevel },
+    });
+  }
+
+  return {
+    finalMessage: lastAssistant,
+    messages: context.messages,
+    finalText,
+    usage,
+    refs,
+    maxComplexity,
+    writtenPaths,
+    instrumentedPaths,
+    readPaths,
+    discoveredPaths,
+    pendingUserQuestion,
+    ...(producedPlanSet ? { planSet: producedPlanSet } : {}),
+    error,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+/** How each rung of the file-search ladder is described in the log. */
+/** One line per QA-gate refusal, for the log. */
+const QA_REFUSAL_REASON: Record<import("./qa-gate.js").QaBlockReason, string> = {
+  scope: "raw UI driving after a write — QA belongs to the verify pass",
+  stale: "the surface is not running the code this run wrote",
+  "unknown-device": "the device id does not match any booted device",
+  "wrong-surface": "running a mobile app on the web while a device is booted",
+  "wrong-build": "an artifact build cannot put the app on the booted device",
+  "blind-tap": "coordinates not derived from a screenshot analysis — nudging is guessing",
+};
+
+const SEARCH_ADVICE_LABEL: Record<SearchAdvice["kind"], string> = {
+  "memory-first": "searching the memory index before the shell",
+  broaden: "a better memory query",
+  "shell-fallback": "falling back to a shell search",
+};
+
+/** How each escalation rung is described in the log. */
+const ADVICE_LABEL: Record<FallbackAdvice["kind"], string> = {
+  fallback: "a bash fallback",
+  escalate: "asking the user",
+  abandon: "to stop retrying and report the blocker",
+};
+
+/**
+ * Pull section blueprints out of an `inspiration_generator` result.
+ *
+ * Shape-checked rather than name-checked so a host that wraps or renames the
+ * tool still feeds the authoring pass — the discriminator is a `sections` array
+ * of objects carrying the blueprint's own `kind`/`category`.
+ */
+function designReferenceFromToolResult(details: unknown): unknown[] | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const d = details as { matched?: unknown; sections?: unknown };
+  if (d.matched !== true || !Array.isArray(d.sections) || d.sections.length === 0) return undefined;
+  const usable = d.sections.filter(
+    (s) => s && typeof s === "object" && typeof (s as { kind?: unknown }).kind === "string",
+  );
+  return usable.length ? usable : undefined;
+}
+
+/**
+ * Lift informational text out of a `media_analysis` tool result so it reaches
+ * the authoring pass. Only an `informational` triage qualifies — a
+ * `ui-replicate`/`ui-bug` image travels as pixels via `images`/`ctx.images`,
+ * not as text, so returning those here would duplicate the reference in the
+ * wrong channel. Prefers the structured `ocr.text` field (the ocr lens), then
+ * falls back to `analysis` for any other informational attachment.
+ */
+/**
+ * Files the user attached to an `ask_user_question` answer.
+ *
+ * Read off the tool's `details.answerAttachments` rather than parsed out of its
+ * text: the paths have already been normalized to absolute and mime-typed by the
+ * tool, and a regex over prose would be one rename away from silently returning
+ * nothing.
+ */
+function answerAttachmentsFromToolResult(
+  details: unknown,
+): Array<{ path: string; mimeType: string }> {
+  if (!details || typeof details !== "object") return [];
+  const d = details as { kind?: unknown; answerAttachments?: unknown };
+  if (d.kind !== "ask_user_question" || !Array.isArray(d.answerAttachments)) return [];
+  const out: Array<{ path: string; mimeType: string }> = [];
+  for (const entry of d.answerAttachments) {
+    if (!entry || typeof entry !== "object") continue;
+    const { path: p, mimeType } = entry as { path?: unknown; mimeType?: unknown };
+    if (typeof p === "string" && p.trim() && typeof mimeType === "string" && mimeType) {
+      out.push({ path: p, mimeType });
+    }
+  }
+  return out;
+}
+
+/**
+ * Lift the Q&A out of an ANSWERED `ask_user_question` result so it reaches the
+ * authoring model.
+ *
+ * The driver sees the answer in its own conversation, but the model that authors
+ * the bytes does not — and under `authorOnlyWrites` the driver has no field in
+ * which to express it, so the write/edit is authored toward the run-level goal
+ * instead. This is the channel that closes that gap.
+ *
+ * Only a RESOLVED question qualifies: `details.answered === true` distinguishes
+ * a blocking question the host just answered from an OUTSTANDING one (which also
+ * carries `details`, but would otherwise seed intent for a question that has no
+ * answer yet). The question comes off `details.question`; the answer is parsed
+ * from the tool result's text, because `details.answerAttachments` carries files
+ * only, not the answer text.
+ */
+export function clarificationFromToolResult(
+  details: unknown,
+  content: unknown,
+): string | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const d = details as { kind?: unknown; answered?: unknown; question?: unknown };
+  if (d.kind !== "ask_user_question" || d.answered !== true) return undefined;
+  const question = typeof d.question === "string" ? d.question.trim() : "";
+  // The tool renders the answer as `User answered: <text>` (see ask-user-question.ts).
+  // Parse it off the result's text blocks rather than a structured field, since the
+  // tool emits no such field — only files are structured, and an answer can be text
+  // alone. A non-matching shape (e.g. files-only) yields no text and is skipped.
+  // The text is newline-collapsed before matching: a free-text answer can span
+  // several lines, and a `.`/`$`-anchored match would otherwise drop everything
+  // after the first newline. `(empty)` is the tool's empty-answer rendering and is
+  // not a real answer, so it is excluded.
+  const text = textFromToolResult(content).replace(/\n+/g, " ");
+  const answerMatch = text.match(/User answered:\s*(.+?)\s*(?:\(clarification for:|$)/);
+  const answer = answerMatch?.[1]?.trim();
+  if (!answer || answer === "(empty)") return undefined;
+  return question
+    ? `Clarification — question: ${question} answer: ${answer}`
+    : `Clarification — answer: ${answer}`;
+}
+
+/** Join the text blocks of a tool result's content into a single string. */
+export function textFromToolResult(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b): b is { type: "text"; text: string } => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+function mediaFactFromToolResult(details: unknown): string | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const d = details as { category?: unknown; ocr?: unknown; analysis?: unknown };
+  if (d.category !== "informational") return undefined;
+  const ocrText = (d.ocr as { text?: unknown } | undefined)?.text;
+  if (typeof ocrText === "string" && ocrText.trim()) return ocrText.trim();
+  if (typeof d.analysis === "string" && d.analysis.trim()) return d.analysis.trim();
+  return undefined;
+}
+
+function toToolDefs(tools: AgentTool[]): Tool[] {
+  return tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+}
+
+function addUsage(a: Usage, b: Usage): Usage {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    totalTokens: a.totalTokens + b.totalTokens,
+    cost: {
+      input: a.cost.input + b.cost.input,
+      output: a.cost.output + b.cost.output,
+      cacheRead: a.cost.cacheRead + b.cost.cacheRead,
+      cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
+      total: a.cost.total + b.cost.total,
+    },
+  };
+}
+
+/** Consume a pi stream into a final AssistantMessage, re-emitting message_update. */
+async function streamToMessage(
+  llm: LLMBridge,
+  model: Model,
+  context: Context,
+  emit: (e: AgentEvent) => void,
+  opts: {
+    temperature?: number;
+    reasoning?: import("../types.js").ThinkingLevel;
+    signal?: AbortSignal;
+    emitText: boolean;
+    emitReasoning: boolean;
+  },
+): Promise<AssistantMessage> {
+  let final: AssistantMessage | undefined;
+  let started = false;
+  const { emitText, emitReasoning, ...streamOpts } = opts;
+  for await (const ev of llm.stream(model, context, streamOpts)) {
+    if (ev.type === "start" && !started) {
+      started = true;
+      emitAssistantLifecycle({ emit, message: ev.partial, emitText, emitReasoning, kind: "start" });
+    }
+    if ("partial" in ev) {
+      emitAssistantLifecycle({ emit, message: ev.partial, assistantMessageEvent: ev, emitText, emitReasoning, kind: "update" });
+    }
+    if (ev.type === "done") {
+      final = ev.message;
+      emitAssistantLifecycle({ emit, message: ev.message, emitText, emitReasoning, kind: "end" });
+    } else if (ev.type === "error") {
+      final = ev.error;
+      emitAssistantLifecycle({ emit, message: ev.error, emitText, emitReasoning, kind: "end" });
+    }
+  }
+  if (!final) throw new Error("stream produced no final message");
+  return final;
+}
+
+function filterAssistantContentForEmission(
+  message: AssistantMessage,
+  emitText: boolean,
+  emitReasoning: boolean,
+): AssistantMessage {
+  if (emitText && emitReasoning) return message;
+  return {
+    ...message,
+    content: message.content.filter((entry) => {
+      if (entry.type === "text") return emitText;
+      if (entry.type === "thinking") return emitReasoning;
+      return true;
+    }),
+  };
+}
+
+function shouldForwardUpdateEvent(
+  event: Extract<AgentEvent, { type: "message_update" }>["assistantMessageEvent"] | undefined,
+  emitText: boolean,
+  emitReasoning: boolean,
+): boolean {
+  switch (event?.type) {
+    case "text_start":
+    case "text_delta":
+    case "text_end":
+      return emitText;
+    case "thinking_start":
+    case "thinking_delta":
+    case "thinking_end":
+      return emitReasoning;
+    default:
+      return true;
+  }
+}
+
+function emitAssistantLifecycle(input: {
+  emit: (e: AgentEvent) => void;
+  message: AssistantMessage;
+  assistantMessageEvent?: Extract<AgentEvent, { type: "message_update" }>["assistantMessageEvent"];
+  emitText: boolean;
+  emitReasoning: boolean;
+  kind: "start" | "update" | "end";
+}) {
+  const eventType = input.kind === "start" ? "message_start" : input.kind === "update" ? "message_update" : "message_end";
+  if (input.kind === "update" && !shouldForwardUpdateEvent(input.assistantMessageEvent, input.emitText, input.emitReasoning)) {
+    return;
+  }
+  input.emit({
+    type: eventType,
+    message: filterAssistantContentForEmission(input.message, input.emitText, input.emitReasoning),
+    ...(input.kind === "update" && input.assistantMessageEvent ? { assistantMessageEvent: input.assistantMessageEvent } : {}),
+  } as AgentEvent);
+}
+
+/** Where tool-returned screenshots are persisted so the model can reference them. */
+const TOOL_SCREENSHOT_DIR = path.join(".turing", "screenshots");
+
+function mediaMimeToExt(mimeType: string): string {
+  const m = (mimeType || "").toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("gif")) return ".gif";
+  if (m.includes("webm")) return ".webm";
+  if (m.includes("mp4") || m.includes("video")) return ".mp4";
+  if (m.includes("mov")) return ".mov";
+  if (m.includes("mp3") || m.includes("mpeg")) return ".mp3";
+  if (m.includes("wav")) return ".wav";
+  if (m.includes("ogg")) return ".ogg";
+  if (m.includes("flac")) return ".flac";
+  if (m.includes("pdf")) return ".pdf";
+  if (m.includes("json")) return ".json";
+  return "";
+}
+
+/**
+ * Persist inlined (base64) audio/video/file blocks to disk and replace `data`
+ * with a `uri` path, so non-image media travels through history as a PATH
+ * reference instead of megabytes of base64. The same problem screenshots had —
+ * base64 bloating the request and tripping compaction — applies to audio and
+ * video too; a tool that returns either as bytes would otherwise inflate every
+ * subsequent turn. Images are handled separately (re-surfaced for the current
+ * turn, then pruned); this covers the rest. Mutates `content` in place;
+ * best-effort (a write failure leaves the block as-is rather than dropping it).
+ */
+async function materializeInlinedMedia(
+  content: unknown | undefined,
+  toolName: string,
+  callId: string,
+  cwd: string,
+): Promise<void> {
+  if (!Array.isArray(content)) return;
+  // Find the blocks that actually need materialising BEFORE touching the
+  // filesystem — a plain-text result has none, and creating `.turing/media` for
+  // it would litter the working directory (and break callers that count files).
+  const targets: number[] = [];
+  for (let i = 0; i < content.length; i++) {
+    const b = content[i];
+    if (!b || typeof b !== "object") continue;
+    const t = (b as { type?: string }).type;
+    if (t !== "audio" && t !== "video" && t !== "file") continue;
+    const data = (b as { data?: unknown }).data;
+    if (typeof data === "string" && data) targets.push(i);
+  }
+  if (!targets.length) return; // nothing inlined → leave the cwd untouched
+  const dir = path.join(cwd, ".turing", "media");
+  const safeName = `${toolName}_${callId}`.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 60);
+  const stamp = Date.now();
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch {
+    return;
+  }
+  let n = 0;
+  for (const i of targets) {
+    const b = content[i] as { type?: string; data?: string; mimeType?: string };
+    const t = b.type!;
+    const mimeType = b.mimeType ?? "application/octet-stream";
+    const file = path.join(dir, `${safeName}-${stamp}-${n}${mediaMimeToExt(mimeType)}`);
+    try {
+      await fs.writeFile(file, Buffer.from(b.data!, "base64"));
+      content[i] = { type: t, uri: file, mimeType };
+      n++;
+    } catch {
+      // leave the block as-is.
+    }
+  }
+}
+
+/**
+ * Persist each tool-returned image to a file under `.turing/screenshots/` and
+ * return the paths. This exists for two coupled reasons:
+ *
+ *  - The model needs a PATH it can hand to `media_analysis` later. Without it, a
+ *    run takes a screenshot, then calls `media_analysis` expecting it to analyze
+ *    "the screenshot" — but media_analysis needs an explicit `file`/`url`, and
+ *    the screenshot existed only as base64 in a prior message. Persisting + naming
+ *    the path gives the model something concrete to pass.
+ *
+ *  - The history need not carry the base64 forever. The path is recorded as text
+ *    alongside the image (see {@link buildToolMediaMessage}); once the image block
+ *    is pruned, the path text survives, so the model can re-read or re-analyze the
+ *    capture by path instead of the run re-sending megabytes each turn.
+ *
+ * Best-effort: a write failure skips that image (the base64 still reaches the
+ * model for the current turn). Returns the paths that DID save.
+ */
+async function persistToolImages(
+  images: ImageContent[],
+  toolName: string,
+  callId: string,
+  cwd: string,
+): Promise<SavedImage[]> {
+  const dir = path.join(cwd, TOOL_SCREENSHOT_DIR);
+  const safeName = `${toolName}_${callId}`.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 60);
+  const stamp = Date.now();
+  const saved: SavedImage[] = [];
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch {
+    return saved;
+  }
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i]!;
+    // The extension is what media_analysis infers the modality from, and a
+    // mime-less block (some capture sources omit it) would otherwise save extension-less.
+    const sniffed = sniffImageFormat(img.data, img.mimeType ?? "");
+    const mime = img.mimeType ?? (sniffed === "jpeg" ? "image/jpeg" : sniffed === "webp" ? "image/webp" : sniffed === "png" ? "image/png" : "");
+    const file = path.join(dir, `${safeName}-${stamp}-${i}${mediaMimeToExt(mime)}`);
+    try {
+      await fs.writeFile(file, Buffer.from(img.data, "base64"));
+      const dims = imagePixelDimensions(img.data, img.mimeType ?? "");
+      saved.push({ path: file, ...(dims ?? {}) });
+    } catch {
+      // skip; the base64 still reaches the model this turn.
+    }
+  }
+  return saved;
+}
+
+export { imagePixelDimensions } from "../image-dims.js";
+import { imagePixelDimensions, sniffImageFormat } from "../image-dims.js";
+
+/** A persisted capture: its path and, when readable, its pixel dimensions. */
+interface SavedImage {
+  path: string;
+  width?: number;
+  height?: number;
+}
+
+/** Suffix naming the saved paths so the model can pass them to media_analysis. */
+function savedPathsNote(saved: SavedImage[], toolName: string): string {
+  if (!saved.length) return "";
+  const list =
+    saved.length === 1
+      ? formatSaved(saved[0]!)
+      : saved.map((s, i) => `(${i + 1}) ${formatSaved(s)}`).join("  ");
+  let note = ` Saved to: ${list}. Pass any one as \`file:\` to \`media_analysis\` to analyze it.`;
+  // A DEVICE capture is the one place image pixels and screen points diverge,
+  // and by arbitrary, call-to-call-inconsistent ratios. Name the conversion so
+  // the model never has to invent (or `sips`) one.
+  if (/mobile|device|simctl|adb/i.test(toolName) && saved.some((s) => s.width)) {
+    note +=
+      " IMAGE px ≠ SCREEN points: any position an analysis reports for this image is in IMAGE pixels — " +
+      "convert before tapping: logical = image_px × (screen ÷ image) per axis, with the screen's logical " +
+      "size from `mobile_get_screen_size`.";
+  }
+  return note;
+}
+
+function formatSaved(s: SavedImage): string {
+  return s.width && s.height ? `${s.path} (${s.width}×${s.height} px)` : s.path;
+}
+
+/**
+ * Turn a tool's image output into a message the run's model can actually use.
+ *
+ * Three outcomes, in order of preference:
+ *   1. The model reads images  -> pass them through untouched.
+ *   2. It doesn't, but a vision model is configured -> describe them and pass
+ *      the description as text. The run keeps its sight, second-hand.
+ *   3. Neither -> a short note, so the model at least knows an image existed
+ *      rather than silently reasoning about a page it was never shown.
+ *
+ * When `savedPaths` is set, each outcome names the persisted file path(es) so the
+ * model can hand them to `media_analysis`. That text is a SIBLING of the image
+ * block, so it survives {@link pruneHistoricalImages} — the model keeps the path
+ * even after the base64 is pruned from history.
+ *
+ * Never throws: a failed description degrades to (3). Losing the picture is
+ * survivable; losing the run is not.
+ */
+async function buildToolMediaMessage(input: {
+  toolName: string;
+  images: ImageContent[];
+  model: Model;
+  llm: LLMBridge;
+  visionModel?: string;
+  savedPaths?: SavedImage[];
+  log: (message: string, data?: Record<string, unknown>) => void;
+}): Promise<Message> {
+  const { toolName, images, model, llm, visionModel, log } = input;
+  const note = savedPathsNote(input.savedPaths ?? [], input.toolName);
+  const modelReadsImages = !model.input || model.input.length === 0 || model.input.includes("image");
+
+  if (modelReadsImages) {
+    return {
+      role: "user",
+      content: [{ type: "text", text: `Image output from ${toolName}:${note}` }, ...images],
+      timestamp: Date.now(),
+    };
+  }
+
+  if (visionModel) {
+    try {
+      const vision = llm.resolveModel(visionModel);
+      const described = await llm.complete(
+        vision,
+        {
+          systemPrompt:
+            "You are describing an image for another model that cannot see it. " +
+            "Be concrete and complete: layout, visible text (verbatim), controls, " +
+            "state, and anything that looks broken. No preamble, no speculation.",
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: `Describe this output from the \`${toolName}\` tool so another model can act on it.`,
+                },
+                ...images,
+              ],
+              timestamp: Date.now(),
+            },
+          ],
+          tools: [],
+        },
+        { reasoning: "off" },
+      );
+      const text = described.content
+        .filter((c) => c.type === "text")
+        .map((c) => (c as { text: string }).text)
+        .join("\n")
+        .trim();
+      if (text) {
+        log(`described ${toolName} image output with ${visionModel}`, {
+          toolName,
+          visionModel,
+          images: images.length,
+          chars: text.length,
+        });
+        return {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                `Image output from ${toolName} (described by ${visionModel}, ` +
+                `because ${model.id} cannot read images):\n\n${text}${note}`,
+            },
+          ],
+          timestamp: Date.now(),
+        };
+      }
+    } catch (err) {
+      log(`vision description failed for ${toolName}; falling back to a note`, {
+        toolName,
+        visionModel,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text:
+          `${toolName} returned ${images.length} image(s), but ${model.id} cannot read images ` +
+          `and no vision model is configured. Continue without them, or use a tool that returns text.${note}`,
+      },
+    ],
+    timestamp: Date.now(),
+  };
+}
+
+function missingRequiredArgs(tool: AgentTool, args: Record<string, unknown> | undefined): string[] {
+  const required = tool.parameters?.required;
+  if (!Array.isArray(required) || required.length === 0) return [];
+  const a = args ?? {};
+  const missing: string[] = [];
+  for (const key of required) {
+    if (typeof key !== "string") continue;
+    const v = (a as Record<string, unknown>)[key];
+    // A required argument is "missing" only when it is genuinely ABSENT
+    // (undefined/null). An empty string is a legitimate, intentional value —
+    // `edit`'s `newString: ""` is a deletion, and replacement/override fields
+    // can validly be empty — so it must not be rejected here. Empty arrays are
+    // the same: a tool may legitimately receive `[]`. Each tool's own `execute`
+    // already validates its fields with a field-specific message (e.g.
+    // "oldString not found in <file>", "bash: missing required argument
+    // 'command'"), so dropping the empty-value rule here loses no real
+    // protection — it only stops this generic gate from blocking valid calls.
+    if (v === undefined || v === null) missing.push(key);
+  }
+  return missing;
+}
+
+function canonicalArgs(args: Record<string, unknown> | undefined): string {
+  if (!args || typeof args !== "object") return "";
+  try {
+    const keys = Object.keys(args).sort();
+    return JSON.stringify(args, keys);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Cache key for a read-only tool call.
+ *
+ * `path` is resolved to an absolute path first, so the same file reached
+ * relatively and absolutely collapses to one entry; every other argument is
+ * canonicalised as-is, so `offset`/`limit`/`pattern` still distinguish genuinely
+ * different calls.
+ */
+function readCacheKey(cwd: string, name: string, args: Record<string, unknown> | undefined): string {
+  if (!args || typeof args !== "object") return `${name}:`;
+  const argPath = (args as { path?: unknown }).path;
+  const normalised =
+    typeof argPath === "string" && argPath.trim()
+      ? { ...args, path: normalizeToolPath(cwd, argPath) }
+      : args;
+  return `${name}:${canonicalArgs(normalised)}`;
+}
+
+/**
+ * Drop the cached reads that a write to `absPath` invalidated — that path only.
+ *
+ * Entries are keyed by tool + canonical args, so the path is matched against the
+ * normalised form embedded in the key. A directory listing (`ls`) is dropped too
+ * when the write was inside it, since its contents may now differ.
+ */
+function invalidateReadCache(cache: Map<string, string>, cwd: string, absPath: string): void {
+  const target = normalizeToolPath(cwd, absPath);
+  const parent = path.dirname(target);
+  for (const key of [...cache.keys()]) {
+    if (key.includes(target) || key.includes(parent)) cache.delete(key);
+  }
+}
+
+/**
+ * Ceiling on the text of ONE tool result as it enters the conversation.
+ *
+ * ~24k characters is roughly 6k tokens — big enough for a long file or a wide
+ * search, small enough that a runaway result cannot end the run.
+ */
+const MAX_TOOL_RESULT_CHARS = 24_000;
+
+/**
+ * Activity-monitor probe markers. A write/edit whose content or diff matches
+ * this likely inserted `__t()` instrumentation that must be stripped before the
+ * run completes (the model places the snippet the tool hands back; see
+ * `activity_trace_start`). Anchored on the function name and the trace-id
+ * constant names every supported language emits, so it is stable across the
+ * TS/JS/Python/Go/Rust/Dart variants. False positives (a model that names a
+ * helper `__t` on its own) are vanishingly rare and only cost one extra verify
+ * round that finds nothing to strip.
+ */
+
+/**
+ * Bound one tool result before it becomes a message.
+ *
+ * This is the general safety net, and it exists because the specific guards
+ * cannot be complete: a single `grep` with no `path` recursed a whole repo
+ * (node_modules included) and returned 11.3 MB, which was appended verbatim and
+ * made the NEXT request 413 Payload Too Large. The run died with ten successful
+ * tool calls, no stall and no cap — just one result nobody bounded.
+ *
+ * It has to live here rather than in each tool, because the tools that can do
+ * this are not only ours: any MCP server the user connects can return anything,
+ * and the loop is the last place that sees every result.
+ *
+ * The middle is dropped rather than the tail: the head carries what the result
+ * IS (the first matches, the opening of a file) and the tail often carries the
+ * conclusion (a summary line, the final error), while the bulk in between is
+ * what makes it unmanageable. The notice is explicit so the model narrows its
+ * next call instead of assuming it saw everything.
+ */
+function boundToolResultText(text: string, toolName: string): string {
+  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
+  const keep = Math.floor(MAX_TOOL_RESULT_CHARS / 2) - 200;
+  const dropped = text.length - keep * 2;
+  return (
+    `${text.slice(0, keep)}\n\n` +
+    `… [${toolName}: ${dropped.toLocaleString("en-US")} characters omitted from the middle of this result — ` +
+    `it exceeded the ${MAX_TOOL_RESULT_CHARS.toLocaleString("en-US")}-character limit. You are NOT seeing the whole ` +
+    `output. Narrow the call (a specific path, a tighter pattern, a glob, fewer lines) rather than assuming this ` +
+    `is everything.] …\n\n${text.slice(-keep)}`
+  );
+}
+
+/**
+ * Apply {@link boundToolResultText} to every text block of a result.
+ *
+ * Non-text blocks (images, refs) pass through untouched — they are already
+ * bounded by their own tools and are not what blows a request up.
+ */
+function boundResultContent<T extends { type: string; text?: string }>(content: T[], toolName: string): T[] {
+  return content.map((block) =>
+    block.type === "text" && typeof block.text === "string"
+      ? ({ ...block, text: boundToolResultText(block.text, toolName) } as T)
+      : block,
+  );
+}
+
+function makeToolResult(id: string, name: string, text: string, isError: boolean): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: id,
+    toolName: name,
+    content: [{ type: "text", text: boundToolResultText(text, name) }],
+    isError,
+    timestamp: Date.now(),
+  };
+}
+
+function toolExecutionEventResult(result: ToolResultMessage): unknown {
+  if (result.details !== undefined) return { content: result.content, details: result.details };
+  return result.content;
+}
+
+function refFromToolResult(msg: ToolResultMessage): MediaRef | undefined {
+  const d = msg.details as { uri?: string; mimeType?: string; size?: number; summary?: string } | undefined;
+  if (d && typeof d.uri === "string" && typeof d.mimeType === "string") {
+    return { id: msg.toolCallId, uri: d.uri, mimeType: d.mimeType, size: d.size, summary: d.summary };
+  }
+  return undefined;
+}
+
+/**
+ * Recognize a `create_plan` result. Keyed on the `kind` discriminator rather than
+ * the tool name so any host-registered planner can produce a plan the loop picks
+ * up, as long as it uses the same result shape.
+ */
+function planSetFromToolResult(details: unknown): import("../types.js").PlanSet | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const record = details as Record<string, unknown>;
+  if (record.kind !== "plan_set") return undefined;
+  const planSet = record.planSet as import("../types.js").PlanSet | undefined;
+  // An empty plan (a cancelled or failed draft) must not be mistaken for a plan
+  // to execute — the run should fall through to planless work instead.
+  if (!planSet || !Array.isArray(planSet.plans) || planSet.plans.length === 0) return undefined;
+  return planSet;
+}
+
+function askUserQuestionRequestFromResult(details: unknown): AskUserQuestionRequest | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const record = details as Record<string, unknown>;
+  if (record.kind !== "ask_user_question") return undefined;
+  // An ANSWERED question is not a pending one. The tool emits details on both
+  // paths — the answered path carries the user's files so they can be threaded
+  // into the run — and without this guard a question the host just answered
+  // would stop the run as though it were still waiting for one.
+  if (record.answered === true) return undefined;
+  if (typeof record.question !== "string" || record.question.trim().length === 0) return undefined;
+  const options = Array.isArray(record.options)
+    ? record.options.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : undefined;
+  const answerMode =
+    record.answerMode === "text" || record.answerMode === "single-select" || record.answerMode === "multi-select"
+      ? record.answerMode
+      : undefined;
+  return {
+    phase: "plan",
+    question: record.question.trim(),
+    ...(typeof record.reason === "string" && record.reason.trim().length > 0 ? { reason: record.reason.trim() } : {}),
+    ...(typeof record.placeholder === "string" && record.placeholder.trim().length > 0 ? { placeholder: record.placeholder.trim() } : {}),
+    ...(answerMode ? { answerMode } : {}),
+    ...(options?.length ? { options } : {}),
+  };
+}
+
+function normalizeToolPath(cwd: string, filePath: string): string {
+  return path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+}
+
+/**
+ * Whether a call is allowed to self-declare its complexity/category.
+ *
+ * Restricted to the mutating file tools, which are the only ones whose arguments
+ * carry both the target and the code. Accepting the fields from any tool would let
+ * an arbitrary MCP tool's unrelated `complexity` argument silently steer routing.
+ */
+function canDeclareComplexity(name: string, mutates: boolean): boolean {
+  return mutates && (name === "write" || name === "edit");
+}
+
+/**
+ * Read an up-front per-file verification declaration from a write/edit call's
+ * optional `verify` arg. The model commits to the check the change needs at the
+ * moment it writes the file (`{ method: "none", reason: "tiny config change" }`
+ * is the bypass for a change that needs no runtime check). Returns a
+ * `VerificationDeclaration` the gate records, or `undefined` if no usable
+ * declaration was supplied. Tolerant of malformed input — a bad declaration is
+ * ignored, never thrown.
+ */
+function readVerifyDeclaration(
+  raw: unknown,
+  path: string,
+): import("./verification-gate.js").VerificationDeclaration | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  const method = obj.method;
+  const validMethod = method === "visual" || method === "logic" || method === "endpoint" || method === "none";
+  if (!validMethod) return undefined;
+  const tier = obj.tier === "static" || obj.tier === "runtime" ? obj.tier : undefined;
+  const reason = typeof obj.reason === "string" ? obj.reason : undefined;
+  // `method: "none"` (the bypass) REQUIRES a reason — an unjustified skip is
+  // exactly the silent give-up the gate exists to stop.
+  if (method === "none" && !reason?.trim()) return undefined;
+  return { path, ...(tier ? { tier } : {}), method, ...(reason ? { reason } : {}) };
+}
+
+function buildAuthoringSnippets(input: ToolLoopInput): { fileSnippets?: Array<{ path: string; content: string }> } {
+  const MAX = 12000;
+  const fileSnippets: Array<{ path: string; content: string }> = [];
+  let totalChars = 0;
+  for (const file of [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])]) {
+    if (!file?.path || !file?.content) continue;
+    if (totalChars >= MAX) break;
+    const remaining = MAX - totalChars;
+    const content = file.content.length > remaining ? file.content.slice(0, remaining) : file.content;
+    fileSnippets.push({ path: file.path, content });
+    totalChars += content.length;
+  }
+  return fileSnippets.length ? { fileSnippets } : {};
+}
+
+/**
+ * File extensions whose content is a rendered interface, not plain logic — the
+ * set the fallback synthesizer fires on. Mirrors `UI_EXTENSIONS` in
+ * `coding.ts:1073` plus `.svg` (kept local to avoid an orchestrator→tool import
+ * for a private constant). A `.tsx` that is pure logic still triggers, but a
+ * false positive there only spends a synthesis call the authoring model can
+ * ignore; a false negative on a real UI file leaves it blind.
+ */
+const UI_OR_SVG_EXTENSIONS = new Set([
+  ".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".sass", ".less", ".html", ".htm", ".svg",
+]);
+
+function isUiOrSvgPath(file: string): boolean {
+  return UI_OR_SVG_EXTENSIONS.has(path.extname(file).toLowerCase());
+}
+
+/**
+ * Resolve a model for the design skill (rung 3 of reference sourcing).
+ *
+ * The skill does not consume an image — it designs from the brief — so it does
+ * not need a vision-capable model the way the removed image synthesis did. It
+ * does need a model strong enough to design a coherent layout, so the
+ * precedence mirrors the authoring path: an explicit host decision wins, then
+ * the routed write model, then the loop model. Returns `undefined` when nothing
+ * resolves, in which case the gate's guard skips the skill and the run proceeds
+ * with no reference (today's no-match behavior).
+ */
+function resolveAuthorModelForSkill(input: {
+  decision: { authorModel?: string };
+  routedAuthorSlug?: string;
+  loop: ToolLoopInput;
+}): Model | undefined {
+  const { decision, routedAuthorSlug, loop } = input;
+  const slug = decision.authorModel ?? routedAuthorSlug ?? loop.model?.openRouterSlug ?? loop.model?.id;
+  if (slug) return loop.llm.resolveModel(slug);
+  return loop.model;
+}
+
+/**
+ * Derive `inspiration_generator` lookup args from the task + path.
+ *
+ * The auto-invoked call has no model in the loop to choose keywords, so this
+ * does the cheap version: tokenize the task into lowercase tags, infer `kind`
+ * from the extension, default the sections to a full page, and ask for
+ * `scope:"page"` so the result is coherent. The tool's own normalization handles
+ * dedupe and case; we just produce a reasonable query. An empty task still
+ * yields the default sections/kind, which lets the backend pick.
+ */
+function inspirationArgsFromBrief(
+  task: string | undefined,
+  argPath: string,
+): Record<string, unknown> {
+  const keywords = (task ?? "")
+    .toLowerCase()
+    // Keep words of 4+ chars as tags; shorter words add noise. Style/domain
+    // terms (glassmorphism, ecommerce) are what the backend scores on.
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 4)
+    .slice(0, 12);
+  const ext = path.extname(argPath).toLowerCase();
+  const kind = ext === ".svg" ? "poster" : "web-ui";
+  return {
+    ...(keywords.length ? { keywords } : { keywords: ["ui", "landing"] }),
+    kind,
+    scope: "page",
+    sections: ["navigation", "hero", "section", "footer"],
+  };
+}
+
+/** Minimal abort error without depending on DOM lib types. */
+class DOMExceptionLike extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "AbortError";
+  }
+}
+
+// Silence the unused-import linter for Complexity (re-exported for callers).
+export type { Complexity };

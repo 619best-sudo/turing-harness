@@ -57,8 +57,8 @@ Extends the orchestrator options (`models`, `toolModelCandidates`, `phaseTools`,
 | `permissionCallback` | `PermissionCallback` | — | |
 | `registerBuiltins` | `boolean` | `true` | Bundle coding tools + the 3 internal tools |
 | `assets` | `AssetsGeneratorConfig` | — | Backends for `assets_generator` |
-| `auditor` | `UiScreenAuditorConfig` | — | Vision model for `ui_screen_auditor` |
-| `studyModel` | `string` | haiku | Model for `activity_monitor` "study" |
+| `mediaAnalysis` | `MediaAnalysisConfig` | — | Multimodal model (and optional backend) for `media_analysis` |
+| `studyModel` | `string` | haiku | Model for `activity_study` |
 
 `dispose()` on the Harness closes every session. `HarnessConfig` fields also serve as per-session defaults, overridable in `createSession(opts)`.
 
@@ -89,8 +89,9 @@ Everything in `HarnessConfig` (except `apiKey`/`baseUrl`/`llm`, which are manage
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `runChain(task, opts?)` | `Promise<ChainResult>` | Run the full 4P chain (run-scoped abort). |
-| `runPhase(phase, task, opts?)` | `Promise<PhaseResult>` | Run one phase standalone. |
+| `run(task, opts?)` | `Promise<RunLoopResult>` | **Primary entry point.** Flat loop driver: optional plan → one sub-loop per step → run summary. See [loop.md](./loop.md). |
+| `runChain(task, opts?)` | `Promise<ChainResult>` | Legacy: run the full 4P chain (run-scoped abort). Back-compat shim. |
+| `runPhase(phase, task, opts?)` | `Promise<PhaseResult>` | Legacy: run one phase standalone. |
 | `abort()` | `void` | Cancel every in-flight run in this session. |
 | `get isRunning` | `boolean` | True while a run is in flight. |
 | `subscribe(fn)` | `() => void` | This session's `AgentEvent` stream. |
@@ -141,7 +142,9 @@ pi-`Agent`-compatible facade. Created via `harness.createAgent(opts?)`.
 
 ## Orchestrator
 
-Runs the loop and manages the four phases. Never reasons over file contents; never writes/edits code.
+Runs the work. The primary entry point is `run` (the flat loop driver; see
+[loop.md](./loop.md)). `runChain`/`runPhase` remain as legacy 4P back-compat
+shims. Never reasons over file contents; never writes/edits code.
 
 ```ts
 new Orchestrator(config?: OrchestratorConfig)
@@ -159,7 +162,7 @@ new Orchestrator(config?: OrchestratorConfig)
 | `models` | `PhaseModelConfig` | `{ orchestrator?, prepare?, plan?, perform?, perfect? }` slugs |
 | `toolModelCandidates` | `string[]` | Slugs the selector may pick from for tool calls |
 | `phaseTools` | `Partial<Record<Phase, AgentTool[]>>` | Pin exact toolsets |
-| `maxSteps` | `Partial<Record<Phase, number>>` | Tool-loop cap (default 12) |
+| `maxSteps` | `Partial<Record<Phase, number>>` | Optional per-phase tool-loop cap. Unset by default — a phase runs to completion, bounded by stall detection |
 | `reasoning` | `Partial<Record<Phase, ThinkingLevel>>` | |
 | `temperature` | `Partial<Record<Phase, number>>` | |
 | `maxChainIterations` | `number` | Perfect→Perform retries (default 3) |
@@ -412,10 +415,11 @@ Transport: newline-delimited JSON-RPC 2.0 over stdio.
 
 Factory functions (return an `AgentTool`) and pre-built lists:
 
-- `CODING_TOOLS` — `bashTool`, `readTool`, `writeTool`, `editTool`, `lsTool`, `grepTool`.
+- `CODING_TOOLS` — `bashTool`, `bashReadonlyTool`, `readTool`, `writeTool`, `editTool`, `lsTool`, `grepTool`, `markConcernLinesTool`. (`mark_concern_lines` is the per-read "lines of concern" marker: after a `read`, the model calls it with the lines that matter for the task — `lines` accepts a range like `"42-44"` or a list like `"42,43,44"`, optional `why`. Surfaces live via `tool_execution_end` (`details: { path, lines, why }`) and at phase end via `PhaseResult.lineConcerns`.)
 - `createAssetsGeneratorTool(config?: AssetsGeneratorConfig)` — image/video/audio/3d. Config: `{ backends?: AssetBackends, defaultOutDir? }`. Returns the asset by reference; `details: AssetResult { uri, mimeType, size, summary }`.
-- `createUiScreenAuditorTool(config?: UiScreenAuditorConfig)` — visual QA; `details: AuditResult { pass, score, findings[], summary }`.
-- `createActivityMonitorTool({ logStore, studyModel? })` — actions `search` | `tags` | `tail_file` | `study`.
+- `createMediaAnalysisTool(config?: MediaAnalysisConfig)` — analyze image/video/audio/document attachments; args `{ prompt, file?, files?, type?, model? }`, `details: MediaAnalysisResult { analysis, analyzed: ResolvedMedia[] }`. Config: `{ model?, analyze?: MediaAnalysisBackend }`.
+- `createWebTools(config?: WebConfig): AgentTool[]` — `web_search` (args `{ query, maxResults?, site? }`, `details: WebSearchResult { query, searchUrl, hits[] }`) and `web_fetch` (args `{ url, maxChars? }`, `details: WebFetchResult { url, finalUrl, title?, text, truncated }`). Both drive the Playwright MCP resolved from the registry at call time; neither makes its own HTTP request. Config: `{ maxResults?, maxFetchChars?, searchUrlTemplate? }`. Also exports `findBrowserTool`, `extractJsonPayload`.
+- `createActivityMonitorTools({ logStore, studyModel? }): AgentTool[]` — the activity-monitor provider's toolset, registered `kind: "mcp"`: `activity_search`, `activity_tags`, `activity_tail_file`, `activity_study`, `activity_trace_start`, `activity_collect`, `activity_cleanup`, `activity_inspect`. One tool per step so each is a separate, visible tool call.
 - `createProjectMemoryTool(memory)` — read/append durable project memory; actions `get` | `remember` | `recall` | `set_category`. See [Project memory](./project-memory.md).
 - `builtinProviders(config): ProviderInput[]` and `registerBuiltins(registry, config)` — assemble/register all internal providers.
 
@@ -482,11 +486,29 @@ interface ToolResult<D = unknown> {
   details?: D;                // UI-facing structured payload
   content?: ToolResultContent[];
   isError?: boolean;
+  usage?: Usage;              // tokens spent by internal LLM calls inside the tool
+  /** Complexity the tool MEASURED off the artifact it touched (vs. the static
+   *  `complexityHint` guessed before the call). The loop folds this into its
+   *  per-path floor — ratchets up only — so the next call on that path arrives at
+   *  the gate pre-rated with `complexitySource: "tool-measured"`. Set by the
+   *  staged `read`. */
+  measuredComplexity?: ComplexityRating;
+  measuredPath?: string;      // defaults to the call's path argument
 }
 
 interface ToolContext {
   cwd: string; signal?: AbortSignal; model?: Model;
+  authorModel?: Model; authoringContext?: AuthoringContext;
+  images?: Array<{ path: string; mimeType: string }>;
+  /** The loop's candidate pool (cheap → capable), so a tool can escalate
+   *  INTERNALLY — rate the artifact, then selectModel({complexity, candidates}).
+   *  Absent ⇒ the tool must behave as single-stage (graceful degradation). */
+  toolModelCandidates?: string[];
+  /** Rating the loop already holds for this path, so a staged tool can skip its
+   *  own rating pass instead of paying to recompute it. */
+  knownComplexity?: ComplexityRating;
   log: (entry: LogEntry) => void; llm?: LLMBridge; registry?: unknown;
+  askUserQuestion?: (req: AskUserQuestionRequest) => Promise<string>;
 }
 ```
 
@@ -507,9 +529,12 @@ type AgentEvent =
   | { type: "tool_execution_start" | "tool_execution_end"; ... }
   // 4P extensions:
   | { type: "phase_start"; phase; model } | { type: "phase_end"; phase; result }
+  | { type: "phase_summary"; phase; uiSummary?; handoff? }   // lightweight end-of-phase UI signal
   | { type: "chain_start"; task } | { type: "chain_iteration"; iteration } | { type: "chain_end"; success; iterations }
   | { type: "permission_request"; request } | { type: "permission_decision"; request; decision };
 ```
+
+`phase_summary` is emitted once at the very end of every phase (after `phase_end`) carrying **only** the user-facing `uiSummary` string and the structured `handoff` object — so a UI/IPC host gets the one card it renders plus the continuity object without unpacking the heavy `PhaseResult` that `phase_end` carries. Like the other 4P events it is additive: a pi UI can ignore it.
 
 ### 4P, permissions, complexity, media
 
@@ -527,8 +552,25 @@ type PermissionMode = "ask-all" | "bypass" | "ask-mutations";
 interface PermissionRequest {
   kind: "tool" | "phase"; name: string; mutates: boolean;
   args?; complexity: Complexity; refs?: MediaRef[]; phase?: Phase;
+  complexityRating?: ComplexityRating;
+  /** "estimated" | "prepare-file" | "plan-task" | "tool-measured" — the last
+   *  meaning a tool read the real artifact and rated it mid-run. */
+  complexitySource?: ComplexitySource;
 }
-interface PermissionDecision { allowed: boolean; model?: string; reason?: string; }
+interface PermissionDecision {
+  allowed: boolean;
+  /** Model that PROCESSES this call's result on the next turn (Model B reads the
+   *  diff / interprets the read). Applies to every tool; one turn only. */
+  model?: string;
+  /** Model that AUTHORS the bytes for a write/edit (Model B authors from scratch).
+   *  write: B's content replaces Model A's draft. edit: B authors the replacement;
+   *  Model A's oldString anchor is kept. Honored only for write/edit. Omit ⇒ Model
+   *  A's args are written as-is (today's behavior). No fallback on failure. */
+  authorModel?: string;
+  /** UI-emission toggles + reasoning effort for the next turn (see types.ts). */
+  thinkingLevel?: ThinkingLevel; reasoning?: boolean; transcript?: boolean;
+  reason?: string;
+}
 type PermissionCallback = (req: PermissionRequest) => PermissionDecision | Promise<PermissionDecision>;
 
 interface Complexity { score: number; signals: { toolBreadth?; contextSize?; attachmentWeight?; mutation?; }; }
@@ -565,3 +607,49 @@ interface LLMBridge {
 ```ts
 interface LogEntry { timestamp: number; level: "debug"|"info"|"warn"|"error"; tags: string[]; message: string; data?: unknown; }
 ```
+
+## Escalation routing (`routeModel`)
+
+`HarnessConfig.routeModel` / `SessionOptions.routeModel` — a host-owned table
+mapping an escalation to a model slug:
+
+```ts
+type ModelRouter = (input: {
+  kind: "read" | "write";
+  rating: "low" | "medium" | "high";
+  path?: string;
+}) => string | undefined;
+```
+
+It answers a question `toolModelCandidates` cannot. That pool picks a tier with
+`floor(score * pool.length)`, so which model a rating lands on is a function of
+the pool's **length** — appending a slug silently re-targets every rating — and a
+flat list cannot distinguish a read from a write at all. The two want different
+models: comprehension rewards raw capability, authoring rewards
+instruction-following and diff discipline.
+
+Where each `kind` is consulted:
+
+| kind | consulted by | how it arrives |
+|---|---|---|
+| `read` | the staged `read`'s comprehension escalation (`comprehendFile`) | `ctx.routeModel`, because the escalation happens *inside* the tool |
+| `write` | `write` / `edit` byte authoring | the loop resolves it into `ctx.authorModel` |
+
+Precedence, highest first:
+
+1. **`decision.authorModel`** from the permission callback — a per-call
+   instruction, more specific than standing policy.
+2. **`routeModel`** — returns a slug, or `undefined` for "no opinion".
+3. **`toolModelCandidates`** — the score-indexed pool.
+4. **No escalation.** The loop's own model does the work.
+
+`low` never routes: it proceeds unescalated, because spending a second model
+round-trip to re-derive what the loop's model was already trusted with is pure
+cost. The hook is additive — a host that passes no `routeModel` behaves exactly
+as before.
+
+⚠️ Any slug that can end up as the **driver** must be reasoning-capable. A model
+without the capability returns stream deltas carrying only `content`/`role`, so
+no thinking is ever emitted and nothing reports an error — the loop logs a
+`warn` under the `reasoning` tag when a reasoning level was requested and no
+turn returned any.

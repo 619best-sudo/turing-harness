@@ -72,11 +72,20 @@ export interface SelectModelInput extends ComplexityInput {
 /**
  * Tiered fallbacks used when no explicit candidate list is provided. Ordered
  * cheap → capable; selection walks up the tiers as complexity rises.
+ *
+ * All three tiers are the same model today, so this pool escalates to nothing —
+ * a host that wants real escalation supplies `toolModelCandidates` or a
+ * `routeModel`. That is deliberate, and it has to stay in step with
+ * `DEFAULT_PHASE_MODELS`: if these tiers named a WEAKER model than the driver,
+ * the staged read would "escalate" a hard file DOWNWARD — the tier id differs
+ * from the driver's, so the `escalatedId === currentId` short-circuit would not
+ * catch it, and a file judged beyond the driver would be explained by something
+ * smaller.
  */
 const COMPLEXITY_TIERS: string[] = [
-  "poolside/laguna-xs-2.1",
-  "poolside/laguna-xs-2.1",
-  "poolside/laguna-xs-2.1",
+  "xiaomi/mimo-v2.5",
+  "xiaomi/mimo-v2.5",
+  "xiaomi/mimo-v2.5",
 ];
 
 function supportsModalities(model: Model, needed: Modality[]): boolean {

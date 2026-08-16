@@ -15,6 +15,7 @@ import type {
   AgentEvent,
   AgentTool,
   AskUserQuestionRequest,
+  AskUserQuestionResult,
   LLMBridge,
   PermissionCallback,
   PermissionMode,
@@ -22,6 +23,7 @@ import type {
   PhaseResult,
   PrepareProviderAssignmentMap,
   RegisteredProviderSummary,
+  RunLoopResult,
   ThreadFollowUpContext,
   ThreadRunDisposition,
   ThreadRunSnapshot,
@@ -44,12 +46,16 @@ import {
   type PhaseModelConfig,
   type RunChainOptions,
   type RunPhaseOptions,
+  type RunOptions,
 } from "./orchestrator/orchestrator.js";
 import { registerBuiltins } from "./tools/index.js";
 import { connectMcpServer, type McpServerOptions } from "./mcp/client.js";
 import { McpRuntimePool, wrapPooledProvider, mcpServerSignature } from "./mcp/runtime-pool.js";
 import type { AssetsGeneratorConfig } from "./tools/builtin/assets-generator.js";
-import type { UiScreenAuditorConfig } from "./tools/builtin/ui-screen-auditor.js";
+import type { MediaAnalysisConfig } from "./tools/builtin/media-analysis.js";
+import type { WebConfig } from "./tools/builtin/web.js";
+import type { PlanToolConfig } from "./tools/builtin/plan.js";
+import type { InspirationGeneratorConfig } from "./tools/builtin/inspiration-generator.js";
 import { HarnessAgent, type AgentHost, type HarnessAgentOptions } from "./agent.js";
 import { applyProjectPreset, presetPolicy, type ApplyPresetOptions, type ProjectCategory } from "./presets/project-presets.js";
 import type { FileMemory } from "./memory/file-memory.js";
@@ -74,6 +80,8 @@ export interface SessionOptions {
   permissionCallback?: PermissionCallback;
   models?: PhaseModelConfig;
   toolModelCandidates?: string[];
+  /** Host-owned escalation routing: (kind, rating) → model slug. See ModelRouter. */
+  routeModel?: import("./types.js").ModelRouter;
   /** Customize the fixed toolset per phase (exact list, filter, or resolver). */
   phaseTools?: Partial<Record<Phase, PhaseToolSpec>>;
   /** Custom 4P categorization strategy for this session's registry. */
@@ -85,14 +93,38 @@ export interface SessionOptions {
   /** Register the bundled internal tools into this session (default true). */
   registerBuiltins?: boolean;
   assets?: AssetsGeneratorConfig;
-  auditor?: UiScreenAuditorConfig;
+  mediaAnalysis?: MediaAnalysisConfig;
+  /** Multimodal slug used to describe tool images for a text-only run model. */
+  visionModel?: string;
+  /** Config for `create_plan`, including its replaceable planning prompt. */
+  plan?: PlanToolConfig;
+  /** Config for `web_search` / `web_fetch` (engine, model, limits, custom backend). */
+  web?: WebConfig;
+  /**
+   * Config for `inspiration_generator` — a host-injected keyword lookup returning
+   * a reusable UI/poster/parallax blueprint (or null). The harness owns no HTTP
+   * client; the host wires the real backend here.
+   */
+  inspiration?: InspirationGeneratorConfig;
   studyModel?: string;
+  /**
+   * Register `write`/`edit` in content-less author-only mode (see
+   * BuiltinToolsConfig.authorOnlyWrites). Only effective when authoring is
+   * configured; default false keeps today's content-required behaviour.
+   */
+  authorOnlyWrites?: boolean;
   /** Extra providers to register at creation (e.g. shared, stateless tools). */
   providers?: ProviderInput[];
   /** Freeform metadata (project path, tab id, user...). */
   metadata?: Record<string, unknown>;
   /** How much raw transcript detail this session should expose to hosts. */
   transcriptMode?: TranscriptMode;
+  /**
+   * Whether to auto-triage image attachments at the start of a task run (one
+   * media_analysis per image, then surface role + OCR to the loops). Default
+   * true; pass false for latency-sensitive runs. See OrchestratorConfig.
+   */
+  autoTriageAttachments?: boolean;
 }
 
 /** A dependency bundle the manager passes to each session. */
@@ -193,8 +225,12 @@ export class Session implements AgentHost {
       registerBuiltins(this.registry, {
         logStore: this.logStore,
         assets: opts.assets,
-        auditor: opts.auditor,
+        mediaAnalysis: opts.mediaAnalysis,
+        plan: opts.plan,
+        web: opts.web,
+        inspiration: opts.inspiration,
         studyModel: opts.studyModel,
+        ...(opts.authorOnlyWrites ? { authorOnlyWrites: true } : {}),
       });
     }
     for (const p of opts.providers ?? []) this.registry.add(p);
@@ -214,19 +250,26 @@ export class Session implements AgentHost {
 
     this.orchestrator = new Orchestrator({
       cwd: this.cwd,
+      ...(opts.authorOnlyWrites ? { authorOnlyWrites: true } : {}),
       llm: this.llm,
       registry: this.registry,
       logStore: this.logStore,
       permission: this.permission,
       models,
       toolModelCandidates: opts.toolModelCandidates,
+      ...(opts.visionModel ? { visionModel: opts.visionModel } : {}),
+      ...(opts.routeModel ? { routeModel: opts.routeModel } : {}),
       phaseTools,
       maxSteps: opts.maxSteps,
       reasoning: opts.reasoning,
       temperature: opts.temperature,
       maxChainIterations: opts.maxChainIterations,
       transcriptMode: opts.transcriptMode,
+      ...(opts.autoTriageAttachments === false ? { autoTriageAttachments: false } : {}),
     });
+    // Seed the live category from the preset so the non-UI skip is in effect
+    // even before Prepare runs. Corrected live in `reconcileAfterPrepare`.
+    if (opts.preset) this.orchestrator.projectCategory = opts.preset;
     this.orchestrator.setAfterPrepareHook((prepare, { signal }) => this.reconcileAfterPrepare(prepare, signal));
 
     this.logStore.append({ tags: ["session", `session:${this.id}`], level: "info", message: `session ${this.id} created (cwd=${this.cwd})` });
@@ -313,6 +356,29 @@ export class Session implements AgentHost {
     this.permission.setCallback(cb);
   }
 
+  /** Re-point the candidate model pool (cheap → capable) for subsequent runs.
+   *  Needed by hosts that reuse a warm session across runs whose model changes. */
+  setToolModelCandidates(slugs: string[] | undefined): void {
+    this.orchestrator.setToolModelCandidates(slugs);
+  }
+
+  /** Install the host's escalation routing table on a session created without one.
+   *  Without this, a warm session reused across runs has no router and write/edit
+   *  escalation cannot fire at all — see `Orchestrator.setRouteModel`. */
+  setRouteModel(router: import("./types.js").ModelRouter | undefined): void {
+    this.orchestrator.setRouteModel(router);
+  }
+
+  /**
+   * Install the host's plan-review callback. `create_plan` calls it with each
+   * draft; the host returns approve / re-plan-with-comments, plus any per-step
+   * notes and attachments the user added. Without one the tool auto-approves its
+   * first draft, so headless runs never block.
+   */
+  setPlanApprovalCallback(cb: import("./types.js").PlanApprovalCallback | undefined): void {
+    this.orchestrator.setPlanApprovalCallback(cb);
+  }
+
   /**
    * Install a host callback for `ask_user_question`. When set, the
    * `ask_user_question` tool blocks in-place until the callback resolves with
@@ -325,7 +391,7 @@ export class Session implements AgentHost {
    * with the answer as a new user message).
    */
   setAskUserQuestionCallback(
-    cb: ((request: AskUserQuestionRequest) => Promise<string>) | undefined,
+    cb: ((request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>) | undefined,
   ): void {
     this.askUserQuestion = cb;
   }
@@ -336,7 +402,7 @@ export class Session implements AgentHost {
    * `undefined`, the tool falls back to surfacing the question through
    * `details` so a non-blocking host can handle it.
    */
-  private askUserQuestion?: (request: AskUserQuestionRequest) => Promise<string>;
+  private askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>;
 
   // ---- Events ------------------------------------------------------------
 
@@ -379,6 +445,30 @@ export class Session implements AgentHost {
           : {}),
       });
       this.lastThreadSnapshot = buildStandaloneThreadSnapshot(task, result);
+      return result;
+    } finally {
+      await done();
+    }
+  }
+
+  /**
+   * Run the flat loop driver (the primary entry point). `runPhase`/`runChain`
+   * remain as back-compat shims; new code should call this.
+   */
+  async run(task: string, opts: RunOptions = {}): Promise<RunLoopResult> {
+    this.assertLive();
+    const { signal, done } = await this.beginRun(opts.signal);
+    const followUpContext = this.resolveFollowUpContext(opts.followUpContext);
+    try {
+      const result = await this.orchestrator.run(task, {
+        ...opts,
+        signal,
+        ...(followUpContext ? { followUpContext } : {}),
+        ...(opts.askUserQuestion || this.askUserQuestion
+          ? { askUserQuestion: opts.askUserQuestion ?? this.askUserQuestion }
+          : {}),
+      });
+      this.lastThreadSnapshot = result.threadSnapshot;
       return result;
     } finally {
       await done();
@@ -467,6 +557,11 @@ export class Session implements AgentHost {
     if (this.memory && patched.projectCategory && this.memory.category !== patched.projectCategory) {
       await this.memory.setCategory(patched.projectCategory, { auto: false });
     }
+    // Thread the corrected category live to the orchestrator so the non-UI skip
+    // (inspiration/assets/design-skill) reflects the post-scan verdict, not the
+    // preset guess. Memory is the source of truth once Prepare has reconciled.
+    const liveCategory = this.memory?.category ?? patched.projectCategory;
+    if (liveCategory) this.orchestrator.projectCategory = liveCategory;
 
     if (this.memory && patched.memoryUpdates?.length) {
       const known = new Set(this.memory.data.facts.map((f) => f.text.trim().toLowerCase()));

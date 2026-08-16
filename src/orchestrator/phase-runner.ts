@@ -13,11 +13,14 @@ import type {
   AgentEvent,
   AgentTool,
   AskUserQuestionRequest,
+  AskUserQuestionResult,
   AssistantMessage,
+  AuthoringContext,
   ComplexityRating,
   Context,
   FileMemoryUpdate,
   LLMBridge,
+  LineConcern,
   MediaRef,
   Message,
   Model,
@@ -50,15 +53,23 @@ import type {
 import { emptyUsage, ratingToScore, scoreToRating } from "../types.js";
 import type { LogStore } from "../logging/logger.js";
 import type { Registry } from "../registry/registry.js";
+import { isMalformedToolArgs } from "../llm/bridge.js";
 import { PermissionGate } from "./permission.js";
+import { StallGuard } from "./stall-guard.js";
+import { ToolFallbackAdvisor } from "./tool-fallback.js";
+import { SearchLadderAdvisor } from "./search-ladder.js";
+import { unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage } from "./tool-suggest.js";
+import { clarificationFromToolResult } from "./loop.js";
 import { estimateComplexity, selectModel } from "../llm/model-selector.js";
-import { PHASE_PROMPTS } from "../phases/prompts.js";
+import { buildPhaseSystemPrompt } from "../phases/prompts.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export interface PhaseRunInput {
   phase: Phase;
   task: string;
+  /** See `OrchestratorConfig.authorOnlyWrites` — shapes the escalation ladder. */
+  authorOnlyWrites?: boolean;
   /** Summaries from earlier phases (carried by reference, not full transcripts). */
   priorSummaries?: Array<{ phase: Phase; summary: string }>;
   /** Media refs available to this phase (address + summary, not bytes). */
@@ -135,6 +146,7 @@ export interface PhaseRunInput {
   emit: (e: AgentEvent) => void;
   cwd: string;
   signal?: AbortSignal;
+  /** Optional hard cap on turns; unset = run until the phase model finishes. */
   maxSteps?: number;
   temperature?: number;
   reasoning?: ThinkingLevel;
@@ -146,7 +158,7 @@ export interface PhaseRunInput {
    * conversation. When absent, the tool falls back to surfacing the question
    * via its `details` payload for a non-blocking host.
    */
-  askUserQuestion?: (request: AskUserQuestionRequest) => Promise<string>;
+  askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>;
   transcriptMode?: TranscriptMode;
   /** When `false`, the phase model's reasoning/thinking is NOT emitted to the UI
    *  stream (thinking blocks are stripped and thinking_* update events dropped).
@@ -180,76 +192,80 @@ function isCompactTranscriptMode(mode: TranscriptMode | undefined) {
   return mode === "compact";
 }
 
-function toCompactAssistantMessage(message: AssistantMessage): AssistantMessage {
+/** Keep only the assistant content blocks currently allowed to reach the UI.
+ *  Tool calls are ALWAYS kept — a phase must release its tool calls mid-phase
+ *  regardless of the text/reasoning toggles. Text blocks are kept when
+ *  `emitText`, thinking blocks when `emitReasoning`. */
+function filterAssistantContentForEmission(
+  message: AssistantMessage,
+  emitText: boolean,
+  emitReasoning: boolean,
+): AssistantMessage {
+  if (emitText && emitReasoning) return message;
   return {
     ...message,
-    content: message.content.filter((entry) => entry.type === "toolCall"),
+    content: message.content.filter((entry) => {
+      if (entry.type === "text") return emitText;
+      if (entry.type === "thinking") return emitReasoning;
+      return true; // toolCall — always released
+    }),
   };
 }
 
-/** Drop reasoning/thinking blocks from an emitted message (UI reasoning suppressed). */
-function stripThinkingContent(message: AssistantMessage): AssistantMessage {
-  return { ...message, content: message.content.filter((entry) => entry.type !== "thinking") };
-}
-
-function isThinkingUpdateEvent(
+/** Whether a streamed update event may be forwarded under the current toggles.
+ *  `text_*` is gated by `emitText`, `thinking_*` by `emitReasoning`; `toolcall_*`
+ *  and any non-content lifecycle event always pass. */
+function shouldForwardUpdateEvent(
   event: Extract<AgentEvent, { type: "message_update" }>["assistantMessageEvent"] | undefined,
+  emitText: boolean,
+  emitReasoning: boolean,
 ): boolean {
-  return (
-    event?.type === "thinking_start" || event?.type === "thinking_delta" || event?.type === "thinking_end"
-  );
+  switch (event?.type) {
+    case "text_start":
+    case "text_delta":
+    case "text_end":
+      return emitText;
+    case "thinking_start":
+    case "thinking_delta":
+    case "thinking_end":
+      return emitReasoning;
+    default:
+      return true;
+  }
 }
 
+/**
+ * Forward a phase-model streaming lifecycle event to the host, honoring the two
+ * INDEPENDENT UI-emission axes for the AI's response to a tool result:
+ *   - `emitText`      → the non-reasoning assistant text response (the
+ *                       "transcript" the host renders as the answer/narration).
+ *   - `emitReasoning` → the model's thinking/reasoning blocks.
+ * Tool calls are always released regardless of either flag. Both false ⇒ the
+ * legacy compact (tool-calls-only) stream; both true ⇒ the full transcript.
+ */
 function emitAssistantLifecycle(
   input: {
     emit: (e: AgentEvent) => void;
     message: AssistantMessage;
     assistantMessageEvent?: Extract<AgentEvent, { type: "message_update" }>["assistantMessageEvent"];
-    transcriptMode?: TranscriptMode;
-    emitReasoning?: boolean;
+    emitText: boolean;
+    emitReasoning: boolean;
     kind: "start" | "update" | "end";
   },
 ) {
   const eventType =
     input.kind === "start" ? "message_start" : input.kind === "update" ? "message_update" : "message_end";
 
-  // Compact transcript: only tool calls reach the UI (this already excludes text
-  // and reasoning), and only tool-call update events are forwarded.
-  if (isCompactTranscriptMode(input.transcriptMode)) {
-    if (input.kind === "update") {
-      const event = input.assistantMessageEvent;
-      if (!event || (event.type !== "toolcall_start" && event.type !== "toolcall_delta" && event.type !== "toolcall_end")) {
-        return;
-      }
-    }
-    input.emit({
-      type: eventType,
-      message: toCompactAssistantMessage(input.message),
-      ...(input.kind === "update" && input.assistantMessageEvent
-        ? { assistantMessageEvent: input.assistantMessageEvent }
-        : {}),
-    } as AgentEvent);
+  if (
+    input.kind === "update" &&
+    !shouldForwardUpdateEvent(input.assistantMessageEvent, input.emitText, input.emitReasoning)
+  ) {
     return;
   }
 
-  // Full transcript with reasoning suppressed: drop thinking_* update events and
-  // strip thinking blocks from every emitted message.
-  if (input.emitReasoning === false) {
-    if (input.kind === "update" && isThinkingUpdateEvent(input.assistantMessageEvent)) return;
-    input.emit({
-      type: eventType,
-      message: stripThinkingContent(input.message),
-      ...(input.kind === "update" && input.assistantMessageEvent
-        ? { assistantMessageEvent: input.assistantMessageEvent }
-        : {}),
-    } as AgentEvent);
-    return;
-  }
-
-  // Full transcript with reasoning (default).
   input.emit({
     type: eventType,
-    message: input.message,
+    message: filterAssistantContentForEmission(input.message, input.emitText, input.emitReasoning),
     ...(input.kind === "update" && input.assistantMessageEvent
       ? { assistantMessageEvent: input.assistantMessageEvent }
       : {}),
@@ -304,7 +320,7 @@ function buildOpeningMessage(input: PhaseRunInput): string {
   // 2a. Exact toolbox for THIS phase. The model already receives structured tool
   // defs, but surfacing the active names in prose sharply reduces "tool
   // imagination" (e.g. trying browser_* in a session that never connected a
-  // browser MCP, or calling ui_screen_auditor without its required args).
+  // browser MCP, or calling media_analysis without its required args).
   if (input.tools.length) {
     const list = input.tools
       .map((t) => {
@@ -560,16 +576,56 @@ function refFromToolResult(msg: ToolResultMessage): MediaRef | undefined {
   return undefined;
 }
 
+/** Cap on the total surrounding-snippet chars handed to an authoring model, so
+ *  the authoring prompt stays bounded (mirrors the thread-snapshot cap). */
+const MAX_AUTHORING_SNIPPET_CHARS = 12000;
+
+/**
+ * Assemble the bounded context an authoring model (Model B) needs to author a
+ * file's bytes from scratch: the task, the structured PLAN_JSON, and a capped
+ * slice of the surrounding files Plan handed to Perform. The runner passes this
+ * through `toolCtx` — it performs NO content reasoning of its own.
+ */
+function buildAuthoringContext(input: PhaseRunInput): AuthoringContext {
+  const fileSnippets: Array<{ path: string; content: string }> = [];
+  let totalChars = 0;
+  for (const file of [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])]) {
+    if (!file?.path || !file?.content) continue;
+    if (totalChars >= MAX_AUTHORING_SNIPPET_CHARS) break;
+    const remaining = MAX_AUTHORING_SNIPPET_CHARS - totalChars;
+    const content = file.content.length > remaining ? file.content.slice(0, remaining) : file.content;
+    fileSnippets.push({ path: file.path, content });
+    totalChars += content.length;
+  }
+  return {
+    ...(input.task ? { task: input.task } : { task: "" }),
+    ...(input.priorPlanJson?.length ? { planJson: input.priorPlanJson } : {}),
+    ...(fileSnippets.length ? { fileSnippets } : {}),
+  };
+}
+
 export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
   const { phase, llm, permission, emit, cwd, signal, logStore } = input;
-  const maxSteps = input.maxSteps ?? 12;
+  // No default cap: the phase runs until its model stops calling tools. A hard
+  // 12-step ceiling used to end phases mid-work with no summary; non-convergence
+  // is caught by `StallGuard` instead. `maxSteps` remains an opt-in host bound.
+  const maxSteps = input.maxSteps ?? Infinity;
+  const stallGuard = new StallGuard();
+  const fallbackAdvisor = new ToolFallbackAdvisor();
+  // Same file-search ladder the flat loop enforces, so a phase cannot drift into
+  // grepping the repo just because it was reached through `runChain`.
+  const searchLadder = new SearchLadderAdvisor();
   const toolByName = new Map(input.tools.map((t) => [t.name, t]));
 
   emit({ type: "phase_start", phase, model: input.model.openRouterSlug ?? input.model.id });
   logStore.append({ tags: ["phase", `phase:${phase}`], level: "info", message: `start ${phase}` });
 
   const context: Context = {
-    systemPrompt: PHASE_PROMPTS[phase],
+    // Gated on the tools this phase actually resolved: guidance for an absent
+    // tool cannot be acted on, and it dilutes the guidance that can.
+    systemPrompt: buildPhaseSystemPrompt(phase, input.tools.map((t) => t.name), {
+      authorOnlyWrites: input.authorOnlyWrites === true,
+    }),
     messages: [{ role: "user", content: buildOpeningMessage(input), timestamp: Date.now() }],
     tools: toToolDefs(input.tools),
   };
@@ -593,6 +649,10 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
   const READ_WITH = new Set(readPaths);
   const readFileContents: ReadFileContent[] = [];
   const READ_CONTENT_WITH = new Set<string>();
+  // Lines flagged via mark_concern_lines as relevant to the task, per file.
+  // One entry per successful call (later same-file calls append fresh entries
+  // rather than overwrite, so a phase can refine its concern set across reads).
+  const lineConcerns: LineConcern[] = [];
   const MUTATING_TOOLS = new Set(["write", "edit"]);
   const READ_TOOLS = new Set(["read", "ls", "grep", "cat"]);
   const PLAN_BLOCKED_TOOLS = new Set(["bash", "bash_readonly", "ls", "grep", "cat"]);
@@ -631,6 +691,34 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
   let lastAssistant: AssistantMessage | undefined;
   let error: string | undefined;
   let pendingUserQuestion: AskUserQuestionRequest | undefined;
+  // A resolved ask_user_question's Q&A, folded into the authoring intent — the
+  // phase-loop mirror of the flat loop's carry-through. Without this, a
+  // clarification resolved inside a 4P/legacy phase never reaches Model B.
+  let clarification: string | undefined;
+
+  // Live, INDEPENDENT UI-emission axes for this phase's model turns (the AI's
+  // response to each tool result):
+  //   - liveEmitText      → emit the non-reasoning assistant text ("transcript").
+  //   - liveEmitReasoning → emit the model's thinking/reasoning blocks.
+  // Tool calls are always released regardless. They seed from the phase-scoped
+  // permission decision (input.transcriptMode / input.emitReasoning) and can each
+  // be flipped mid-phase by a TOOL permission decision's `transcript` /
+  // `reasoning` flags. A change takes effect from the NEXT phase-model turn
+  // onward: the turn that produced the current tool call has already streamed
+  // under the previous setting and cannot be retroactively re-emitted.
+  const seedCompact = isCompactTranscriptMode(input.transcriptMode);
+  let liveEmitText = !seedCompact;
+  let liveEmitReasoning = seedCompact ? false : (input.emitReasoning ?? true);
+  // Reasoning EFFORT for the next phase-model turn. Seeds from the phase baseline
+  // (which already folds in any PHASE-scoped decision `thinkingLevel`); a TOOL
+  // decision may raise/lower it for subsequent turns.
+  let liveReasoningLevel = input.reasoning;
+  // Model that drives the NEXT phase-model turn. Seeds from the phase model
+  // (Model A). A TOOL permission decision's `model` re-pins it for exactly ONE
+  // subsequent turn; it is reset back to the phase model right after that turn
+  // (see below), so the model that requested the tool resumes control. Unlike
+  // `liveReasoningLevel`, this does NOT persist across turns.
+  let liveModel = input.model;
 
   try {
     for (let step = 0; step < maxSteps; step++) {
@@ -638,16 +726,20 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
 
       // ---- phase model turn (reasoning happens here, not in the orchestrator) ----
       emit({ type: "turn_start" });
-      const assistant = await streamToMessage(llm, input.model, context, emit, {
+      const assistant = await streamToMessage(llm, liveModel, context, emit, {
         temperature: input.temperature,
-        reasoning: input.reasoning,
+        reasoning: liveReasoningLevel,
         signal,
-        transcriptMode: input.transcriptMode,
-        emitReasoning: input.emitReasoning,
+        emitText: liveEmitText,
+        emitReasoning: liveEmitReasoning,
       });
       lastAssistant = assistant;
       usage = addUsage(usage, assistant.usage);
       context.messages.push(assistant);
+      // Revert the driver to the phase model so a `model` override from a tool
+      // decision applies to exactly ONE turn (the one we just streamed). The next
+      // tool decision may re-pin it again for its own single turn.
+      liveModel = input.model;
 
       // Stop on error OR abort. On abort the stream throws before tool-call
       // argument buffers are parsed, so any streamed toolCall still has empty
@@ -677,8 +769,26 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
         // `bash({timeoutMs:...})`, `read({})`) are a common weak-model / stream
         // artifact. Reject them centrally BEFORE permission, model-selection, or
         // execution, so they burn no budget and never pollute the handover.
+        // Unknown argument keys are detected here too, but surfaced as a
+        // non-blocking warning on the result; hoisted so it is in scope below.
+        let unknownArgs: Array<{ key: string; suggestion?: string }> = [];
         if (tool) {
           const missing = missingRequiredArgs(tool, call.arguments);
+          // Same distinction the flat loop makes: arguments that arrived but
+          // could not be decoded are NOT missing arguments, and telling the
+          // model otherwise sends it into an identical-retry loop.
+          if (isMalformedToolArgs(call.arguments)) {
+            const msg =
+              `${call.name}: the arguments for this call were not valid JSON, so none of them could be read. ` +
+              `Re-issue the call with complete, valid JSON — shorter, if they were long. ` +
+              `Do not repeat the call unchanged; it will fail identically.`;
+            emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+            const invalid = makeToolResult(call.id, call.name, msg, true);
+            emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: invalid.content, isError: true });
+            context.messages.push(invalid);
+            toolResults.push(invalid);
+            continue;
+          }
           if (missing.length) {
             const plural = missing.length > 1;
             const msg =
@@ -692,6 +802,11 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
             toolResults.push(invalid);
             continue;
           }
+          // Unknown ARGUMENT keys: detected but surfaced as a non-blocking
+          // warning appended to the tool result (after it runs), mirroring the
+          // flat loop. The call still executes; the model is told which fields
+          // it invented and what the tool accepts so it self-corrects.
+          unknownArgs = unknownArgumentKeys(call.name, tool.parameters, call.arguments, mutates);
         }
         const argPath = (call.arguments as { path?: unknown } | undefined)?.path;
         if (phase === "plan" && call.name === "read" && typeof argPath === "string" && ALLOWED_PLAN_READ_PATHS.size > 0) {
@@ -887,6 +1002,20 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
         const decision = await permission.evaluate(req);
         emit({ type: "permission_decision", request: req, decision });
 
+        // Honor the two INDEPENDENT UI-emission toggles the host may return with a
+        // TOOL decision, next to `model`:
+        //   - `transcript` → emit the AI's non-reasoning text response to the tool
+        //     result (mapped to `liveEmitText`).
+        //   - `reasoning`  → emit the AI's reasoning/thinking (`liveEmitReasoning`).
+        // Each is applied independently to the rest of the phase; omitting a flag
+        // leaves that axis unchanged. Tool calls stream regardless.
+        if (typeof decision.transcript === "boolean") {
+          liveEmitText = decision.transcript;
+        }
+        if (typeof decision.reasoning === "boolean") {
+          liveEmitReasoning = decision.reasoning;
+        }
+
         if (!decision.allowed) {
           const denied = makeToolResult(call.id, call.name, `Permission denied by policy: ${decision.reason ?? ""}`, true);
           context.messages.push(denied);
@@ -894,10 +1023,22 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
           continue;
         }
         if (!tool) {
-          const missing = makeToolResult(call.id, call.name, `Unknown tool "${call.name}".`, true);
+          const missing = makeToolResult(call.id, call.name, unknownToolMessage(call.name, toolByName.keys()), true);
           context.messages.push(missing);
           toolResults.push(missing);
           continue;
+        }
+
+        // Per-call reasoning EFFORT + MODEL for the *next* phase-model turn,
+        // applied only for tools that actually execute (after the allow/valid
+        // checks above) so a denied/unknown tool never redirects the next turn.
+        // `model` re-pins the driver for exactly ONE turn; `liveModel` resets to
+        // the phase model after that turn (see the reset below).
+        if (typeof decision.thinkingLevel === "string") {
+          liveReasoningLevel = decision.thinkingLevel;
+        }
+        if (decision.model) {
+          liveModel = llm.resolveModel(decision.model);
         }
 
         // ---- per-call model selection ----
@@ -909,16 +1050,59 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
           refs,
           mutates,
         });
+
+        // `decision.authorModel` requests a SECOND model (Model B) to author the
+        // on-disk bytes for a mutating write/edit call, instead of the requesting
+        // model's draft. The authoring LLM call lives inside the tool (matching
+        // the image-analysis / activity-monitor pattern); the runner only
+        // resolves the slug + assembles the bounded authoring context it needs
+        // (task, PLAN_JSON, surrounding snippets), so the runner still does no
+        // content reasoning. Honored only for write/edit.
+        const canAuthor = mutates && (call.name === "write" || call.name === "edit");
+        const authorModel =
+          canAuthor && decision.authorModel ? llm.resolveModel(decision.authorModel) : undefined;
+        // Gated on `canAuthor`, not `authorModel` — see the matching comment in
+        // `loop.ts`. A tool that authors on the driver model (content-less mode)
+        // needs the task just as much as one that escalated to a pinned slug;
+        // keying off the slug starved exactly the calls that never route.
+        // Compose the authoring intent, appending any resolved clarification so a
+        // mid-phase ask_user_question answer reaches Model B (mirror of loop.ts).
+        const baseAuthoringTask = input.task;
+        const taskWithClarification = clarification
+          ? baseAuthoringTask
+            ? `${baseAuthoringTask}\n\n${clarification}`
+            : clarification
+          : baseAuthoringTask;
+        const authoringContext =
+          canAuthor && (taskWithClarification || input.priorPlanJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length)
+            ? { ...buildAuthoringContext(input), ...(taskWithClarification ? { task: taskWithClarification } : {}) }
+            : undefined;
+
         const toolCtx: ToolContext = {
           cwd,
           signal,
+          phase,
           model: decision.model ? llm.resolveModel(decision.model) : callModel ?? input.model,
+          ...(authorModel ? { authorModel } : {}),
+          ...(authoringContext ? { authoringContext } : {}),
+          // Same staged-tool plumbing as the flat loop, so the back-compat path
+          // doesn't silently lose read escalation.
+          ...(input.toolModelCandidates?.length ? { toolModelCandidates: input.toolModelCandidates } : {}),
           log: (e) => logStore.append(e),
+          // Progress is correlated to THIS call's id, so a host can render it
+          // against the right tool card. Emitting after `tool_execution_end`
+          // would be a host-visible ordering bug, so the emitter is disarmed
+          // below once the call settles.
+          progress: (update) => {
+            if (settled) return;
+            emit({ type: "tool_execution_update", toolCallId: call.id, toolName: call.name, progress: update });
+          },
           llm,
           registry: input.registry,
           ...(input.askUserQuestion ? { askUserQuestion: input.askUserQuestion } : {}),
         };
 
+        let settled = false;
         emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
         let resultMsg: ToolResultMessage;
         try {
@@ -936,9 +1120,23 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
           if (res.output && !(res.content ?? []).some((c) => c.type === "text")) {
             resultMsg.content = [{ type: "text", text: res.output }, ...(res.content ?? [])];
           }
+          // Surface unknown argument keys as a non-blocking warning appended to
+          // the result, mirroring the flat loop. The call already ran; the model
+          // is told which fields it invented or typo'd and what the tool accepts.
+          if (unknownArgs.length) {
+            const warning = unknownArgumentMessage(call.name, tool.parameters, unknownArgs);
+            resultMsg.content = [...(resultMsg.content ?? []), { type: "text", text: warning }];
+          }
+          // Account tokens a tool incurred internally (e.g. an authoring-model
+          // call inside write/edit). Pure-IO tools return no usage; this folds
+          // any into the phase/chain total so cost stays honest.
+          if (res.usage) {
+            usage = addUsage(usage, res.usage);
+          }
         } catch (err) {
           resultMsg = makeToolResult(call.id, call.name, `Tool threw: ${(err as Error).message}`, true);
         }
+        settled = true;
         emit({
           type: "tool_execution_end",
           toolCallId: call.id,
@@ -949,6 +1147,13 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
 
         const ref = refFromToolResult(resultMsg);
         if (ref) refs.push(ref);
+        // Fold a resolved clarification into the authoring intent, mirroring the
+        // flat loop. The driver saw the answer in conversation; this carries it
+        // to Model B for the next write/edit.
+        const resolvedClarification = clarificationFromToolResult(resultMsg.details, resultMsg.content);
+        if (resolvedClarification) {
+          clarification = clarification ? `${clarification}\n${resolvedClarification}` : resolvedClarification;
+        }
         const questionRequest =
           phase === "plan" ? askUserQuestionRequestFromResult(phase, resultMsg.details) : undefined;
         if (questionRequest) pendingUserQuestion = questionRequest;
@@ -1031,6 +1236,19 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
             }
           }
 
+          // mark_concern_lines: record the flagged lines (path + lines + why)
+          // from its structured details payload. Lives outside the `if (outText)`
+          // block since the payload rides on `details`, not the text output.
+          if (call.name === "mark_concern_lines" && absPath) {
+            const d = resultMsg.details as { lines?: unknown; why?: unknown } | undefined;
+            const rawLines = Array.isArray(d?.lines) ? (d!.lines as unknown[]) : [];
+            const lines = rawLines.filter((n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1);
+            if (lines.length) {
+              const why = typeof d?.why === "string" && d.why.trim() ? d.why.trim() : undefined;
+              lineConcerns.push({ path: absPath, lines, ...(why ? { why } : {}) });
+            }
+          }
+
         }
 
         context.messages.push(resultMsg);
@@ -1053,6 +1271,76 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
       }
       emit({ type: "turn_end", message: assistant, toolResults });
       if (pendingUserQuestion) break;
+
+      const turnCalls = toolCalls.filter((c): c is Extract<typeof c, { type: "toolCall" }> => c.type === "toolCall");
+      const turnResults = toolResults.filter((m): m is ToolResultMessage => m.role === "toolResult");
+
+      // Escalation ladder for a repeatedly-failing tool: bash recipe → ask the
+      // user → honest stop. Before the stall verdict, so actionable advice buys a
+      // grace turn to be acted on.
+      for (const advice of fallbackAdvisor.observe(turnCalls, turnResults, toolByName.keys())) {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: advice.note }],
+          timestamp: Date.now(),
+        });
+        if (advice.kind !== "abandon") stallGuard.grantGrace();
+        logStore.append({
+          tags: ["phase", `phase:${phase}`, "loop:fallback", `fallback:${advice.kind}`],
+          level: "warn",
+          message: `${advice.tool} kept failing in ${phase}; advised ${advice.kind}`,
+          data: { tool: advice.tool },
+        });
+      }
+
+      // File-search ladder: memory index → better query → shell search. Needs each
+      // tool's OUTPUT, since a memory query that found nothing is a successful call.
+      for (const advice of searchLadder.observe(
+        turnCalls,
+        turnResults.map((r) => ({
+          toolCallId: r.toolCallId,
+          isError: r.isError,
+          text: r.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map((c) => c.text)
+            .join("\n"),
+        })),
+        toolByName.keys(),
+      )) {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: advice.note }],
+          timestamp: Date.now(),
+        });
+        stallGuard.grantGrace();
+        logStore.append({
+          tags: ["phase", `phase:${phase}`, "loop:search", `search:${advice.kind}`],
+          level: "info",
+          message: `${advice.tool} in ${phase}: advised ${advice.kind}`,
+          data: { tool: advice.tool },
+        });
+      }
+
+      // Stall detection stands in for the old step ceiling: a turn that repeats
+      // itself or fails outright is nudged, and a persistent pattern ends the
+      // phase with a reason that names it.
+      const verdict = stallGuard.observe(turnCalls, turnResults);
+      if (verdict.kind === "stop") {
+        error = verdict.reason;
+        logStore.append({
+          tags: ["phase", `phase:${phase}`, "loop:stalled"],
+          level: "warn",
+          message: verdict.reason,
+        });
+        break;
+      }
+      if (verdict.kind === "nudge") {
+        context.messages.push({
+          role: "user",
+          content: [{ type: "text", text: verdict.note }],
+          timestamp: Date.now(),
+        });
+      }
     }
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
@@ -1163,12 +1451,17 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
   });
   const display = buildPhaseDisplayArtifact(phase, finalText, summary, uiSummary, phaseToolCallIds);
 
+  // `reasoning` is the NEXT-PHASE BRIEFING, i.e. the `SUMMARY:` section (what a
+  // later phase needs to continue the work) — NOT `uiSummary` (the user-facing
+  // `UI SUMMARY:` card). uiSummary flows to the host only via `result.uiSummary`
+  // and the dedicated `phase_summary` event; it must not be stuffed into the
+  // next-phase reasoning slot. See PhaseHandoff.reasoning docs.
   const handoff: PhaseHandoff = {
     from: phase,
     to: nextPhase(phase),
     files: relevantFiles,
     toolChain,
-    ...(uiSummary ? { reasoning: uiSummary } : {}),
+    ...(summary ? { reasoning: summary } : {}),
   };
   const result: PhaseResult = {
     phase,
@@ -1203,6 +1496,7 @@ export async function runPhase(input: PhaseRunInput): Promise<PhaseResult> {
     relevantFiles: relevantFiles.length ? relevantFiles : input.priorRelevantFiles,
     toolTranscript: mergedToolTranscript.length ? mergedToolTranscript : input.priorToolTranscript,
     readFileContents: readFileContents.length ? readFileContents : undefined,
+    lineConcerns: lineConcerns.length ? lineConcerns : undefined,
     registeredProvidersSeen: input.phase === "prepare" ? input.availableProviders : undefined,
     memoryUpdates: memoryUpdates.length ? memoryUpdates : undefined,
     fileMemoryUpdates: fileMemoryUpdates.length ? fileMemoryUpdates : undefined,
@@ -1241,9 +1535,11 @@ function missingRequiredArgs(tool: AgentTool, args: Record<string, unknown> | un
   for (const key of required) {
     if (typeof key !== "string") continue;
     const v = (a as Record<string, unknown>)[key];
+    // A required argument is "missing" only when it is genuinely ABSENT
+    // (undefined/null). An empty string is a legitimate value (e.g. `edit`'s
+    // `newString: ""` is a deletion), and empty arrays can be valid too; each
+    // tool's own `execute` validates its fields with a field-specific message.
     if (v === undefined || v === null) missing.push(key);
-    else if (typeof v === "string" && v.trim() === "") missing.push(key);
-    else if (Array.isArray(v) && v.length === 0) missing.push(key);
   }
   return missing;
 }
@@ -1270,14 +1566,18 @@ function makeToolResult(id: string, name: string, text: string, isError: boolean
   };
 }
 
-function hasStructuredDiff(details: unknown): details is { diff: string } {
-  return typeof details === "object" && details !== null && typeof (details as { diff?: unknown }).diff === "string";
-}
-
 function toolExecutionEventResult(result: ToolResultMessage): unknown {
-  return hasStructuredDiff(result.details)
-    ? { content: result.content, details: result.details }
-    : (result.details ?? result.content);
+  // Always carry both `content` (the text/blocks the model sees) and `details`
+  // (the structured payload) when a details object exists. Previously non-diff
+  // tools (e.g. `read`) emitted only `details` (`{ path, lineCount }`), which
+  // dropped the file content from the host-facing event and left the UI with
+  // nothing to render but the metadata. Keeping `content` on every event lets
+  // hosts render read output while still reading structured fields from
+  // `details`. When there's no details object, fall back to content alone.
+  if (result.details !== undefined) {
+    return { content: result.content, details: result.details };
+  }
+  return result.content;
 }
 
 function askUserQuestionRequestFromResult(
@@ -1287,6 +1587,10 @@ function askUserQuestionRequestFromResult(
   if (!details || typeof details !== "object") return undefined;
   const record = details as Record<string, unknown>;
   if (record.kind !== "ask_user_question") return undefined;
+  // Same guard as the flat loop's copy: the tool emits details on the ANSWERED
+  // path too (carrying any files the user attached), and treating those as a
+  // pending question would stop a phase that already has its answer.
+  if (record.answered === true) return undefined;
   if (typeof record.question !== "string" || record.question.trim().length === 0) return undefined;
   const options = Array.isArray(record.options)
     ? record.options.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
@@ -1345,21 +1649,22 @@ async function streamToMessage(
     temperature?: number;
     reasoning?: ThinkingLevel;
     signal?: AbortSignal;
-    transcriptMode?: TranscriptMode;
-    emitReasoning?: boolean;
+    emitText: boolean;
+    emitReasoning: boolean;
   },
 ): Promise<AssistantMessage> {
   let final: AssistantMessage | undefined;
   let started = false;
-  // `reasoning`/`emitReasoning` are runner concerns, not LLM request options.
-  const { emitReasoning, transcriptMode, ...streamOpts } = opts;
+  // `reasoning`/`emitText`/`emitReasoning` are runner emission concerns, not LLM
+  // request options — strip them before calling the bridge.
+  const { emitText, emitReasoning, ...streamOpts } = opts;
   for await (const ev of llm.stream(model, context, streamOpts)) {
     if (ev.type === "start" && !started) {
       started = true;
       emitAssistantLifecycle({
         emit,
         message: ev.partial,
-        transcriptMode,
+        emitText,
         emitReasoning,
         kind: "start",
       });
@@ -1369,7 +1674,7 @@ async function streamToMessage(
         emit,
         message: ev.partial,
         assistantMessageEvent: ev,
-        transcriptMode,
+        emitText,
         emitReasoning,
         kind: "update",
       });
@@ -1379,7 +1684,7 @@ async function streamToMessage(
       emitAssistantLifecycle({
         emit,
         message: ev.message,
-        transcriptMode,
+        emitText,
         emitReasoning,
         kind: "end",
       });
@@ -1388,7 +1693,7 @@ async function streamToMessage(
       emitAssistantLifecycle({
         emit,
         message: ev.error,
-        transcriptMode,
+        emitText,
         emitReasoning,
         kind: "end",
       });

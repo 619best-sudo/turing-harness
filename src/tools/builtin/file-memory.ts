@@ -76,7 +76,12 @@ export function createFileMemoryTool(memory: FileMemory): AgentTool {
                 .join(" | ");
               return `- ${result.path}\n  ${result.summary}${extra ? `\n  ${extra}` : ""}`;
             })
-            : ["(no matching files)"];
+            // An empty result must not read as "the code does not exist". Say what
+            // to try next, in this tool, before the loop's search ladder has to.
+            : [
+              "(no matching files)",
+              `Worth trying: retry with ONE distinctive term (a symbol, filename fragment, route or error string) instead of a phrase, and drop any extensions/tags filters. Check the index is warm with action:"stats". After a few empty queries, searching with grep/bash is usually the better bet — an empty index entry is not evidence of a missing file.`,
+            ];
           return {
             output: lines.join("\n"),
             details: await createLazyToolResultDetails(ctx, {

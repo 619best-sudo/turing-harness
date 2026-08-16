@@ -32,7 +32,14 @@ export function createProjectMemoryTool(memory: ProjectMemory): AgentTool {
   return {
     name: "project_memory",
     description:
-      "Read or update durable project memory: the project's category (frontend/mobile/games/backend) + tech stack, and facts learned across runs. Actions: get, remember, recall, set_category (default: inferred — category→set_category, text→recall, otherwise get; `remember` must be explicit).",
+      "Read or update durable project memory — the ONLY thing that outlives this conversation: the project's " +
+      "category (frontend/mobile/games/backend) + tech stack, and the rules learned across runs. " +
+      "`remember` the two things that would otherwise be re-learned every run: a STANDING PREFERENCE the user " +
+      "states or corrects you on (\"colors come from the tokens file, never raw hex\"), and a RESOLVED FAILURE " +
+      "you hit twice (\"playwright needs the dev server already running\") — the rule and its cause, never the " +
+      "symptom, and never anything the code already states. " +
+      "Actions: get, remember, recall, set_category (default: inferred — category→set_category, text→recall, " +
+      "otherwise get; `remember` must be explicit).",
     // Reads dominate; remembering a fact is a low-risk local note, not a code change.
     mutates: false,
     phases: ["prepare", "plan", "perform", "perfect"],

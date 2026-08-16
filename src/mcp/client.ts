@@ -11,6 +11,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { AgentTool, JSONSchema, ToolResultContent } from "../types.js";
 import type { ProviderInput } from "../registry/registry.js";
+import type { McpToolCache } from "./tool-cache.js";
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
@@ -42,38 +43,32 @@ export interface McpServerOptions {
 }
 
 /**
- * npx and pnpm dlx optimisation. Detects `npx -y <pkg>` style invocations and
- * returns an args list with cache-friendly flags injected so subsequent calls
- * don't re-hit the registry:
- *   - `npx -y ...`        → `npx -y --prefer-offline ...`  (use cache if warm)
- *   - `npx -y --no ...`   → unchanged (user explicitly asked for offline)
- *   - `pnpm dlx ...`      → unchanged (pnpm's store is already content-addressed)
- *   - everything else     → unchanged
+ * Normalises an MCP spawn command. Currently a pass-through.
  *
- * `--prefer-offline` makes npx skip the registry check when the package is in
- * the npm cache, so the dominant cost on the second run becomes the actual
- * `npx` process spawn (≈100 ms) instead of a 1–3 s network round-trip.
+ * This used to inject `--prefer-offline` into `npx -y <pkg>` to skip the npm
+ * registry check when the package was already cached, saving roughly a second.
+ * That was a bad trade: `--prefer-offline` applies to the ENTIRE transitive
+ * dependency tree, so any dependency whose metadata is missing or stale in the
+ * local cache resolves as "version does not exist" and the server never starts.
+ *
+ * Measured on a real server — same package, same machine:
+ *   npm install --prefer-offline some-mcp-server@1.0.0
+ *     -> npm error ETARGET  No matching version found for a transitive dep
+ *   npm install some-mcp-server@1.0.0
+ *     -> added 134 packages in 4s
+ *
+ * The failure mode is brutal out of proportion to the saving: npm spends ~30s
+ * resolving before erroring, the pool retries on every prewarm, and the run's
+ * bridge-attach window expires — so the model is told it has no MCP tools at all
+ * and silently works without them. A second of spawn latency is cheap next to
+ * that, so the flag is gone. Keep this function as the single place any future
+ * command rewriting goes, so it stays testable.
  */
 export function optimizeMcpArgs(command: string, args: readonly string[] | undefined): {
   command: string;
   args: string[];
 } {
-  const base = command.split("/").pop() ?? command;
-  if (base !== "npx") return { command, args: [...(args ?? [])] };
-  const list = [...(args ?? [])];
-  if (list.includes("--offline") || list.includes("--prefer-offline") || list.includes("--no")) {
-    return { command, args: list };
-  }
-  // `--prefer-offline` is the lowest-impact cache-first flag; npm treats it
-  // as "use cache if present, fall back to network". Insert right after the
-  // existing `-y`/`--yes` so the user-visible invocation order is preserved.
-  const yesIdx = list.findIndex((a) => a === "-y" || a === "--yes");
-  if (yesIdx >= 0) {
-    list.splice(yesIdx + 1, 0, "--prefer-offline");
-  } else {
-    list.unshift("--prefer-offline");
-  }
-  return { command, args: list };
+  return { command, args: [...(args ?? [])] };
 }
 
 /**
@@ -127,9 +122,8 @@ export class McpClient {
 
   async start(): Promise<McpToolDef[]> {
     const t0 = Date.now();
-    // Inject --prefer-offline for npx so cached packages don't re-hit the
-    // registry. The original `opts.command`/`opts.args` are preserved on the
-    // instance for diagnostic logging; only the spawn uses the optimised set.
+    // Command normalisation hook. `opts.command`/`opts.args` stay untouched on
+    // the instance for diagnostic logging; only the spawn uses the result.
     const { command, args } = optimizeMcpArgs(this.opts.command, this.opts.args);
     this.proc = spawn(command, args, {
       env: { ...process.env, ...this.opts.env },
@@ -261,11 +255,16 @@ export class McpClient {
  * Connect to an MCP server and return a ProviderInput ready for `registry.add`.
  * Each MCP tool becomes an AgentTool that proxies through the live client.
  */
-export async function connectMcpServer(opts: McpServerOptions): Promise<ProviderInput> {
-  const client = new McpClient(opts);
-  const toolDefs = await client.start();
-
-  const tools: AgentTool[] = toolDefs.map((def) => ({
+/**
+ * Build the AgentTools for an MCP server from a tool list, routing each call
+ * through `getClient()` so the transport can be created lazily.
+ */
+function buildMcpTools(
+  opts: McpServerOptions,
+  toolDefs: readonly McpToolDef[],
+  getClient: () => Promise<McpClient>,
+): AgentTool[] {
+  return toolDefs.map((def) => ({
     name: def.name,
     description: def.description ?? `MCP tool ${def.name}`,
     parameters: def.inputSchema ?? { type: "object", properties: {} },
@@ -279,6 +278,15 @@ export async function connectMcpServer(opts: McpServerOptions): Promise<Provider
         data: args,
       });
       try {
+        const client = await getClient();
+        // NOTE: this used to rescale mobile tap coordinates that arrived in
+        // physical pixels instead of the logical points the tool consumed. That
+        // shim keyed on the legacy device server's tool names, which the harness
+        // no longer speaks — device automation is the built-in `mobile_*`
+        // toolkit over `mobilecli`, and the bounds check that catches a
+        // physical-pixel coordinate now lives in `mobile_tap`, next to the
+        // screen size it needs. An MCP transport is the wrong place to know
+        // about one server's coordinate space.
         const { content, isError } = await client.callTool(def.name, args);
         const output = content
           .filter((c) => c.type === "text")
@@ -290,6 +298,69 @@ export async function connectMcpServer(opts: McpServerOptions): Promise<Provider
       }
     },
   }));
+}
+
+/**
+ * Connect an MCP server using CACHED tool metadata, deferring the spawn until a
+ * tool is actually called.
+ *
+ * Returns `undefined` when the cache has nothing for this server, so the caller
+ * falls back to {@link connectMcpServer}. That is the only difference in
+ * behaviour: with a warm cache this is a synchronous object construction; the
+ * child process, handshake and any npm work happen on first tool use.
+ *
+ * On that first use the live tool list is written back to the cache, so a server
+ * whose tools changed is corrected for the next run.
+ */
+export function connectMcpServerFromCache(
+  opts: McpServerOptions,
+  cache: McpToolCache,
+  signature: string,
+): ProviderInput | undefined {
+  const cached = cache.get(signature);
+  if (!cached || cached.length === 0) return undefined;
+
+  let client: McpClient | undefined;
+  let starting: Promise<McpClient> | undefined;
+  const getClient = (): Promise<McpClient> => {
+    if (client) return Promise.resolve(client);
+    starting ??= (async () => {
+      const fresh = new McpClient(opts);
+      const live = await fresh.start();
+      client = fresh;
+      // Refresh from the authoritative list now that the server has spoken.
+      cache.set(signature, live);
+      return fresh;
+    })().catch((err: unknown) => {
+      // Let the next call retry rather than caching a rejected promise forever.
+      starting = undefined;
+      throw err;
+    });
+    return starting;
+  };
+
+  return {
+    id: opts.id,
+    kind: "mcp",
+    source: "external",
+    name: opts.name ?? opts.id,
+    tools: buildMcpTools(opts, cached, getClient),
+    // Nothing to tear down if no tool was ever called.
+    dispose: () => (client ? client.stop() : Promise.resolve()),
+    metadata: { command: opts.command, args: opts.args, transport: "stdio", lazy: true },
+  };
+}
+
+export async function connectMcpServer(
+  opts: McpServerOptions,
+  /** When supplied, the live tool list is recorded so the next run can go lazy. */
+  cache?: { cache: McpToolCache; signature: string },
+): Promise<ProviderInput> {
+  const client = new McpClient(opts);
+  const toolDefs = await client.start();
+  cache?.cache.set(cache.signature, toolDefs);
+
+  const tools: AgentTool[] = buildMcpTools(opts, toolDefs, () => Promise.resolve(client));
 
   return {
     id: opts.id,
