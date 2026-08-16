@@ -251,6 +251,15 @@ function resolveCategorizerTools(
  * Enforce "create_plan always" in write_edit: the first write/edit is refused
  * (twice, then allowed — a deadlock is worse than a soft nudge) until a
  * create_plan call has succeeded in this loop.
+ *
+ * The rule is taught at the DESCRIPTION layer too, not only enforced at the
+ * gate: a small model chooses its next call from the tool schemas, and the
+ * stock `create_plan` description ("for any task that spans more than one
+ * file or more than one step") actively licenses skipping the plan for a
+ * one-line change — the exact run that made this necessary. In this
+ * categorizer the descriptions state the flow instead: create_plan is FIRST
+ * always, and write/edit is refused before it. Wrapping happens here so the
+ * flat loop (where plan-first is optional) keeps the stock descriptions.
  */
 function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
   let planSeen = false;
@@ -259,6 +268,13 @@ function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
     if (t.name === "create_plan") {
       return {
         ...t,
+        description:
+          t.description.replace(
+            "Call this ONCE, before doing any implementation work, for any task that spans more than one file or more than one step.",
+            "Call this ONCE, FIRST — before any implementation work.",
+          ) +
+          " In this categorizer it comes FIRST, ALWAYS — even for a single-file, one-line change " +
+          "(the plan may be a single step): every write/edit is refused until this has succeeded.",
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
           const res = await t.execute(id, args, ctx);
           if (!res.isError) planSeen = true;
@@ -270,13 +286,17 @@ function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
       return {
         ...t,
         mutates: t.mutates,
+        description:
+          t.description +
+          " Plan-first: REFUSED until create_plan has succeeded in this categorizer — call create_plan first, then re-issue.",
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
           if (!planSeen && refusals < 2) {
             refusals++;
             return {
               output:
-                "create_plan comes FIRST in this categorizer: break the work into plan steps, " +
-                "then make this change. Call create_plan now and re-issue this call.",
+                "create_plan comes FIRST in this categorizer — even a one-line change gets a plan " +
+                "(it may be a single step). Call create_plan now, then re-issue this exact call; " +
+                "nothing is lost.",
               isError: true,
             };
           }
