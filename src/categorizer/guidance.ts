@@ -1219,6 +1219,32 @@ export const DRIVING_AUTOMATION = [
   "    binary WITHOUT your change on screen — so every tap and screenshot after verifies nothing.",
 ].join("\n");
 
+/**
+ * The fused web-automation block. One tool call per automation step is the
+ * whole point — without it a small model spends its budget on the snapshot →
+ * ref → click → re-snapshot ceremony and the user watches five cards per tap.
+ */
+export const DRIVE_TOOL = [
+  "DRIVING A WEB PAGE — the `drive` tool does ONE STEP PER CALL. Use it instead of raw browser_*",
+  "  tools: it resolves the target against the live page, acts, and returns the post-action",
+  "  screenshot plus what changed — so there is nothing to look up beforehand and nothing to",
+  "  re-check afterwards.",
+  "  THE SHAPE OF AN AUTOMATION PASS (each line = one call):",
+  '    1. `drive { action: "open", url }`     — navigate',
+  '    2. `drive { action: "look" }`          — screenshot + every element (names + refs), ONE result',
+  '    3. `drive { action: "click", target: "Sign in" }` / `fill` / `select` — act by DESCRIPTION',
+  '    4. `drive { action: "shot" }`          — the final capture',
+  "    5. hand the capture to `media_analysis` (lens:\"qa\" with `expected`) / study the logs → verdict",
+  "  RULES:",
+  "  - `target` is a description or a verbatim ref from `look`. NEVER a guessed CSS selector.",
+  "  - An ambiguous or missed target returns the page's element list — pick from it and re-issue;",
+  "    do not nudge or retry blind.",
+  "  - The click/fill/select result already carries the post-action screenshot: do NOT follow it",
+  "    with `look` just to see what happened.",
+  "  - For a device/simulator use `mobile` (same fused shape); for a one-shot page + console",
+  "    capture with no driving, `activity_inspect` remains one call.",
+].join("\n");
+
 export const GUIDANCE = {
   contract: { text: GUIDELINE_CONTRACT, applies: ALWAYS },
   runOrder: { text: RUN_ORDER, applies: ALWAYS },
@@ -1228,6 +1254,10 @@ export const GUIDANCE = {
     applies: (has) => has("file_memory") || has("graph_memory") || has("project_memory"),
   },
   web: { text: WEB_AND_SCRAPING, applies: (has) => has("web_search") || has("web_fetch") },
+  driveTool: {
+    text: DRIVE_TOOL,
+    applies: (has) => has("drive"),
+  },
   driving: {
     text: DRIVING_AUTOMATION,
     applies: (has) =>

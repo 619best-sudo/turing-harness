@@ -70,28 +70,34 @@ export async function resolveMentions(
     return item;
   };
 
-  for (const token of tokens) {
-    const slash = token.startsWith("/");
-    const item = matchProvider(token);
-    if (item && (item.kind === "skill" || item.kind === "mcp")) {
-      providers.add(item.id);
-      continue;
-    }
-    if (!slash) {
-      // `#token` may be a file mention.
-      const rel = token.slice(1);
-      const abs = path.isAbsolute(rel) ? rel : path.join(cwd, rel);
-      try {
-        const stat = await fs.stat(abs);
-        if (stat.isFile()) {
-          files.push(abs);
-          continue;
-        }
-      } catch {
-        // not a file either
+  // Provider matching is sync; the per-`#token` filesystem probes run in
+  // PARALLEL (independent stats, and they sit on the pre-router critical path).
+  const fileMentions = await Promise.all(
+    tokens.map(async (token) => {
+      const slash = token.startsWith("/");
+      const item = matchProvider(token);
+      if (item && (item.kind === "skill" || item.kind === "mcp")) {
+        providers.add(item.id);
+        return null; // resolved as a provider
       }
-    }
-    unknown.push(token);
+      if (!slash) {
+        // `#token` may be a file mention.
+        const rel = token.slice(1);
+        const abs = path.isAbsolute(rel) ? rel : path.join(cwd, rel);
+        try {
+          const stat = await fs.stat(abs);
+          if (stat.isFile()) return abs;
+        } catch {
+          // not a file either
+        }
+      }
+      return undefined; // unresolved
+    }),
+  );
+  for (let i = 0; i < tokens.length; i++) {
+    if (fileMentions[i] === null) continue; // provider hit
+    if (typeof fileMentions[i] === "string") files.push(fileMentions[i]!);
+    else unknown.push(tokens[i]);
   }
 
   // Resolve the executable tools for matched providers in one pass.

@@ -438,6 +438,8 @@ async function runCategorizerHop(
     mentionFiles: string[];
     mediaFact?: string;
     triageCallback?: (img: { path: string; mimeType: string }) => Promise<{ fact?: string; note?: string; category?: string } | undefined>;
+    readCache: Map<string, string>;
+    complexityByPath: Record<string, import("../types.js").ComplexityRating>;
   },
 ): Promise<HopRun> {
   const model = input.modelFor(def);
@@ -510,6 +512,8 @@ async function runCategorizerHop(
     ...(acceptedSnippets.length ? { attachedFileContents: acceptedSnippets } : {}),
     ...(shared.mediaFact ? { mediaFact: shared.mediaFact } : {}),
     ...(shared.triageCallback ? { triageAttachment: shared.triageCallback } : {}),
+    sharedReadCache: shared.readCache,
+    ...(Object.keys(shared.complexityByPath).length ? { complexityByPath: { ...shared.complexityByPath } } : {}),
     clarifyGate: shared.clarifyGate,
     phase: def.id,
     ...(input.projectCategory ? { projectCategory: input.projectCategory } : {}),
@@ -601,33 +605,38 @@ async function triageAttachments(input: CategorizerChainInput): Promise<{
       }
     : undefined;
 
-  for (const img of input.images ?? []) {
-    if (tctx) {
+  // Images triage in PARALLEL: each is an independent describe pass, and
+  // sequential awaits were the slowest part of multi-attachment startup.
+  const triagedImages = await Promise.all(
+    (input.images ?? []).map(async (img) => {
+      if (!tctx) return { path: img.path, mimeType: img.mimeType };
       try {
         const { result, fact, usage: u } = await triageImageAttachment(img, input.task, tctx);
         if (fact) facts.push(fact);
         if (u) usage = usage ? addUsage(usage, u) : u;
-        images.push({
+        return {
           path: img.path,
           mimeType: img.mimeType,
           ...(result.category ? { category: result.category } : {}),
           ...(result.note ? { label: result.note } : {}),
-        });
-        continue;
+        };
       } catch {
-        // fall through to un-enriched
+        // a failed triage leaves the image un-enriched, never blocks the run
+        return { path: img.path, mimeType: img.mimeType };
       }
-    }
-    images.push({ path: img.path, mimeType: img.mimeType });
-  }
+    }),
+  );
+  images.push(...triagedImages);
   for (const img of images) {
     notes.push(`${img.path}${img.label ? ` — ${img.label}` : ""} (${img.mimeType})`);
   }
 
   const fileLines: string[] = [];
-  for (const f of input.files ?? []) {
-    fileLines.push(`${f.path} (${f.mimeType})`);
-    if (tctx && isDocumentRef(f)) {
+  // Documents triage in parallel (independent OCR/text passes).
+  await Promise.all(
+    (input.files ?? []).map(async (f) => {
+      fileLines.push(`${f.path} (${f.mimeType})`);
+      if (!tctx || !isDocumentRef(f)) return;
       try {
         const { fact, usage: u } = await triageDocumentAttachment(f, input.task, tctx);
         if (fact) facts.push(fact);
@@ -635,8 +644,8 @@ async function triageAttachments(input: CategorizerChainInput): Promise<{
       } catch {
         // enrichment is best-effort
       }
-    }
-  }
+    }),
+  );
 
   return {
     images,
@@ -693,23 +702,28 @@ function buildTriageCallback(
 async function scanForProbeMarkers(cwd: string, paths: string[]): Promise<string[]> {
   if (!paths.length) return [];
   const fs = await import("node:fs/promises");
-  const remaining: string[] = [];
-  for (const p of paths) {
-    const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
-    try {
-      const content = await fs.readFile(abs, "utf8");
-      if (PROBE_MARKER_RE.test(content)) remaining.push(p);
-    } catch {
-      // missing/unreadable → can't confirm a marker; skip
-    }
-  }
-  return remaining;
+  // Parallel reads: the scan runs after every chain and the files are
+  // independent.
+  const checked = await Promise.all(
+    paths.map(async (p) => {
+      const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+      try {
+        const content = await fs.readFile(abs, "utf8");
+        return PROBE_MARKER_RE.test(content) ? p : null;
+      } catch {
+        // missing/unreadable → can't confirm a marker; skip
+        return null;
+      }
+    }),
+  );
+  return checked.filter((p): p is string => p !== null);
 }
 
 async function stripRemainingProbes(
   input: CategorizerChainInput,
   paths: string[],
   model: Model,
+  readCache: Map<string, string>,
 ): Promise<Usage | undefined> {
   const tools: AgentTool[] = [];
   for (const name of ["activity_cleanup", "remove_log", "bash_readonly", "read"]) {
@@ -723,6 +737,7 @@ async function stripRemainingProbes(
   if (!tools.some((t) => t.name === "activity_cleanup" || t.name === "remove_log")) return undefined;
   const loop = await runToolLoop({
     task: input.task,
+    sharedReadCache: readCache,
     systemPrompt: [
       "You are the cleanup pass of a coding run. Earlier categorizers instrumented these files with",
       "activity-monitor probes (`__t(...)` / TURING_TRACE lines). Strip every probe marker from each",
@@ -807,6 +822,14 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
   // same describe→ocr pass the up-front pre-pass runs.
   const triageCallback = buildTriageCallback(input);
 
+  // RUN-LEVEL EFFICIENCY STATE, threaded through every hop:
+  //  • readCache — one dedup cache across hops (write_edit never re-pays a
+  //    read the read categorizer already made; writes still invalidate).
+  //  • complexityByPath — difficulty floors (plan-task + tool-measured)
+  //    ratchet UP across hops, so read's verdict reaches write_edit's gate.
+  const readCache = new Map<string, string>();
+  const complexityByPath: Record<string, import("../types.js").ComplexityRating> = {};
+
   const shared = {
     clarifyGate: new ClarifyGate(),
     mentionTools,
@@ -817,6 +840,8 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     mentionFiles,
     ...(triageCallback ? { triageCallback } : {}),
     ...(triage.mediaFact ? { mediaFact: triage.mediaFact } : {}),
+    readCache,
+    complexityByPath,
   };
 
   // --- hop loop ---
@@ -865,6 +890,12 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
       const { hop, loop } = await runCategorizerHop(input, def, hops, shared);
       hops.push(hop);
       totalUsage = addUsage(totalUsage, loop.usage);
+      // Ratchet the run's per-path difficulty floors (never down).
+      const rank = { low: 0, medium: 1, high: 2 } as const;
+      for (const [path, rating] of Object.entries(loop.complexityByPath ?? {})) {
+        const prev = shared.complexityByPath[path];
+        if (!prev || rank[rating] > rank[prev]) shared.complexityByPath[path] = rating;
+      }
       refs.push(...loop.refs);
       for (const p of loop.writtenPaths) if (!writtenPaths.includes(p)) writtenPaths.push(p);
       for (const p of loop.readPaths) if (!readPaths.includes(p)) readPaths.push(p);
@@ -894,7 +925,12 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
       for (const p of writtenPaths) instrumented.add(p);
       const remaining = await scanForProbeMarkers(input.cwd, [...instrumented]);
     if (remaining.length) {
-      const stripUsage = await stripRemainingProbes(input, remaining, input.modelFor(getCategory(input.setup, "activity_inspect")));
+      const stripUsage = await stripRemainingProbes(
+        input,
+        remaining,
+        input.modelFor(getCategory(input.setup, "activity_inspect")),
+        shared.readCache,
+      );
       if (stripUsage) totalUsage = addUsage(totalUsage, stripUsage);
     }
   } catch {

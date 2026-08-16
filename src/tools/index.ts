@@ -17,6 +17,7 @@ import {
   createInspirationGeneratorTool,
   type InspirationGeneratorConfig,
 } from "./builtin/inspiration-generator.js";
+import { createDriveTool } from "./builtin/drive.js";
 
 export * from "./builtin/coding.js";
 export * from "./builtin/assets-generator.js";
@@ -28,6 +29,7 @@ export * from "./builtin/ask-user-question.js";
 export * from "./builtin/plan.js";
 export * from "./builtin/web.js";
 export * from "./builtin/inspiration-generator.js";
+export * from "./builtin/drive.js";
 
 export interface BuiltinToolsConfig {
   logStore: LogStore;
@@ -150,6 +152,17 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
         "on-screen element), tap/longpress/swipe/type/press/open, launch/terminate/install/apps, devices. " +
         "`tap` takes a DESCRIPTION and resolves it against the live screen. All coordinates are LOGICAL POINTS.",
       tools: [createMobileTool()],
+    },
+    {
+      id: "builtin:drive",
+      kind: "tool",
+      source: "internal",
+      name: "drive",
+      description:
+        "Fused web automation (the mobile tool's twin): `drive { action }` — look (screenshot + " +
+        "elements in one), click/fill/select by DESCRIPTION (resolve → act → post-shot + what changed, " +
+        "one call), open, press, shot (final capture for media_analysis), close.",
+      tools: [createDriveTool()],
     },
     {
       id: "builtin:activity_monitor",

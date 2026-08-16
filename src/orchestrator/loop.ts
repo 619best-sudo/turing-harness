@@ -199,6 +199,13 @@ export interface ToolLoopInput {
   attachedFileContents?: ReadFileContent[];
   attachedContextFiles?: ReadFileContent[];
   /**
+   * A read-dedup cache SHARED across a run's loops (the chain threads one in).
+   * Within a loop, identical read-only calls are served from cache; a write to a
+   * path invalidates its entries. Sharing it across hops means write_edit does
+   * not re-pay (or re-escalate) reads the read categorizer already made.
+   */
+  sharedReadCache?: Map<string, string>;
+  /**
    * The detected project category, threaded live so the post-Prepare correction
    * is seen here. Drives the non-UI skip: when `"backend"`, the
    * inspiration/design-skill reference ladder is bypassed (no UI to design) and
@@ -272,6 +279,11 @@ export interface ToolLoopResult {
    * stopped calling tools. Undefined on a natural stop.
    */
   terminatedBy?: string;
+  /**
+   * Final per-path complexity state (plan floors + measured ratchets), for
+   * callers that chain loops and want difficulty to carry forward.
+   */
+  complexityByPath?: Record<string, import("../types.js").ComplexityRating>;
 }
 
 /**
@@ -391,7 +403,7 @@ function guessImageMime(p: string): string {
       file.content,
     ] as const),
   );
-  const readCache = new Map<string, string>();
+  const readCache = input.sharedReadCache ?? new Map<string, string>();
   let maxComplexity = 0;
   let lastAssistant: AssistantMessage | undefined;
   let error: string | undefined;
@@ -511,6 +523,12 @@ function guessImageMime(p: string): string {
           });
         }
       }
+
+      // Context size computed ONCE per turn and reused by every complexity
+      // estimate in it. The old code serialized the ENTIRE history
+      // (JSON.stringify) on EVERY tool call — O(history × calls) work per turn,
+      // which is what made long runs slow down as they grew.
+      const turnContextChars = historySize(context.messages);
 
       emit({ type: "turn_start" });
       const assistant = await streamToMessage(llm, liveModel, context, emit, {
@@ -764,7 +782,7 @@ function guessImageMime(p: string): string {
         const inheritedRating = inheritedKey ? COMPLEXITY_BY_PATH.get(inheritedKey) : undefined;
         const complexity = estimateComplexity({
           toolCount: input.tools.length,
-          contextChars: JSON.stringify(context.messages).length,
+          contextChars: turnContextChars,
           mutates,
           refs,
           bias: tool?.complexityHint ? tool.complexityHint - 0.3 : 0,
@@ -1664,6 +1682,10 @@ function guessImageMime(p: string): string {
     ...(producedPlanSet ? { planSet: producedPlanSet } : {}),
     error,
     ...(terminatedBy ? { terminatedBy } : {}),
+    // The loop's final per-path complexity state (plan-task floors + tool-
+    // measured ratchets). The chain threads it into later hops so difficulty
+    // discovered in read reaches write_edit's permission gate.
+    complexityByPath: Object.fromEntries(COMPLEXITY_BY_PATH),
   };
 }
 

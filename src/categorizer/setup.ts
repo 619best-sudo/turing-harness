@@ -209,6 +209,7 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "ls",
         "media_analysis",
         "mobile",
+        "drive",
         "activity_search",
         "activity_tags",
         "activity_tail_file",

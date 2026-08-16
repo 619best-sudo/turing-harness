@@ -99,6 +99,12 @@ the post-write inspect hop.
   for fresh UI with no reference.
 - **Bounded results, compaction, stall guard, tool-failure ladder**
   (read the error → shell fallback → ask the user → honest stop).
+- **Fused automation**: `drive` (web) and `mobile` (devices) do one step per
+  call — look returns screenshot + elements together; click/fill/select take a
+  plain description, resolve it on the live page, act, and return the
+  post-action screenshot + what changed. The inspect pass is therefore:
+  add_log → build → open → look → click/fill… → shot → media_analysis/logs →
+  verdict, with no multi-call ceremony between the steps.
 - **clearing_doubt** everywhere: when unsure or beyond capability, the small
   model consults the big model and gets numbered steps for ITS OWN tools.
 

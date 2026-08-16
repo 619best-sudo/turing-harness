@@ -74,7 +74,7 @@ await agent.prompt("build me a landing page", attachments, { planMode: true });
 | `conversation` | — (globals) | — | fresh | `{summary}` |
 | `read` | read, ls, grep, bash_readonly, mark_concern_lines, *_memory | write_edit, activity_inspect | fresh | files (path/lines/snippet) + linked `codeSummary` |
 | `write_edit` | read/ls/grep, write, edit, **create_plan (always)**, assets_generator, inspiration_generator, design_skill | activity_inspect | read + activity_inspect deliverables | the writes that landed |
-| `activity_inspect` | media_analysis, mobile, activity_* family, add_log, remove_log | write_edit | write_edit deliverable **+ write/edit call records** | findings + logPaths + bugLocation + verdict |
+| `activity_inspect` | **drive** (fused web automation), media_analysis, mobile, activity_* family, add_log, remove_log | write_edit | write_edit deliverable **+ write/edit call records** | findings + logPaths + bugLocation + verdict |
 
 **Globals every categorizer receives**: `bash`, `ask_user_question`,
 `clearing_doubt`, `web_search`, `web_fetch`, `web_scrape` — plus the tools of
@@ -161,6 +161,26 @@ otherwise the plan auto-approves silently.
   each category's `model` (its driver), plus `routerModel` / `summaryModel` /
   `doubtModel` chain-wide. A category without a `model` drives on the work-tier
   default (conversation on the cheap tier).
+
+## Fused automation (`drive` + `mobile`)
+
+Automation is one tool call per step — never the snapshot → ref → click →
+re-snapshot ceremony:
+
+```
+add_log → build (bash) → drive open → drive look → drive click/fill/… → drive shot
+→ media_analysis (qa/compare) + activity_study → verdict
+```
+
+- `drive { action: "look" }` returns the screenshot **and** every element
+  (names + refs) in one result.
+- `drive { action: "click", target: "Sign in" }` resolves the description
+  against the live page, clicks, and returns the post-action screenshot plus
+  what changed — nothing to look up first, nothing to re-check after.
+- `drive { action: "shot" }` is the final capture for media_analysis.
+- Ambiguous/missed targets list the page's elements instead of guessing.
+- Devices/simulators use the same shape via `mobile`; a one-shot page + console
+  capture with no driving remains `activity_inspect`.
 
 ## clearing_doubt
 
