@@ -489,8 +489,9 @@ async function runCategorizerHop(
     data: { categorizer: def.id, tools: toolNames },
   });
 
-  // Read deliverables hand their snippets to the authoring pass as bounded
-  // file contents (write/edit's Model-B context), not just opening prose.
+  // Read deliverables hand their snippets to the authoring pass as bounded,
+  // LABELED extracts (write/edit's Model-B context), not just opening prose —
+  // via `handoffSnippets`, which never satisfies a `read` call.
   const acceptedSnippets = hops
     .filter((h) => (def.accepts?.from ?? []).includes(h.id))
     .flatMap((h) => {
@@ -529,7 +530,11 @@ async function runCategorizerHop(
       ? { planApproval: input.planApproval }
       : {}),
     ...(shared.images.length ? { images: shared.images } : {}),
-    ...(acceptedSnippets.length ? { attachedFileContents: acceptedSnippets } : {}),
+    // Read-deliverable snippets feed the AUTHORING context only (labeled as
+    // extracts). They must not satisfy a `read` — write_edit's edit anchors
+    // need the file's exact bytes, so a read in that hop executes for real
+    // (the shared read cache still dedups identical repeats).
+    ...(acceptedSnippets.length ? { handoffSnippets: acceptedSnippets } : {}),
     ...(shared.mediaFact ? { mediaFact: shared.mediaFact } : {}),
     ...(shared.triageCallback ? { triageAttachment: shared.triageCallback } : {}),
     sharedReadCache: shared.readCache,

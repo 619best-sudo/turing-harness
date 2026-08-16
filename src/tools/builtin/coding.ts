@@ -2250,9 +2250,14 @@ async function executeWrite(
     } catch (err) {
       if (err instanceof AuthoringError) {
         // Nothing was written. Say so explicitly and name the cause, so the model
-        // retries differently instead of re-issuing the identical call.
+        // retries differently instead of re-issuing the identical call — and name
+        // the self-serve escape: a caller that already knows the contents has no
+        // reason to wait on the authoring model at all.
         return {
-          output: `write: authoring escalation failed for ${file} — ${err.message} Nothing was written.`,
+          output:
+            `write: authoring escalation failed for ${file} — ${err.message} Nothing was written. ` +
+            `If you already know the contents, re-issue the write WITH explicit \`content\` — it is ` +
+            `applied directly, no authoring model involved.`,
           isError: true,
           details: { path: file, authoringFailure: err.message },
         };
@@ -2607,8 +2612,16 @@ async function executeEdit(
       };
     } catch (err) {
       if (err instanceof AuthoringError) {
+        // The self-serve path matters here more than on write: an edit caller
+        // that omitted `newString` usually KNOWS the replacement (a colour, a
+        // label) and only skipped it because the schema allowed the omission.
+        // Without this hint the model shells out to `sed -i`, which the loop
+        // refuses, and the run burns turns rediscovering what one line says.
         return {
-          output: `edit: authoring escalation failed for ${file} — ${err.message} Nothing was changed.`,
+          output:
+            `edit: authoring escalation failed for ${file} — ${err.message} Nothing was changed. ` +
+            `If you know the replacement, re-issue the edit WITH an explicit \`newString\` — it is ` +
+            `applied directly, no authoring model involved.`,
           isError: true,
           details: { path: file, authoringFailure: err.message },
         };

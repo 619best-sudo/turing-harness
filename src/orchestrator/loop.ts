@@ -199,6 +199,17 @@ export interface ToolLoopInput {
   attachedFileContents?: ReadFileContent[];
   attachedContextFiles?: ReadFileContent[];
   /**
+   * Task-relevant line extracts a prior categorizer's deliverable carried
+   * (read's `files[].snippet`). These reach the AUTHORING context only,
+   * clearly labeled as extracts — they are NOT verbatim file contents and
+   * must NEVER satisfy a `read` call: a hop that wants exact bytes (an edit
+   * anchor) gets a real read, not a paraphrase served as the file. Feeding
+   * them through the attached-file cache is exactly the field failure where
+   * write_edit's offset read came back as read's summary and the model fell
+   * back to `bash sed -n` to see its own lines.
+   */
+  handoffSnippets?: ReadFileContent[];
+  /**
    * A read-dedup cache SHARED across a run's loops (the chain threads one in).
    * Within a loop, identical read-only calls are served from cache; a write to a
    * path invalidates its entries. Sharing it across hops means write_edit does
@@ -1116,7 +1127,7 @@ function guessImageMime(p: string): string {
             ? (producedPlanSet.plans.flatMap((p) => p.tasks) as unknown[])
             : undefined;
         const authoringContext: AuthoringContext | undefined =
-          canAuthor && (taskWithClarification || effectivePlanJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length || liveImages.length)
+          canAuthor && (taskWithClarification || effectivePlanJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length || input.handoffSnippets?.length || liveImages.length)
             ? {
                 task: taskWithClarification,
                 ...(effectivePlanJson?.length ? { planJson: effectivePlanJson } : {}),
@@ -2420,13 +2431,23 @@ function buildAuthoringSnippets(input: ToolLoopInput): { fileSnippets?: Array<{ 
   const MAX = 12000;
   const fileSnippets: Array<{ path: string; content: string }> = [];
   let totalChars = 0;
-  for (const file of [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])]) {
-    if (!file?.path || !file?.content) continue;
-    if (totalChars >= MAX) break;
+  const push = (file: ReadFileContent, label?: string) => {
+    if (!file?.path || !file?.content) return;
+    if (totalChars >= MAX) return;
     const remaining = MAX - totalChars;
-    const content = file.content.length > remaining ? file.content.slice(0, remaining) : file.content;
+    const raw = file.content.length > remaining ? file.content.slice(0, remaining) : file.content;
+    // Handoff extracts are labeled so the authoring model never mistakes a
+    // prior pass's extract for the file itself; verbatim attached files need
+    // no label.
+    const content = label ? `${label}\n${raw}` : raw;
     fileSnippets.push({ path: file.path, content });
     totalChars += content.length;
+  };
+  for (const file of [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])]) {
+    push(file);
+  }
+  for (const file of input.handoffSnippets ?? []) {
+    push(file, "[task-relevant lines extracted by the read pass — NOT the full file]");
   }
   return fileSnippets.length ? { fileSnippets } : {};
 }

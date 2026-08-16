@@ -481,16 +481,14 @@ async function completeWithRetry(
     };
   }
   // Empty text with a thinking block is the reasoning-runaway signature: the model
-  // spent its budget in `reasoning` and never emitted `content`. Worth its own
-  // message, because "returned empty" sends you looking at the prompt instead of
-  // the reasoning budget.
-  if (hasThinking(first.content)) {
-    throw new AuthoringError(
-      `model returned ONLY reasoning and no content (${usage.output} output tokens` +
-        `${first.stopReason === "length" ? ", hit the completion limit" : ""}). ` +
-        `It never began writing the file. Lower the reasoning effort or cap reasoning tokens.`,
-    );
-  }
+  // spent its budget in `reasoning` and never emitted `content`. This is the MOST
+  // recoverable empty response — the model was mid-thought, not refusing — so it
+  // takes the same nudge-and-retry as a plain empty answer, at LOWERED reasoning
+  // effort (the first attempt proved the effort outruns the budget). Throwing
+  // here, as this used to, is a field-proven triple loss: the 32k-token bill is
+  // paid, the tool fails, and the calling model burns extra turns rediscovering
+  // the self-serve path (read again → shell edit refused → read again).
+  const runaway = hasThinking(first.content);
 
   const retryContext: Context = {
     ...context,
@@ -500,7 +498,8 @@ async function completeWithRetry(
         role: "user",
         content:
           "Your last response was empty. Output the file contents now — raw text only, " +
-          "no fences, no commentary, no explanation of why.",
+          "no fences, no commentary, no explanation of why." +
+          (runaway ? " Do NOT reason first: emit the contents as your response." : ""),
         timestamp: Date.now(),
       },
     ],
@@ -508,7 +507,7 @@ async function completeWithRetry(
   const second = await llm.complete(model, retryContext, {
     temperature: 0,
     signal,
-    ...budget,
+    ...(runaway ? { reasoning: "low" } : budget),
   });
   if (second.stopReason === "error") {
     throw new AuthoringError(
@@ -519,10 +518,11 @@ async function completeWithRetry(
   const cleanedSecond = stripFences(extractText(second.content), path);
   const secondText = cleanedSecond.text;
   const total = mergeUsage(usage, second.usage ?? emptyUsage());
-  if (!secondText.trim() && hasThinking(second.content)) {
+  if (!secondText.trim() && (runaway || hasThinking(second.content))) {
     throw new AuthoringError(
       `model returned only reasoning and no content on both attempts (${total.output} output ` +
-        `tokens total). Lower the reasoning effort or cap reasoning tokens for authoring.`,
+        `tokens total, including a retry at LOW reasoning effort). It never began writing the ` +
+        `file. Cap reasoning tokens for authoring, or pin a model that answers within its budget.`,
     );
   }
   if (secondText.trim() && second.stopReason === "length") {
