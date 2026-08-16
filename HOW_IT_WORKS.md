@@ -117,5 +117,7 @@ the post-write inspect hop.
   means defects were found. No verdict, no claim.
 - Plans are structured (`PLANS_JSON`), reviewed only in plan mode, and their
   per-task complexity floors the writes on their files.
-- Every hop emits `categorizer_start` / `categorizer_end` (with the
-  deliverable) for UI cards; the pi event stream is unchanged.
+- Per-hop deliverables are INTERNAL handoffs: they are never emitted as UI
+  events. `categorizer_start`/`categorizer_end` are progress telemetry only
+  (which hop, which paths); the run's single user-facing summary is the final
+  one, composed from every hop's deliverable.

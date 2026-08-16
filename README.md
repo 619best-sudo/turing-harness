@@ -198,9 +198,15 @@ namespaced pair (ignorable by pi UIs):
 
 ```ts
 | { type: "categorizer_start"; categorizer: string; model: string }
-| { type: "categorizer_end"; categorizer: string; summary: string;
-    deliverable?: unknown; writtenPaths?: string[]; readPaths?: string[] }
+| { type: "categorizer_end"; categorizer: string; writtenPaths?: string[]; readPaths?: string[] }
 ```
+
+Hop events are **progress telemetry only**. Each categorizer's deliverable is an
+internal handoff for the next categorizer — it is never emitted as UI content.
+The single user-facing summary of a run is the final one
+(`RunLoopResult.summary`), composed from every hop's deliverable: a
+summary-of-summaries, produced by a dedicated summary turn when the last
+categorizer finishes.
 
 The old `phase_*` / `chain_*` events are retired with the 4P system.
 

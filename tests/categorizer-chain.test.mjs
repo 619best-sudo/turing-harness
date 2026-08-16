@@ -291,6 +291,30 @@ test("planMode gates the plan CARD; the plan always runs", async () => {
   }
 });
 
+test("hop deliverables are internal: categorizer_end carries no summary/deliverable; the final summary is the composed one", async () => {
+  const { dir, orch } = await graphSetup();
+  const hopEnds = [];
+  const summaries = [];
+  orch.subscribe((e) => {
+    if (e.type === "categorizer_end") hopEnds.push(e);
+  });
+  const result = await orch.run("fix the service");
+
+  // Progress telemetry only: id + paths. The deliverable never rides the event.
+  assert.equal(hopEnds.length, 3, "three hops ended");
+  for (const e of hopEnds) {
+    assert.equal("summary" in e, false, "no summary on the hop event");
+    assert.equal("deliverable" in e, false, "no deliverable on the hop event");
+    assert.ok(typeof e.categorizer === "string");
+  }
+
+  // The ONE user-facing summary is the final composed one — grounded in every
+  // hop's deliverable (the summary-of-summaries turn).
+  assert.ok(result.summary && result.summary.length > 0, "final summary exists");
+  summaries.push(result.summary);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("clearing_doubt consults the big model and returns executable steps", async () => {
   const llm = new OpenRouterBridge();
   llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text"] });

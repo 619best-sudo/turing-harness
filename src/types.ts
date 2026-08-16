@@ -732,15 +732,16 @@ export type AgentEvent =
   /** A categorizer hop is starting (router picked it; tools are scoped). */
   | { type: "categorizer_start"; categorizer: string; model: string }
   /**
-   * A categorizer hop finished: one-line summary, its structured deliverable,
-   * and the paths it wrote/read. Lightweight by design — hosts render a card,
-   * not a transcript.
+   * A categorizer hop finished. PROGRESS TELEMETRY ONLY: the hop's deliverable
+   * is an internal handoff for the NEXT categorizer and is deliberately NOT
+   * carried here — the only user-facing summary of a run is the final one
+   * (RunLoopResult.summary / the last assistant message), composed from every
+   * hop's deliverable. Hosts may use this event for progress indication
+   * (a step finished, these paths changed); never for content to display.
    */
   | {
       type: "categorizer_end";
       categorizer: string;
-      summary: string;
-      deliverable?: unknown;
       writtenPaths?: string[];
       readPaths?: string[];
     }

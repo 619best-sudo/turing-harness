@@ -555,11 +555,12 @@ async function runCategorizerHop(
     ...(loop.planSet ? { planSet: loop.planSet } : {}),
   };
 
+  // Progress telemetry only — the deliverable is the NEXT categorizer's
+  // handoff, not UI content; the run's single user-facing summary is the final
+  // one composed from every hop (see summarizeChain).
   input.emit({
     type: "categorizer_end",
     categorizer: def.id,
-    summary: hop.summary,
-    ...(deliverable ? { deliverable } : {}),
     ...(loop.writtenPaths.length ? { writtenPaths: loop.writtenPaths } : {}),
     ...(loop.readPaths.length ? { readPaths: loop.readPaths } : {}),
   });
