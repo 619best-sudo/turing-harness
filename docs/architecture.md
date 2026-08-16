@@ -10,8 +10,9 @@ Harness  (session manager)      shared LLM bridge + defaults; mints Sessions
     ├── PermissionGate          ask-all | bypass | ask-mutations
     ├── LogStore                structured logs; feeds activity_monitor
     ├── cwd + abort scope
-    └── Orchestrator            runs the loop; resolves per-phase/per-tool models
-        └── runPhase()          an LLM-driven tool loop for one phase → PhaseResult
+    └── Orchestrator            runs the loop; resolves per-slot/per-tool models
+        ├── run()               PRIMARY — one flat LLM-driven tool loop → RunLoopResult
+        └── runPhase()          legacy 4P — one phase → PhaseResult
             prepare → plan → perform → perfect (verify → retry)
 
 Shared (stateless): OpenRouterBridge (LLMBridge), model catalog, selection fns
@@ -96,11 +97,15 @@ Consequences:
 
 ## Model resolution order
 
-For a **phase**: `permissionDecision.model` → runtime override (`orchestrator.setModel(phase, …)`) → `models[phase]` config → `models.orchestrator` → built-in default.
+For a **slot**: `permissionDecision.model` → runtime override (`orchestrator.setModel(slot, …)`) → `models[slot]` config → `models.orchestrator` → built-in default.
 
-For a **tool call**: `permissionDecision.model` → `selectModel()` by complexity + required modalities (from `toolModelCandidates` or the built-in cheap→capable tiers) → the phase model.
+Under `run` the four `models` keys are **role slots, not phases**: `perform` is the work-loop driver, `prepare` is the intent router and conversational reply, `perfect` is the run summary, `plan` is unused.
 
-"If no model is specified, the orchestrator runs it" — the phase/orchestrator model is always the final fallback.
+For a **tool call**: `permissionDecision.model` → `selectModel()` by complexity + required modalities (from `toolModelCandidates` or the built-in cheap→capable tiers) → the driver.
+
+For an **escalation** (read comprehension / write authoring): `decision.authorModel` → `routeModel(kind, rating, category, hasAttachment)` → `toolModelCandidates` → no escalation.
+
+"If no model is specified, the orchestrator runs it" — the driver/orchestrator model is always the final fallback. Full detail: [complexity, category & models](./models.md).
 
 ## Result-processing model vs. authoring model (`model` vs `authorModel`)
 
@@ -117,9 +122,13 @@ Two **independent** permission-decision fields let a host swap in a second model
 
 This split keeps the orchestrator invariant intact: the runner still does no content reasoning — it only resolves the slug, assembles the bounded context, and accumulates usage. The authoring LLM call lives in the tool, exactly like `media_analysis` / `activity_monitor` already call `ctx.llm.complete(...)` internally.
 
-## Complexity
+## Complexity and category
 
-Every phase/tool call gets a `Complexity { score: 0..1, signals }` from `estimateComplexity()`, blending tool breadth, context size, attachment weight, and whether the call mutates. It is passed to the permission callback (so a UI can decide what to ask about and which model to pin) and drives automatic model-tier selection.
+Every tool call gets a `Complexity { score: 0..1, signals }` from `estimateComplexity()`, blending tool breadth, context size, attachment weight, and whether the call mutates. It is passed to the permission callback (so a UI can decide what to ask about and which model to pin) and drives automatic model-tier selection.
+
+Alongside the score, a call carries the human-scale `ComplexityRating` (`low`/`medium`/`high`) that the prompts and `routeModel` speak, plus a `ComplexityCategory` (`ui`/`svg`/`code`) saying what an escalated model must be strong *at*. The rating decides **whether** to escalate; the category decides **to what**; a third axis, whether the call carries images, decides whether the model needs eyes. The three are independent on purpose.
+
+A rating is declared (write/edit), measured (a read that rated the real bytes), inherited (a plan step), or estimated — reported honestly as `complexitySource`. See [complexity, category & models](./models.md).
 
 ## Registry & 4P categorization
 

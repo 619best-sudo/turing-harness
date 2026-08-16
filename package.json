@@ -1,7 +1,7 @@
 {
   "name": "turing-harness",
   "version": "0.1.0",
-  "description": "4P (Prepare, Plan, Perform, Perfect) coding-agent orchestration library.",
+  "description": "Coding-agent orchestration library: a flat tool loop with per-call model escalation by complexity and category (4P chain kept as a back-compat path).",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

@@ -617,9 +617,16 @@ mapping an escalation to a model slug:
 type ModelRouter = (input: {
   kind: "read" | "write";
   rating: "low" | "medium" | "high";
+  /** What the escalated model must be strong AT. Independent of `rating`. */
+  category?: "ui" | "svg" | "code";
+  /** Whether the call carries images — a design to build FROM. */
+  hasAttachment?: boolean;
   path?: string;
 }) => string | undefined;
 ```
+
+See [complexity, category and choosing models](./models.md) for where each of
+those inputs comes from.
 
 It answers a question `toolModelCandidates` cannot. That pool picks a tier with
 `floor(score * pool.length)`, so which model a rating lands on is a function of
@@ -633,20 +640,26 @@ Where each `kind` is consulted:
 | kind | consulted by | how it arrives |
 |---|---|---|
 | `read` | the staged `read`'s comprehension escalation (`comprehendFile`) | `ctx.routeModel`, because the escalation happens *inside* the tool |
-| `write` | `write` / `edit` byte authoring | the loop resolves it into `ctx.authorModel` |
+| `write` | `write` / `edit` byte authoring | the loop pre-resolves it into `ctx.authorModel`; the tool also consults `ctx.routeModel` itself |
 
 Precedence, highest first:
 
 1. **`decision.authorModel`** from the permission callback — a per-call
    instruction, more specific than standing policy.
 2. **`routeModel`** — returns a slug, or `undefined` for "no opinion".
-3. **`toolModelCandidates`** — the score-indexed pool.
+3. **`toolModelCandidates`** — the score-indexed pool. For authoring this is a
+   **vision-only** fallback; a plain write has no pool fallback.
 4. **No escalation.** The loop's own model does the work.
 
-`low` never routes: it proceeds unescalated, because spending a second model
-round-trip to re-derive what the loop's model was already trusted with is pure
-cost. The hook is additive — a host that passes no `routeModel` behaves exactly
-as before.
+A `low` **read** never routes: it returns the bytes and stops, because spending a
+second model round-trip to re-derive what the loop's model was already trusted
+with is pure cost. A `low` **write** *is* routed — the tool asks for every write —
+which is what lets `authorOnlyWrites` resolve its trivial tier (normally back to
+the driver itself). Under that mode a plain write with no routed author model
+errors loudly rather than being silently authored by the driver.
+
+The hook is additive — a host that passes no `routeModel` and does not enable
+`authorOnlyWrites` behaves exactly as before.
 
 ⚠️ Any slug that can end up as the **driver** must be reasoning-capable. A model
 without the capability returns stream deltas carrying only `content`/`role`, so

@@ -96,26 +96,35 @@ Modes:
 
 The callback can pin the model for that specific call via `decision.model`.
 
-## Per-phase and per-tool models
+## Per-slot and per-tool models
+
+The four `models` keys are named after the 4P phases, but under `run` they are
+**role slots**: `perform` drives the work loop, `prepare` runs the intent router
+and conversational replies, `perfect` writes the run summary, `plan` is unused.
 
 ```ts
 new Harness({
   models: {
     orchestrator: "anthropic/claude-haiku-4.5",  // fallback for anything unspecified
-    prepare: "anthropic/claude-haiku-4.5",
-    plan:    "anthropic/claude-opus-4.8",         // hard thinking → strong model
-    perform: "anthropic/claude-sonnet-4.5",
-    perfect: "anthropic/claude-sonnet-4.5",
+    perform: "anthropic/claude-sonnet-4.5",      // the driver
   },
   toolModelCandidates: ["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-opus-4.8"],
 });
 
 // Change at runtime:
-harness.orchestrator.setModel("plan", "openai/gpt-5");
+harness.orchestrator.setModel("perform", "openai/gpt-5");
 harness.orchestrator.setModel("orchestrator", undefined);  // clear override
+
+// On a warm session, set these PER RUN — the user can change models between runs:
+session.setToolModelCandidates([cheap, capable]);
+session.setRouteModel(routeModel);
 ```
 
-Per-tool model comes from the permission decision (`decision.model`); with none, `selectModel()` picks from `toolModelCandidates` (or the built-in cheap→capable tiers) by complexity and required modalities; with none capable, the phase model runs it.
+Per-tool model comes from the permission decision (`decision.model`); with none, `selectModel()` picks from `toolModelCandidates` (or the built-in cheap→capable tiers) by complexity and required modalities; with none capable, the driver runs it.
+
+Escalation — which model *comprehends* a hard file or *authors* a write's bytes —
+is a separate decision, made from the call's rating, category and attachments.
+See [complexity, category & models](./models.md).
 
 ## Multimodal inputs
 

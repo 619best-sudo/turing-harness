@@ -1,6 +1,17 @@
 # turing-harness documentation
 
-A coding-agent orchestration library built on the **4P model** — **Prepare → Plan → Perform → Perfect**. It is multimodal, OpenRouter-native, MCP/skills-aware, permission-gated, and structurally compatible with [`@mariozechner/pi`](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/). It runs in Node and in an Electron main process.
+A coding-agent orchestration library. The primary entry point is the **flat loop
+driver**, `run` — one agentic tool loop, with escalation decided per call from the
+work's complexity and category rather than from a fixed pipeline. It is
+multimodal, OpenRouter-native, MCP/skills-aware, permission-gated, and
+structurally compatible with
+[`@mariozechner/pi`](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/). It
+runs in Node and in an Electron main process.
+
+The **4P decomposition** (Prepare → Plan → Perform → Perfect) is the earlier
+design. `runChain`/`runPhase` remain as working back-compat shims, and the four
+phase names still appear as *model role slots* in config — see
+[choosing models](./models.md#the-model-slots) — but new code should call `run`.
 
 ## Start here
 
@@ -9,7 +20,9 @@ A coding-agent orchestration library built on the **4P model** — **Prepare →
 | [Getting started](./getting-started.md) | Install, configure, run your first chain and Agent |
 | [Multi-session (parallel runs)](./multi-session.md) | Run many isolated sessions concurrently in one process |
 | [Concepts & architecture](./architecture.md) | How the pieces fit, data flow, the orchestrator invariant |
-| [The 4P phases](./4p-phases.md) | Deep dive on each phase, the chain, and verify/retry |
+| [The loop driver (`run`)](./loop.md) | The primary entry point: how a run executes, stalls, escalates, and summarizes |
+| [Complexity, category & models](./models.md) | The model slots, the three escalation axes, `routeModel`, and how to configure it all |
+| [The 4P phases](./4p-phases.md) | **Legacy.** Deep dive on each phase, the chain, and verify/retry |
 | [Project presets](./project-presets.md) | Ready-made frontend / mobile / games / backend setups |
 | [Project memory](./project-memory.md) | Durable per-project memory; auto-detects tech stack on first init |
 | [File search](./file-search.md) | The memory-first search ladder: project → file → graph memory, shell only as a fallback |
@@ -37,15 +50,14 @@ import { Harness } from "@turing/harness";
 const harness = new Harness({ apiKey: process.env.OPENROUTER_API_KEY });
 
 harness.subscribe((e) => console.log(e.type));       // pi-compatible event stream
-const result = await harness.runChain("Add a /health endpoint with a test.");
+const result = await harness.run("Add a /health endpoint with a test.");
 
-console.log(result.success);                          // did Perfect verify?
-console.log(result.phases.perfect?.summary);          // the verdict + evidence
+console.log(result.summary);                          // honest end-of-run summary
 ```
 
-- **`runChain(task)`** runs Prepare → Plan → Perform → Perfect. Perfect verifies the work; on failure it re-runs Perform with feedback until it passes or hits the iteration cap. One successful `runChain` = one completed operation.
-- **`runPhase(phase, task)`** runs any single phase on its own.
+- **`run(task)`** is the primary entry point: a single tool loop that plans, works, verifies as it goes, and ends with one bounded summary turn. See [the loop driver](./loop.md).
 - **`createAgent()`** returns a pi-`Agent`-shaped facade (`subscribe`, `prompt`, `state`) for UIs.
+- **`runChain(task)` / `runPhase(phase, task)`** are the legacy 4P entry points, still supported.
 
 ## Requirements mapping
 
@@ -57,7 +69,7 @@ The library was built to a specific 7-point spec; each maps to code as follows.
 | 2 | pi-compatible call signature + response format | `types.ts`, `llm/bridge.ts`, `agent.ts` |
 | 3 | MCP/skills registry with get/add/delete + 4P category | `registry/registry.ts`, `registry/categorize.ts`, `mcp/client.ts` |
 | 4 | 4P chain; standalone phases; Perfect→Perform retry | `orchestrator/orchestrator.ts`, `orchestrator/phase-runner.ts` |
-| 5 | Customizable per-phase & per-tool models over OpenRouter | `llm/openrouter.ts`, `llm/models.ts`, `orchestrator` model resolution |
+| 5 | Customizable per-slot & per-tool models over OpenRouter | `llm/openrouter.ts`, `llm/models.ts`, `orchestrator` model resolution — see [models](./models.md) |
 | 6 | Internal tools: assets_generator, media_analysis, activity_monitor | `tools/builtin/*` |
 | 7 | No orchestrator file-reasoning/writes; permission gate + model selection by complexity/attachments | `orchestrator/phase-runner.ts`, `orchestrator/permission.ts`, `llm/model-selector.ts` |
 

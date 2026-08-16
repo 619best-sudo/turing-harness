@@ -413,7 +413,16 @@ export type ModelRouteKind = "read" | "write";
  * implied by a pool's ordering.
  *
  * Returning `undefined` means "no opinion" — the caller falls back to the
- * candidate pool, and then to not escalating at all. Never called for `low`.
+ * candidate pool, and then to not escalating at all.
+ *
+ * `low` is asymmetric between the two kinds, and hosts have to know which:
+ *   - a `low` READ never routes — `stageRead` returns the bytes and stops before
+ *     it would ask, since re-deriving what the reader was already trusted with is
+ *     pure cost;
+ *   - a `low` WRITE does route. The tool consults this for every write, which is
+ *     what lets `authorOnlyWrites` resolve its trivial tier (normally back to the
+ *     driver itself). Under that mode a plain write left unrouted errors rather
+ *     than being silently authored by the driver.
  */
 export type ModelRouter = (input: {
   kind: ModelRouteKind;

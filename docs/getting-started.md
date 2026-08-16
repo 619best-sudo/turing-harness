@@ -91,14 +91,16 @@ new Harness({
   permissionMode: "ask-mutations",   // "ask-all" | "bypass" | "ask-mutations"
   permissionCallback: (req) => ({ allowed: true }),
 
-  models: {                  // per-phase orchestrator models
-    orchestrator: "anthropic/claude-haiku-4.5",   // fallback for any phase/tool
-    prepare: "anthropic/claude-haiku-4.5",
-    plan:    "anthropic/claude-opus-4.8",
+  // Model role slots. Under `run`: perform = the work-loop driver, prepare = the
+  // intent router / conversational reply, perfect = the run summary, plan unused.
+  // `orchestrator` alone is enough — every slot falls back to it. See ./models.md.
+  models: {
+    orchestrator: "anthropic/claude-haiku-4.5",   // fallback for any slot/tool
     perform: "anthropic/claude-sonnet-4.5",
-    perfect: "anthropic/claude-sonnet-4.5",
   },
   toolModelCandidates: ["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4.5"],
+  routeModel,                // escalation policy: (kind, rating, category, attachment) → slug
+  visionModel: "google/gemini-2.5-flash",   // REQUIRED when the driver is text-only
 
   phaseTools: { perfect: [/* pin exact AgentTool[] */] },   // else resolved by 4P category
   maxSteps: { perform: 20 },        // OPTIONAL hard cap per phase; unset = run to completion

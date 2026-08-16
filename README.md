@@ -16,6 +16,7 @@ Full docs live in [`docs/`](./docs/index.md):
 - [Multi-session (parallel runs)](./docs/multi-session.md) — isolated sessions running concurrently in one process
 - [Concepts & architecture](./docs/architecture.md) — how it fits together, the orchestrator invariant
 - [The loop driver](./docs/loop.md) — the primary `run` entry point: flat loop, multi-plan steps, multimodal, run summary
+- [Complexity, category & models](./docs/models.md) — the model role slots, the three escalation axes (rating / category / attachment), `routeModel`, and how to configure it all
 - [The 4P phases](./docs/4p-phases.md) — the legacy `runChain` path: each phase, the chain, verify/retry
 - [Project presets](./docs/project-presets.md) — ready-made frontend / mobile / games / backend setups
 - [Project memory](./docs/project-memory.md) — durable per-project memory; auto-detects the tech stack on first init
