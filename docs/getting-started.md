@@ -16,7 +16,7 @@ node examples/smoke.mjs   # offline end-to-end demo (fake model, no network)
 export OPENROUTER_API_KEY=sk-or-...
 ```
 
-## Your first chain
+## Your first run
 
 ```ts
 import { Harness } from "@turing/harness";
@@ -27,39 +27,41 @@ const harness = new Harness({
   permissionMode: "bypass",    // auto-allow while you experiment
 });
 
-const result = await harness.runChain("Create a CONTRIBUTING.md with a PR checklist.");
+const result = await harness.run("Create a CONTRIBUTING.md with a PR checklist.");
 
-console.log("verified:", result.success);
-console.log("iterations:", result.iterations);
-console.log("changes:", result.phases.perform?.summary);
-console.log("verdict:", result.phases.perfect?.summary);
+console.log("success:", result.success);
+console.log("summary:", result.summary);     // honest end-of-run summary
+console.log("steps:", result.steps.length);  // empty for a planless run
+console.log("verified:", result.verified);   // undefined when the gate didn't run
 ```
 
-`runChain` returns a [`ChainResult`](./api-reference.md#chainresult): `success`, `iterations`, per-phase [`PhaseResult`](./api-reference.md#phaseresult)s, accumulated `refs`, and total `usage`.
+`run` returns a [`RunLoopResult`](./api-reference.md): `success`, `summary`, `steps`, `planSet`, `refs`, `usage`, and `verified`. See [the loop driver](./loop.md) for how a run actually executes.
 
 ## Watching what happens
 
-Subscribe to the event stream. It is a superset of pi's `AgentEvent` — the extra `phase_*`, `chain_*`, and `permission_*` events are namespaced so a pi UI can ignore them.
+Subscribe to the event stream. `run` emits only the pi-compatible events a pi UI already renders (`agent_*`, `turn_*`, `message_*`, `tool_execution_*`, `permission_*`); the `phase_*` / `chain_*` events belong to the legacy chain and are namespaced so they can be ignored.
 
 ```ts
 harness.subscribe((e) => {
   switch (e.type) {
-    case "phase_start":        console.log(`▶ ${e.phase} (${e.model})`); break;
+    case "agent_start":        console.log("▶ run started"); break;
     case "message_update":     process.stdout.write(deltaText(e.assistantMessageEvent)); break;
     case "tool_execution_end": console.log(`  ✓ ${e.toolName}`); break;
-    case "chain_end":          console.log(`done: success=${e.success}`); break;
+    case "agent_end":          console.log("done"); break;
   }
 });
 ```
 
-## Running a single phase
+## The legacy 4P entry points
 
-Any phase runs standalone and returns a `PhaseResult`:
+`runChain` (Prepare → Plan → Perform → Perfect, with a Perfect→Perform retry) and `runPhase` still work and return a `ChainResult` / `PhaseResult`:
 
 ```ts
 const briefing = await harness.runPhase("prepare", "Understand how auth works here.");
 console.log(briefing.summary);   // starts with "SUMMARY: ..."
 ```
+
+New code should call `run`. See [the 4P phases](./4p-phases.md).
 
 ## Using it as a pi-style Agent
 
@@ -70,10 +72,11 @@ agent.subscribe(renderPiEvent);          // same AgentEvent shape pi UIs consume
 await agent.prompt("Fix the failing login test");
 
 console.log(agent.state.messages);       // AppMessage[]
-console.log(agent.state.lastVerified);   // did the last chain verify?
+console.log(agent.state.lastRunSummary); // the end-of-run summary
+console.log(agent.state.lastVerified);   // did the verify gate pass?
 ```
 
-By default the Agent runs the full chain per `prompt`. To make a prompt run just one phase:
+By default (`mode: "chain"`, despite the legacy name) each `prompt` drives the flat `run` loop. To make a prompt run just one legacy 4P phase:
 
 ```ts
 const planner = harness.createAgent({ mode: "plan" });
@@ -110,9 +113,9 @@ new Harness({
 
   registerBuiltins: true,           // bundle bash/read/write/edit + the 3 internal tools
   assets: { backends: { image: myImageBackend } },
-  auditor: { model: "google/gemini-2.5-pro" },
-  studyModel: "anthropic/claude-haiku-4.5",
+  mediaAnalysis: { model: "google/gemini-2.5-pro" },   // vision for `media_analysis`
+  studyModel: "anthropic/claude-haiku-4.5",            // `activity_monitor`'s study action
 });
 ```
 
-Next: [Concepts & architecture](./architecture.md).
+Next: [Concepts & architecture](./architecture.md), then [complexity, category & models](./models.md) for how each of those model knobs is actually consulted.

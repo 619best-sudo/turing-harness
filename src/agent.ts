@@ -82,7 +82,11 @@ export interface HarnessAgentOptions {
   systemPrompt?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
-  /** Run mode: full 4P chain (default) or a single phase per prompt. */
+  /**
+   * Run mode. `"chain"` is the default and, despite the legacy name, drives the
+   * flat `run` loop — it is the primary path. Naming a `Phase` instead runs that
+   * single legacy 4P phase per prompt.
+   */
   mode?: "chain" | Phase;
   transcriptMode?: TranscriptMode;
   /**

@@ -9,7 +9,7 @@ A `Harness` is a **session manager**. Each `Session` is fully isolated, so a sin
 | `Registry` (built-ins + its own external MCP/skills) | `LLMBridge` (just does `fetch`) |
 | `LogStore` (its own tagged log; its own `activity_monitor`) | Model catalog (`resolveModel`, `MODEL_CATALOG`) |
 | `PermissionGate` (mode + callback) | Complexity / model-selection functions (pure) |
-| `Orchestrator` + runtime per-phase model overrides | Asset backends / auditor config (stateless) |
+| `Orchestrator` + runtime per-slot model overrides | Asset backends / media-analysis config (stateless) |
 | Working directory (`cwd`) | |
 | Event stream (`subscribe`) | |
 | Thread snapshot / follow-up context (`threadSnapshot`) | |
@@ -57,7 +57,7 @@ const [webResult, apiResult] = await Promise.all([
 | `addSharedProvider(input)` | Register a **stateless** provider into every session (current + future). |
 | `dispose()` | Close all sessions. |
 
-`SessionOptions` accepts everything `HarnessConfig` does for a single run (`cwd`, `permissionMode`, `permissionCallback`, `models`, `toolModelCandidates`, `phaseTools`, `maxSteps`, `reasoning`, `temperature`, `maxChainIterations`, `registerBuiltins`, `assets`, `auditor`, `studyModel`) plus `id`, `providers`, and `metadata`.
+`SessionOptions` accepts everything `HarnessConfig` does for a single run (`cwd`, `permissionMode`, `permissionCallback`, `models`, `toolModelCandidates`, `phaseTools`, `maxSteps`, `reasoning`, `temperature`, `maxChainIterations`, `registerBuiltins`, `assets`, `mediaAnalysis`, `visionModel`, `routeModel`, `studyModel`) plus `id`, `providers`, and `metadata`.
 
 ## Session API
 
