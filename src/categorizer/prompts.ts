@@ -39,6 +39,92 @@ export interface CategorizerPromptOptions {
   projectCategory?: import("../presets/project-presets.js").ProjectCategory;
 }
 
+// ---------------------------------------------------------------------------
+// Per-category asking-the-user scoping (the %%ASKING%% slot)
+// ---------------------------------------------------------------------------
+//
+// The shared ASK guidance (guidance.ts) covers HOW to ask; these blocks teach
+// WHAT `ask_user_question` is FOR in each categorizer, because a small model
+// driving one category needs the scope in its own terms. Every block ends with
+// the universal clause: in doubt — or beyond the model itself — ask.
+
+const ASKING_SLOT = "%%ASKING%%";
+
+const ASK_WHEN_IN_DOUBT = [
+  "",
+  "  UNIVERSAL (every category): ask when you are genuinely IN DOUBT — you cannot settle it from the",
+  "  code or a tool and a wrong guess wastes real work — or when the task itself is beyond you and you",
+  "  need the user's call on how to proceed. `ask_user_question` is for decisions and facts only the",
+  "  USER holds; for the HOW of a hard task, `clearing_doubt` hands you numbered steps from a senior",
+  "  model to execute with your own tools.",
+].join("\n");
+
+const ASKING_CONVERSATION = [
+  "ASKING THE USER HERE — you are answering, not doing project work, so ask almost nothing:",
+  "  - at most ONE short question, and only when the answer changes your answer (the request is",
+  "    genuinely ambiguous between two readings);",
+  "  - never ask about anything a search or a command can settle — go find out;",
+  "  - when in doubt what they meant, answer the most useful reading and say which one you picked.",
+  ASK_WHEN_IN_DOUBT,
+].join("\n");
+
+const ASKING_READ = [
+  "ASKING THE USER HERE — ask only for the one thing reading itself cannot recover: what the user",
+  "  actually means, when the RELEVANCE of your read depends on it:",
+  "  - the INTENT when the prompt is ambiguous — which goal is real decides which files matter, and",
+  "    reading the wrong target wastes the whole pass;",
+  "  - WHICH target when several could be meant (file, screen, feature, branch) and the choice changes",
+  "    what you read;",
+  "  - a domain term, version or constraint only they know, when it gates which files matter.",
+  "  Never ask for anything the repo answers — which files exist, what a file says, how things link:",
+  "  go and look. One question, with options when you can name them.",
+  ASK_WHEN_IN_DOUBT,
+].join("\n");
+
+const ASKING_WRITE_EDIT = [
+  "ASKING THE USER HERE — ask only for what you need to EXECUTE the task (never to re-confirm it):",
+  "  - a VALUE the request never names — new copy, a name, a colour, a limit. ENFORCED: the first",
+  "    write/edit is refused until you have asked; offer the candidates you can name as options;",
+  "  - an architecture, trade-off or irreversible choice only they own, or access only they can give",
+  "    (a credential, a running service, a permission) — and when they answer with a value, ACT on it",
+  "    immediately, never asking for the same value twice;",
+  "  - a requirement with two honest readings that diverge — building the wrong one means twice.",
+  "  Never ask what the code answers (conventions, existing patterns, file placement) — read it.",
+  ASK_WHEN_IN_DOUBT,
+].join("\n");
+
+const ASKING_ACTIVITY_INSPECT = [
+  "ASKING THE USER HERE — ask only for the QA/automation realities only the user knows; the evidence",
+  "  is yours to gather:",
+  "  - exact REPRO steps when the flow must be exercised in a way you cannot drive yourself — name the",
+  "    steps you need them to run;",
+  "  - WHO drives, when a live surface is needed and only they can approve or run it (or hold the",
+  "    credential, account or seeded data the app needs);",
+  "  - what FIXED means — the expected behaviour or acceptance criteria your verdict is measured",
+  "    against, when the request does not state it;",
+  "  - WHICH surface when several could be the one under test (web vs device, which environment).",
+  "  Never ask for what a capture or a log answers — run it and look.",
+  ASK_WHEN_IN_DOUBT,
+].join("\n");
+
+const ASKING_IN_CATEGORY: Record<string, string> = {
+  conversation: ASKING_CONVERSATION,
+  read: ASKING_READ,
+  write_edit: ASKING_WRITE_EDIT,
+  activity_inspect: ASKING_ACTIVITY_INSPECT,
+};
+
+/** Scoped asking guidance for a custom categorizer id (a sane generic). */
+const ASKING_GENERIC = [
+  "ASKING THE USER HERE — ask only for decisions and facts only the USER holds; never for anything a",
+  "  tool or a read can settle. Offer options when you can name them.",
+  ASK_WHEN_IN_DOUBT,
+].join("\n");
+
+function askingFor(id: string): string {
+  return ASKING_IN_CATEGORY[id] ?? ASKING_GENERIC;
+}
+
 /** Blocks that only make sense when the project has an interface. */
 const VISUAL_BLOCKS: ReadonlySet<GuidanceBlock> = new Set([GUIDANCE.assets, GUIDANCE.inspiration]);
 
@@ -61,6 +147,7 @@ export function buildCategorizerSystemPrompt(
     .replace(BUGFIX_SLOT, def.id === "write_edit" && opts.isBugFix === true ? BUGFIX_DIRECTIVE : "")
     .replace(GUIDANCE_SLOT, selectGuidance(forCategory(guidanceFor(def.id), opts.projectCategory), toolNames))
     .replace(ESCALATION_SLOT, toolEscalation(opts.authorOnlyWrites === true))
+    .replace(ASKING_SLOT, askingFor(def.id))
     // The conversation lookup clause is attached only when the web tools are:
     // teaching a model to search with no search tool is a wasted instruction.
     .replace(LOOKUP_SLOT, hasAny(toolNames, ["web_search", "web_fetch", "web_scrape"]) ? CONVERSATIONAL_LOOKUP : "");
@@ -141,8 +228,12 @@ const CONVERSATION_TEMPLATE = [
   CONVERSATIONAL_PROMPT,
   LOOKUP_SLOT,
   "",
-  "You also have \`bash\` for quick scripts and one-off commands (versions, file inspection,",
-  "calculations). Keep shell use proportionate to a chat reply.",
+  "You also have \`bash\` — the terminal — for everything the tool chain can do with the data",
+  "at hand: parse files or JSON a tool produced, run calculations, convert formats, chain a few",
+  "commands into a one-off script. Keep shell use proportionate to a chat reply, and do NOT touch",
+  "the user's project with it — that is what the other categories are for.",
+  "",
+  ASKING_SLOT,
   "",
   [
     "YOUR EXPECTATION — a direct answer to the user.",
@@ -166,6 +257,8 @@ const READ_TEMPLATE = [
   "matter. For every file you keep, note the task-relevant LINES — the follow-up model gets line",
   "numbers and short snippets, not whole files. Explain how the files LINK (who imports whom,",
   "where the change ripples) — that combined story is the point of your deliverable.",
+  "",
+  ASKING_SLOT,
   "",
   BUGFIX_SLOT,
   GUIDANCE_SLOT,
@@ -199,6 +292,8 @@ const WRITE_EDIT_TEMPLATE = [
   "steps that need it (a mockup belongs on the step that builds that screen — never on every",
   "step). A reviewer may approve the plan or send it back; when nobody reviews it, it runs as",
   "drafted. Work the plan in order and keep each change small and correct.",
+  "",
+  ASKING_SLOT,
   "",
   BUGFIX_SLOT,
   GUIDANCE_SLOT,
@@ -250,6 +345,8 @@ const ACTIVITY_INSPECT_TEMPLATE = [
   "     Do NOT re-analyse a capture activity_inspect already judged, and do NOT eyeball a",
   "     screenshot in prose — a verdict needs the lens or the logs.",
   "  5. VERDICT: pass | fail | needs-work, grounded in the evidence — in your deliver.",
+  "",
+  ASKING_SLOT,
   "",
   GUIDANCE_SLOT,
   "",
