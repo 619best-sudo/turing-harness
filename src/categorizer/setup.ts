@@ -134,10 +134,15 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
       id: "conversation",
       name: "Conversation",
       description:
-        "Normal conversation, questions answerable in prose, internet lookups and quick bash " +
-        "scripts. No project inspection or change.",
+        "Anything with nothing to do with the user's code: chat, prose questions, internet " +
+        "lookups (web_search/web_fetch), and terminal work on the data at hand. No project " +
+        "inspection or change.",
       systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.conversation,
-      tools: [],
+      // Stated EXPLICITLY (not only via globalTools) so this category keeps its
+      // purpose even when an app customizes the global set: the internet for
+      // current/checkable answers, and bash for processing data the tool chain
+      // produces (files, JSON, calculations, quick scripts).
+      tools: ["web_search", "web_fetch", "web_scrape", "bash"],
       children: [],
       accepts: {},
       returns: {
@@ -151,8 +156,9 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
       id: "read",
       name: "Read",
       description:
-        "Find and understand the files relevant to the task (memory-first, then read). Delivers " +
-        "the relevant files with line numbers/snippets and a combined summary of how they link.",
+        "Find and understand the files relevant to the task (memory-first, then read, then " +
+        "media_analysis on attachments). Delivers the relevant files with line numbers/snippets, " +
+        "a combined summary of how they link, and per-attachment notes for the write pass.",
       systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.read,
       tools: [
         "read",
@@ -163,12 +169,15 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "project_memory",
         "file_memory",
         "graph_memory",
+        "media_analysis",
       ],
       children: ["write_edit", "activity_inspect"],
       accepts: {},
       returns: {
         kind: "code-summary",
-        description: "The relevant files (paths, lines, snippets) + how they link, for a follow-up model",
+        description:
+          "The relevant files (paths, lines, snippets) + how they link + what the attachments " +
+          "contain, for a follow-up model",
       },
     },
     {
@@ -185,6 +194,7 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "write",
         "edit",
         "create_plan",
+        "media_analysis",
         "assets_generator",
         "inspiration_generator",
         "design_skill",
