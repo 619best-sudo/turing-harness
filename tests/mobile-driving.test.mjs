@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 
-import { DRIVING_AUTOMATION } from "../dist/categorizer/guidance.js";
+import { DRIVING_AUTOMATION, BROWSER_RAW_DRIVING } from "../dist/categorizer/guidance.js";
 import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 const BASE = ["read", "write", "edit", "bash", "media_analysis", "ask_user_question"];
@@ -22,8 +22,8 @@ const WITH_BROWSER = [...BASE, "mcp__playwright__browser_navigate", "mcp__playwr
 test("DRIVING_AUTOMATION states element-over-pixel for BOTH surfaces and the media_analysis route", () => {
   assert.match(DRIVING_AUTOMATION, /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/);
   // Browser path: snapshot ref.
-  assert.match(DRIVING_AUTOMATION, /browser_snapshot/);
-  assert.match(DRIVING_AUTOMATION, /BY REF/);
+  assert.match(BROWSER_RAW_DRIVING, /browser_snapshot/);
+  assert.match(BROWSER_RAW_DRIVING, /BY REF/);
   // Device path: verbatim coords from bounds.
   assert.match(DRIVING_AUTOMATION, /VERBATIM/);
   assert.match(DRIVING_AUTOMATION, /never\s+pull a coordinate from memory/);

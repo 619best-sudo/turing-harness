@@ -1181,11 +1181,6 @@ export const DRIVING_AUTOMATION = [
   "DRIVING A UI (browser MCP or the mobile_* device toolkit) — ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS. Acting on a",
   "  coordinate or selector you invented is the biggest source of wrong interactions: it hits the wrong thing",
   "  or nothing, and you then spiral repeating the same bad click. The element tree is the source of truth:",
-  "  BROWSER (Playwright / chrome MCP): `browser_snapshot` returns the accessibility tree WITH element refs.",
-  "    Click, type and select BY REF — `browser_click { element: <ref> }`, `browser_type`, `browser_select_option`.",
-  "    Never guess a CSS selector, never reuse a ref from an earlier snapshot after the page changed, and never",
-  "    act on an element you have not snapshotted THIS turn. Re-snapshot after navigation, opening a menu, or a",
-  "    dialog appearing.",
   "  DEVICE (the `mobile` tool, backed by mobilecli): ONE call does the whole thing —",
   "    `mobile { action: \"tap\", target: \"<describe what to tap>\" }`. It captures the screen, reads the UI",
   "    tree, and FUSES the two: the visual estimate decides WHICH control is meant, the tree supplies its",
@@ -1217,6 +1212,20 @@ export const DRIVING_AUTOMATION = [
   "    it carries (flavor / environment / entrypoint / port / device) and the app id or URL that MATCHES that",
   "    config. A generic default command, or launching an already-running / different-config build, puts a",
   "    binary WITHOUT your change on screen — so every tap and screenshot after verifies nothing.",
+].join("\n");
+
+/**
+ * The RAW browser driving section — attached ONLY when the fused `drive` tool
+ * is absent. With `drive`, DRIVE_TOOL replaces it wholesale: one call per step,
+ * targets by description, no ref bookkeeping.
+ */
+export const BROWSER_RAW_DRIVING = [
+  "BROWSER WITHOUT THE FUSED `drive` TOOL (raw Playwright MCP): `browser_snapshot` returns the",
+  "  accessibility tree WITH element refs. Click, type and select BY REF — `browser_click",
+  "  { element: <ref> }`, `browser_type`, `browser_select_option`. Never guess a CSS selector, never",
+  "  reuse a ref from an earlier snapshot after the page changed, and never act on an element you have",
+  "  not snapshotted THIS turn. Re-snapshot after navigation, opening a menu, or a dialog appearing.",
+  "  (If a `drive` tool is available, use it instead — one call per step, no ceremony.)",
 ].join("\n");
 
 /**
@@ -1257,6 +1266,12 @@ export const GUIDANCE = {
   driveTool: {
     text: DRIVE_TOOL,
     applies: (has) => has("drive"),
+  },
+  browserRaw: {
+    text: BROWSER_RAW_DRIVING,
+    applies: (has) =>
+      !has("drive") &&
+      (has("browser_snapshot") || has("browser_click") || has("browser_navigate")),
   },
   driving: {
     text: DRIVING_AUTOMATION,
