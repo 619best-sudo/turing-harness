@@ -14,10 +14,12 @@
  *   - complexity: `estimateComplexity` per call; inherited ratings honored.
  *   - category:   the `phase` field on PermissionRequest (kept for back-compat).
  *
- * This is the loop core extracted from the old phase-runner; it carries no
- * phase-specific guards, opening scaffolding, or extraction — those live in the
- * caller. The orchestrator drives one sub-loop per plan step (or one for a
- * planless run) plus a final summary turn.
+ * This is the loop core the categorizer chain drives: one scoped toolset, one
+ * system prompt, one model per invocation. It carries no orchestration policy —
+ * the chain (categorizer hops, routing, deliverables) lives in the caller.
+ *
+ * TERMINAL TOOLS: a tool flagged `terminal: true` (the categorizers' `deliver`)
+ * ends the loop after its turn completes — completion is a deterministic signal.
  */
 import { PROBE_MARKER_RE } from "../probe-marker.js";
 import type {
@@ -37,7 +39,6 @@ import type {
   LiveImage,
   Message,
   Model,
-  Phase,
   ReadFileContent,
   Tool,
   ToolResultMessage,
@@ -53,22 +54,17 @@ import {
 import type { LogStore } from "../logging/logger.js";
 import type { Registry } from "../registry/registry.js";
 import { isMalformedToolArgs, MALFORMED_TOOL_ARGS_KEY } from "../llm/bridge.js";
-import { classify } from "../exec/run-commands.js";
 import { PermissionGate } from "./permission.js";
 import { StallGuard, STEP_BUDGET_EXHAUSTED } from "./stall-guard.js";
-import { ReproductionGate, instrumentationTarget, parseReproduceDeclaration } from "./reproduction-gate.js";
 import { ClarifyGate } from "./clarify-gate.js";
-import { QaGate } from "./qa-gate.js";
-import { VerificationGate } from "./verification-gate.js";
-import type { VerifyStageTracker } from "./verify-stages.js";
 import { ToolFallbackAdvisor, type FallbackAdvice } from "./tool-fallback.js";
 import { SearchLadderAdvisor, type SearchAdvice } from "./search-ladder.js";
 import { nameBeforeFraming, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage } from "./tool-suggest.js";
 import { coerceStringArgs, coercionNote, type CoercedArg } from "./tool-arg-coercion.js";
-import { isSourceFile } from "./straightforward-assessor.js";
 import { estimateComplexity, selectModel } from "../llm/model-selector.js";
 import { compactHistory, historySize, pruneHistoricalMedia, resolveCompactionThreshold } from "./compaction.js";
 import { designReferenceFromBrief } from "../tools/builtin/design-skill.js";
+import { guessMimeType } from "../multimodal/attachment.js";
 import { generateAssetsFromReference } from "./asset-generation.js";
 import type { GeneratedAssetRef } from "../types.js";
 import * as fs from "node:fs/promises";
@@ -185,56 +181,18 @@ export interface ToolLoopInput {
   /** Where the inherited per-path complexity came from. */
   complexitySource?: "prepare-file" | "plan-task";
   /**
-   * The phase label stamped onto PermissionRequest.phase for back-compat. The
-   * loop is phase-agnostic, but the client may still key on `phase`; a step
-   * sub-loop reports "perform" so existing policies keep working.
+   * Label stamped onto PermissionRequest.phase. In v2 this is the CATEGORIZER id
+   * driving this loop ("read", "write_edit", …) — kept as a plain string so
+   * hosts keying on the old field keep working, and the chain can label honestly.
    */
-  phase?: Phase;
+  phase?: string;
   /**
-   * Whether this run is fixing a REPORTED BUG.
-   *
-   * Turns on the reproduce-before-you-edit gate: the first `write`/`edit` is
-   * refused until something has actually observed the broken behaviour. Off by
-   * default, because a greenfield feature has nothing to reproduce.
-   */
-  isBugFix?: boolean;
-  /**
-   * The reproduce-before-you-edit gate, threaded in by the orchestrator so a
-   * multi-step bug fix reproduces ONCE (not once per step). When omitted, the
-   * loop creates a fresh one scoped to this single invocation — the original
-   * behavior, preserved for standalone `runToolLoop` callers.
-   */
-  reproductionGate?: ReproductionGate;
-  /**
-   * The verify-what-you-wrote gate, threaded in by the orchestrator so the same
-   * instance observes every work loop of a run. Passive here: the loop only
-   * feeds it writes and tool results; enforcement (the verify sub-loops and the
-   * summary hold) lives in the orchestrator.
-   */
-  verificationGate?: VerificationGate;
-  /**
-   * The ask-before-you-invent gate, threaded in by the orchestrator so one
-   * refusal covers the whole run rather than one per step. When omitted the loop
+   * The ask-before-you-invent gate, threaded in by the chain so one refusal
+   * covers the whole run rather than one per categorizer. When omitted the loop
    * creates an INERT one (no task ⇒ never active), so standalone `runToolLoop`
    * callers are unaffected.
    */
   clarifyGate?: ClarifyGate;
-  /**
-   * The staged-verify tracker, threaded in by the orchestrator for the verify
-   * sub-loops. Passive here: the loop feeds it the same write/probe/capture
-   * signals it already feeds the gates; the orchestrator reads its `stage()` to
-   * pick the next round's message. Omitted for work loops and standalone callers.
-   */
-  verifyStageTracker?: VerifyStageTracker;
-  /**
-   * The QA sequencing gate, threaded in by the orchestrator so the writes a WORK
-   * loop made are the writes the VERIFY pass's freshness rule measures against.
-   * It enforces three things prose could not: QA belongs to the verify pass, a
-   * capture must be of a surface running the new code, and a run going in
-   * circles on a screen should ask the user instead. Omitted ⇒ inert (the loop
-   * creates one with no writes recorded, so nothing can trip).
-   */
-  qaGate?: QaGate;
   /** Optional plan JSON handed to the authoring context. */
   planJson?: unknown[];
   /** Optional surrounding-file snippets handed to the authoring context. */
@@ -308,6 +266,12 @@ export interface ToolLoopResult {
   planSet?: import("../types.js").PlanSet;
   /** Hard error (LLM/transport/tool) that ended the loop early, if any. */
   error?: string;
+  /**
+   * Name of the TERMINAL tool that completed this loop (`deliver`), when the
+   * loop ended because a categorizer delivered rather than because the model
+   * stopped calling tools. Undefined on a natural stop.
+   */
+  terminatedBy?: string;
 }
 
 /**
@@ -329,22 +293,9 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   const compactThreshold = input.compactThresholdChars ?? resolveCompactionThreshold();
   const boundedSteps = Number.isFinite(maxSteps);
   const stallGuard = new StallGuard();
-  // Use the run-scoped gate if the orchestrator threaded one in (so a multi-step
-  // bug fix reproduces once, not per step). Otherwise create a single-invocation
-  // gate — the original behavior for standalone callers.
-  const reproductionGate = input.reproductionGate ?? new ReproductionGate({ enabled: input.isBugFix === true });
   // An unarmed gate by default: without the router's verdict there is nothing to
   // enforce, so a standalone `runToolLoop` caller behaves exactly as before.
   const clarifyGate = input.clarifyGate ?? new ClarifyGate();
-  // Same run-scoped shape, and it MUST be run-scoped to work at all: the
-  // freshness rule compares "when did you last write" against "when did you last
-  // deploy", and those two happen in different loops. A per-loop gate would
-  // start the verify pass believing nothing had been written and wave through
-  // the capture of a stale build — the exact failure it exists to stop.
-  const qaGate = input.qaGate ?? new QaGate();
-  // Populated as source files are read below; consumed by the gate's block-time
-  // assessment, registered once COMPLEXITY_BY_PATH exists (see below).
-  const readContentByPath = new Map<string, string>();
   const fallbackAdvisor = new ToolFallbackAdvisor();
   // Enforces the file-search order — memory index first, shell search only after
   // memory has actually been tried and come back empty.
@@ -421,23 +372,6 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // Seeded from the plan step's ratings, then MUTATED during the run as tools
   // measure the artifacts they touch (see `measuredComplexity` below).
   const COMPLEXITY_BY_PATH = new Map<string, ComplexityRating>();
-  // Register the read-files provider so the gate can run the straightforwardness
-  // assessor at BLOCK TIME (when a mutation is about to be refused), seeing the
-  // FULL read set. Lifting after each read instead would lift on a synchronous
-  // first file before the model reads the file carrying the async marker.
-  //
-  // Each entry carries the MEASURED rating from the staged read that loaded it.
-  // Without it the assessor judges "is this fix straightforward?" on file COUNT
-  // and async tokens alone — and the count is derived from what has been read so
-  // far, so reading LESS makes a bug look simpler. That gradient points the wrong
-  // way: read-one-file-then-edit is the pattern the gate exists to stop, and it
-  // was the pattern earning the lift. Registered here, after the map it reads.
-  reproductionGate.setReadFilesProvider(() =>
-    [...readContentByPath.entries()].map(([p, content]) => {
-      const rating = COMPLEXITY_BY_PATH.get(normalizeToolPath(cwd, p));
-      return { path: p, content, ...(rating ? { rating } : {}) };
-    }),
-  );
   for (const [filePath, rating] of Object.entries(input.complexityByPath ?? {})) {
     COMPLEXITY_BY_PATH.set(normalizeToolPath(cwd, filePath), rating);
   }
@@ -445,6 +379,11 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
    *  Tracked so the permission request can report the honest `complexitySource`. */
   const MEASURED_PATHS = new Set<string>();
   const MUTATING_TOOLS = new Set(["write", "edit"]);
+/** `guessMimeType` narrowed to image/* (plan attachments may omit the mime). */
+function guessImageMime(p: string): string {
+  const m = guessMimeType(p);
+  return m.startsWith("image/") ? m : "application/octet-stream";
+}
   const READ_TOOLS = new Set(["read", "ls", "grep", "cat"]);
   const ATTACHED_FILE_CONTENTS = new Map(
     [...(input.attachedFileContents ?? []), ...(input.attachedContextFiles ?? [])].map((file) => [
@@ -458,6 +397,10 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   let error: string | undefined;
   let pendingUserQuestion: AskUserQuestionRequest | undefined;
   let producedPlanSet: import("../types.js").PlanSet | undefined;
+  // Set when a TERMINAL tool (a categorizer's `deliver`) completed successfully;
+  // the loop finishes the turn (so every toolCall keeps its result — providers
+  // reject a dangling call) and then stops instead of prompting another turn.
+  let terminatedBy: string | undefined;
 
   // Live UI-emission axes + reasoning effort + driver model (same semantics as
   // the old phase runner: a TOOL decision may flip them for subsequent turns).
@@ -572,7 +515,10 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
       emit({ type: "turn_start" });
       const assistant = await streamToMessage(llm, liveModel, context, emit, {
         temperature: input.temperature,
-        reasoning: liveReasoningLevel,
+        // Omit when unset: an explicit `reasoning: undefined` still means
+        // "provider default" to most callers, but omitting the key keeps the
+        // historical "absent ⇒ provider default" contract observable to hosts.
+        ...(liveReasoningLevel ? { reasoning: liveReasoningLevel } : {}),
         signal,
         emitText: liveEmitText,
         emitReasoning: liveEmitReasoning,
@@ -582,18 +528,6 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
       usage = addUsage(usage, assistant.usage);
       context.messages.push(assistant);
       liveModel = input.model;
-
-      // A straightforward-fix declaration travels in the assistant text that
-      // accompanies (or precedes) the write/edit call. Parse it before the
-      // per-call gate check so the declaration lifts the gate for THIS call,
-      // not the next one. A skip is recorded by the gate and surfaces in its
-      // report, so it is auditable rather than a silent give-up.
-      const assistantText = assistant.content
-        .filter((c): c is { type: "text"; text: string } => c.type === "text")
-        .map((c) => c.text)
-        .join("\n");
-      const reproDecl = parseReproduceDeclaration(assistantText);
-      if (reproDecl) reproductionGate.declareStraightforward(reproDecl.reason);
 
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
         error = assistant.errorMessage ?? (assistant.stopReason === "aborted" ? "aborted" : undefined);
@@ -821,99 +755,6 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
           });
           context.messages.push(refused);
           toolResults.push(refused);
-          continue;
-        }
-
-        // ---- reproduce-before-you-edit ----
-        const repro = reproductionGate.check(call.name, call.arguments);
-        if (repro.kind === "block") {
-          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
-          const refused = makeToolResult(call.id, call.name, repro.message, true);
-          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
-          logStore.append({
-            tags: ["loop", "repro-gate"],
-            level: "warn",
-            message: `${call.name} refused: no reproduction evidence yet in this bug-fix run`,
-          });
-          context.messages.push(refused);
-          toolResults.push(refused);
-          continue;
-        }
-
-        // ---- staged-verify: refuse a premature strip ----
-        // `activity_cleanup` / `remove_log {all:true}` before ANY capture destroys
-        // the probes the model still needs to RUN the app and INSPECT what it did.
-        // That is the exact derailment this guard prevents: instrument → immediate
-        // cleanup → "verified" on the analyzer with nothing ever captured. The
-        // tracker lifts the block once a capture exists; a single `remove_log
-        // {logId}` to reposition a probe is allowed through.
-        const prematureStrip = input.verifyStageTracker?.blockPrematureStrip(call.name, call.arguments);
-        if (prematureStrip) {
-          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
-          const refused = makeToolResult(call.id, call.name, prematureStrip, true);
-          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
-          logStore.append({
-            tags: ["loop", "verify-stage", "verify-stage:premature-strip"],
-            level: "warn",
-            message: `${call.name} refused: no capture yet — stripping belongs at DECIDE`,
-          });
-          context.messages.push(refused);
-          toolResults.push(refused);
-          continue;
-        }
-
-        // ---- staged-verify: refuse a premature capture ----
-        // The mirror of the strip guard: while the INSTRUMENT stage is owed (a
-        // runtime gap path carries no probe), a screenshot verifies nothing about
-        // what the code DID — it is exactly how a real run skipped the LOG step
-        // end to end: trace session opened, zero `add_log` calls, screenshot
-        // "verification", then cleanup of probes that never existed.
-        const prematureCapture = input.verifyStageTracker?.blockPrematureCapture(call.name);
-        if (prematureCapture) {
-          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
-          const refused = makeToolResult(call.id, call.name, prematureCapture, true);
-          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
-          logStore.append({
-            tags: ["loop", "verify-stage", "verify-stage:premature-capture"],
-            level: "warn",
-            message: `${call.name} refused: instrument stage still owed (unprobed runtime gaps)`,
-          });
-          context.messages.push(refused);
-          toolResults.push(refused);
-          continue;
-        }
-
-        // ---- QA sequencing: scope + build freshness ----
-        // Ordered last of the gates because it is the narrowest: it only has an
-        // opinion about calls that drive or photograph a surface. Two refusals:
-        // a raw drive/capture tool in a WORK loop after the run has already
-        // written code (QA is the verify pass's job — finish and build), and any
-        // capture of a surface that is not running the bytes just written (a
-        // device app that was never rebuilt, a web url with no server behind it).
-        // Sync rules (scope, build freshness) first, then the async one that has
-        // to ask the machine what is actually booted. Ordered that way so the
-        // cheap judgement runs before the I/O, not because either subsumes the
-        // other.
-        const sync = qaGate.check(call.name, call.arguments);
-        const qa = sync.kind === "block"
-          ? sync
-          : await qaGate.checkDeviceTarget(call.name, call.arguments);
-        if (qa.kind === "block") {
-          emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
-          const refused = makeToolResult(call.id, call.name, qa.message, true);
-          emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: refused.content, isError: true });
-          logStore.append({
-            tags: ["loop", "qa-gate", `qa-gate:${qa.reason}`],
-            level: "warn",
-            message: `${call.name} refused: ${QA_REFUSAL_REASON[qa.reason]}`,
-            data: { tool: call.name, ...(input.label ? { label: input.label } : {}) },
-          });
-          context.messages.push(refused);
-          toolResults.push(refused);
-          // Each refusal hands back a concrete next call (build it, start the
-          // server, use activity_inspect), so it must never be the turn the
-          // stall guard decides to end the loop on.
-          stallGuard.grantGrace();
           continue;
         }
 
@@ -1248,11 +1089,19 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
             ? `${authoringTask}\n\n${clarification}`
             : clarification
           : authoringTask;
+        // The plan the loop itself produced (create_plan inside write_edit)
+        // stands in for a caller-threaded planJson: Model B authors toward the
+        // approved tasks, exactly as the classic per-step loops did.
+        const effectivePlanJson = input.planJson?.length
+          ? input.planJson
+          : producedPlanSet
+            ? (producedPlanSet.plans.flatMap((p) => p.tasks) as unknown[])
+            : undefined;
         const authoringContext: AuthoringContext | undefined =
-          canAuthor && (taskWithClarification || input.planJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length || liveImages.length)
+          canAuthor && (taskWithClarification || effectivePlanJson?.length || input.attachedFileContents?.length || input.attachedContextFiles?.length || liveImages.length)
             ? {
                 task: taskWithClarification,
-                ...(input.planJson?.length ? { planJson: input.planJson } : {}),
+                ...(effectivePlanJson?.length ? { planJson: effectivePlanJson } : {}),
                 ...buildAuthoringSnippets(input),
                 ...(liveImages.length ? { images: liveImages } : {}),
                 ...(designReference?.length ? { designReference } : {}),
@@ -1382,6 +1231,18 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
           resultMsg = makeToolResult(call.id, call.name, `Tool threw: ${(err as Error).message}`, true);
         }
         settled = true;
+        // A terminal tool that SUCCEEDED completes the loop after this turn.
+        // An errored terminal call does not: the model gets the error and a
+        // chance to re-deliver.
+        if (tool?.terminal && !resultMsg.isError && !terminatedBy) {
+          terminatedBy = tool.name;
+          logStore.append({
+            tags: ["loop", "loop:terminated"],
+            level: "info",
+            message: `terminal tool "${tool.name}" completed; finishing after this turn`,
+            ...(input.label ? { data: { label: input.label } } : {}),
+          });
+        }
         emit({
           type: "tool_execution_end",
           toolCallId: call.id,
@@ -1420,7 +1281,54 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
         // A `create_plan` result carries the structured plan; the last one wins
         // so a re-plan supersedes an earlier draft within the same loop.
         const planFromTool = planSetFromToolResult(resultMsg.details);
-        if (planFromTool) producedPlanSet = planFromTool;
+        if (planFromTool) {
+          producedPlanSet = planFromTool;
+          // Files the USER attached to steps during plan review land on the
+          // tasks; feed them into the live image set the moment the plan
+          // exists, so the write that builds that step authors from them
+          // (triaged like any other attachment when a callback is wired).
+          for (const plan of planFromTool.plans) {
+            for (const t of plan.tasks) {
+              for (const att of t.attachments ?? []) {
+                if (!att.path) continue;
+                const mime = att.mimeType || guessImageMime(att.path);
+                if (!mime.startsWith("image/")) continue;
+                if (LIVE_IMAGE_PATHS.has(att.path)) continue;
+                LIVE_IMAGE_PATHS.add(att.path);
+                liveImages.push({ path: att.path, mimeType: mime });
+                if (input.triageAttachment) {
+                  try {
+                    const triaged = await input.triageAttachment({ path: att.path, mimeType: mime });
+                    if (triaged?.fact && triaged.fact.trim()) {
+                      const fact = triaged.fact.trim();
+                      mediaFact = mediaFact ? `${mediaFact}\n${fact}` : fact;
+                    }
+                  } catch {
+                    // enrichment is best-effort
+                  }
+                }
+              }
+            }
+          }
+          // Fold the planner's per-task complexity into the per-path floor, so
+          // a write/edit on a file a plan task rated `high` reaches the
+          // permission gate already rated high (complexitySource "plan-task").
+          // This is the v2 replacement for the classic run's per-step loop
+          // threading: the plan now lives INSIDE the write_edit loop, so the
+          // inheritance must happen the moment the plan exists. Ratings only
+          // ratchet UP — a later cheap read must not erase a plan's high.
+          for (const plan of planFromTool.plans) {
+            for (const t of plan.tasks) {
+              for (const f of t.files) {
+                const key = normalizeToolPath(cwd, f);
+                const known = COMPLEXITY_BY_PATH.get(key);
+                if (!known || ratingToScore(t.complexity) > ratingToScore(known)) {
+                  COMPLEXITY_BY_PATH.set(key, t.complexity);
+                }
+              }
+            }
+          }
+        }
         // Blueprints from `inspiration_generator`, held for the authoring pass.
         // The driver sees this tool result in its conversation; the model that
         // writes the bytes does not, so without this the run looks up a design
@@ -1506,42 +1414,18 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
                 WRITTEN_WITH.add(absPath);
                 if (writtenPaths.length > 50) writtenPaths.splice(0, writtenPaths.length - 50);
               }
-              // Feed the verify gate: a successful write/edit is a path the run
-              // owes verification evidence for (re-writing resets it). The diff
-              // is handed to the verify loop so its check can focus on what changed.
-              //
-              // An instrumentation edit is the exception, and it must be, or the two
-              // gates work against each other: placing `__t()` probes would open a
-              // verification debt on a file whose change is about to be STRIPPED, so
-              // the run would be held open to prove out logging it is going to
-              // delete. The reproduce gate certifies these (probe delta, nothing else
-              // moved) and `instrumentedPaths` below still records them, so they are
-              // tracked for stripping — just not owed evidence.
-              const diffText = (resultMsg.details as { diff?: unknown } | undefined)?.diff;
-              if (!instrumentationTarget(call.name, call.arguments)) {
-                input.verificationGate?.observeWritten(absPath, typeof diffText === "string" ? diffText : undefined);
-                // A real edit invalidates the staged-verify progress for this path
-                // (and the global capture): the bytes the capture proved are gone.
-                input.verifyStageTracker?.onWritten(absPath);
-              }
               // Detect activity-monitor probe markers in what was just written,
-              // so the orchestrator can refuse completion while `__t()` calls
-              // remain and `activity_cleanup` can name the files to strip. Scan
-              // the diff first (cheapest, most precise); fall back to the tool
-              // output for a write whose content isn't surfaced as a diff.
+              // so the chain can strip instrumentation before finishing and
+              // `activity_cleanup` can name the files. Scan the diff first
+              // (cheapest, most precise); fall back to the tool output for a
+              // write whose content isn't surfaced as a diff.
+              const diffText = (resultMsg.details as { diff?: unknown } | undefined)?.diff;
               const probeHaystack =
                 typeof diffText === "string" ? diffText : typeof resultMsg.content === "string" ? resultMsg.content : "";
               if (probeHaystack && PROBE_MARKER_RE.test(probeHaystack) && !INSTRUMENTED_WITH.has(absPath)) {
                 instrumentedPaths.push(absPath);
                 INSTRUMENTED_WITH.add(absPath);
               }
-              // An up-front per-file classification travels ON the write/edit call
-              // itself (a `verify` arg), declared at the moment the model knows
-              // most about the change — not retroactively in the verify phase. A
-              // `method: "none"` with a reason is the auditable bypass for a tiny
-              // change that needs no runtime check.
-              const verifyDecl = readVerifyDeclaration(call.arguments?.verify, absPath);
-              if (verifyDecl) input.verificationGate?.declare([verifyDecl]);
             }
             if (READ_TOOLS.has(call.name) && !READ_WITH.has(absPath)) {
               readPaths.push(absPath);
@@ -1558,7 +1442,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
           // A tool that instrumented a file says so in its details (`add_log`).
           // Probe tracking otherwise works by scanning write/edit diffs, which never
           // sees a tool that writes files itself — so these would escape the
-          // pre-summary strip check and ship whenever cleanup was skipped.
+          // chain's strip check and ship whenever cleanup was skipped.
           const instrumentedByTool = (resultMsg.details as { instrumented?: unknown; path?: unknown } | undefined);
           if (instrumentedByTool?.instrumented === true && typeof instrumentedByTool.path === "string") {
             const probed = normalizeToolPath(cwd, instrumentedByTool.path);
@@ -1566,80 +1450,14 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
               instrumentedPaths.push(probed);
               INSTRUMENTED_WITH.add(probed);
             }
-            // A probe landed (`add_log`) → the instrument stage advanced for this path.
-            input.verifyStageTracker?.onInstrumented(probed);
           }
           // A question to the user satisfies the clarify gate for the rest of the
           // run: the value is no longer being guessed.
           if (!resultMsg.isError) clarifyGate.observe(call.name);
-          // Feed the QA gate: a real write opens a freshness debt, a build+install
-          // or dev-server start closes it, and a question resets the stuck counter.
-          qaGate.observe(
-            call.name,
-            call.arguments,
-            Boolean(resultMsg.isError),
-            resultMsg.details as Record<string, unknown> | undefined,
-          );
-          // Feed the stage tracker's BUILD debt: a successful build/install/launch
-          // means the running app now contains the write(s) the spine is trying to
-          // verify. Recognized from either side — a `bash` command the classifier
-          // reads as device/build/dev-server (the project's own launch or build),
-          // a device install tool, or `activity_trace_start` reporting the app
-          // READY (it launches the startCommand itself and waits for readiness).
-          if (!resultMsg.isError && input.verifyStageTracker) {
-            const isTool = (t: string) => call.name === t || call.name.endsWith(`__${t}`);
-            const buildDetails = resultMsg.details as Record<string, unknown> | undefined;
-            let buildOk = false;
-            if (isTool("activity_trace_start")) {
-              buildOk = buildDetails?.ready === true;
-            } else if (isTool("mobile_install_app")) {
-              buildOk = true;
-            } else if (isTool("bash")) {
-              const cmd = call.arguments?.command;
-              const cmdText = Array.isArray(cmd) ? cmd.join(" ") : typeof cmd === "string" ? cmd : "";
-              if (cmdText) {
-                const kind = classify(cmdText);
-                buildOk = kind === "device" || kind === "build" || kind === "dev-server";
-              }
-            }
-            if (buildOk) input.verifyStageTracker.onBuildOk();
-          }
-          // Feed every completed call to the reproduction gate, so a capture or a
-          // question to the user lifts it for the rest of the loop.
-          reproductionGate.observe(
-            call.name,
-            Boolean(resultMsg.isError),
-            outText.length,
-            // The tool's own counts, so a capture that found NOTHING cannot lift
-            // the gate on the strength of the paragraph explaining that it found
-            // nothing. See ReproductionGate.observe.
-            resultMsg.details as Record<string, unknown> | undefined,
-          );
-          // Feed the verify gate: a qualifying successful capture/test/media pass
-          // grants evidence to the runtime paths the run owes it (matched by method).
-          input.verificationGate?.observeCheck(call.name, Boolean(resultMsg.isError), outText.length, outText);
-          // A capture/check ran (collect/inspect/study/media/tail/curl) → the run
-          // stage produced something to reason over at the inspect stage. The gate
-          // decides whether it SATISFIES a gap; this only marks that one happened.
-          if (!resultMsg.isError && outText.length > 0) input.verifyStageTracker?.onCapture();
           if (outText) {
             if (!mutates && READ_TOOLS.has(call.name)) {
               readCache.set(callSig, outText);
             }
-          }
-
-          // Accumulate source-file content by path for the gate's block-time
-          // straightforwardness assessment. The assessor runs when the gate is
-          // about to block an edit (via the provider), so it sees ALL read files
-          // — not lifted early on the first sync file before an async file is read.
-          if (
-            !resultMsg.isError &&
-            READ_TOOLS.has(call.name) &&
-            typeof absPath === "string" &&
-            isSourceFile(absPath) &&
-            outText
-          ) {
-            readContentByPath.set(absPath, outText);
           }
         }
 
@@ -1689,6 +1507,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
       }
       emit({ type: "turn_end", message: assistant, toolResults });
       if (pendingUserQuestion) break;
+      if (terminatedBy) break;
 
       const turnCalls = toolCalls.filter((c): c is Extract<typeof c, { type: "toolCall" }> => c.type === "toolCall");
       const turnResults = toolResults.filter((m): m is ToolResultMessage => m.role === "toolResult");
@@ -1740,28 +1559,6 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
           level: "info",
           message: `${advice.tool}: advised ${SEARCH_ADVICE_LABEL[advice.kind]}`,
           data: { tool: advice.tool, ...(input.label ? { label: input.label } : {}) },
-        });
-      }
-
-      // Stuck-on-a-screen nudge: enough drive/capture calls with no write, no
-      // rebuild and no question is the shape of a run tapping at a login wall.
-      // A nudge rather than a refusal — the model may be three taps from the
-      // target — pointing at the one move that actually crosses the wall:
-      // `ask_user_question`, which the user can answer with a value OR an
-      // attachment. Fires once per streak.
-      const stuckNote = qaGate.stuckNote();
-      if (stuckNote) {
-        context.messages.push({
-          role: "user",
-          content: [{ type: "text", text: stuckNote }],
-          timestamp: Date.now(),
-        });
-        stallGuard.grantGrace();
-        logStore.append({
-          tags: ["loop", "qa-gate", "qa-gate:stuck"],
-          level: "warn",
-          message: "driving the UI with no progress; advised asking the user",
-          data: { ...(input.label ? { label: input.label } : {}) },
         });
       }
 
@@ -1866,23 +1663,13 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
     pendingUserQuestion,
     ...(producedPlanSet ? { planSet: producedPlanSet } : {}),
     error,
+    ...(terminatedBy ? { terminatedBy } : {}),
   };
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-/** How each rung of the file-search ladder is described in the log. */
-/** One line per QA-gate refusal, for the log. */
-const QA_REFUSAL_REASON: Record<import("./qa-gate.js").QaBlockReason, string> = {
-  scope: "raw UI driving after a write — QA belongs to the verify pass",
-  stale: "the surface is not running the code this run wrote",
-  "unknown-device": "the device id does not match any booted device",
-  "wrong-surface": "running a mobile app on the web while a device is booted",
-  "wrong-build": "an artifact build cannot put the app on the booted device",
-  "blind-tap": "coordinates not derived from a screenshot analysis — nudging is guessing",
-};
 
 const SEARCH_ADVICE_LABEL: Record<SearchAdvice["kind"], string> = {
   "memory-first": "searching the memory index before the shell",
@@ -2606,31 +2393,6 @@ function canDeclareComplexity(name: string, mutates: boolean): boolean {
   return mutates && (name === "write" || name === "edit");
 }
 
-/**
- * Read an up-front per-file verification declaration from a write/edit call's
- * optional `verify` arg. The model commits to the check the change needs at the
- * moment it writes the file (`{ method: "none", reason: "tiny config change" }`
- * is the bypass for a change that needs no runtime check). Returns a
- * `VerificationDeclaration` the gate records, or `undefined` if no usable
- * declaration was supplied. Tolerant of malformed input — a bad declaration is
- * ignored, never thrown.
- */
-function readVerifyDeclaration(
-  raw: unknown,
-  path: string,
-): import("./verification-gate.js").VerificationDeclaration | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const obj = raw as Record<string, unknown>;
-  const method = obj.method;
-  const validMethod = method === "visual" || method === "logic" || method === "endpoint" || method === "none";
-  if (!validMethod) return undefined;
-  const tier = obj.tier === "static" || obj.tier === "runtime" ? obj.tier : undefined;
-  const reason = typeof obj.reason === "string" ? obj.reason : undefined;
-  // `method: "none"` (the bypass) REQUIRES a reason — an unjustified skip is
-  // exactly the silent give-up the gate exists to stop.
-  if (method === "none" && !reason?.trim()) return undefined;
-  return { path, ...(tier ? { tier } : {}), method, ...(reason ? { reason } : {}) };
-}
 
 function buildAuthoringSnippets(input: ToolLoopInput): { fileSnippets?: Array<{ path: string; content: string }> } {
   const MAX = 12000;

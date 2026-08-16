@@ -60,6 +60,7 @@ test("a mockup flows through analysis → plan → step → vision-authored writ
   const target = path.join(dir, "Hero.tsx");
 
   const seen = { lenses: [], authoredBy: [], planPrompts: [] };
+  let routerCalls = 0;
   const llm = new OpenRouterBridge();
   llm.resolveModel = (slug) => (slug === "test/vision" ? VISION : { id: slug, openRouterSlug: slug, input: ["text"] });
 
@@ -72,7 +73,10 @@ test("a mockup flows through analysis → plan → step → vision-authored writ
       usage: zeroUsage(), stopReason: "stop", timestamp: 0,
     });
 
-    if (/router at the front/.test(sys)) return reply("TASK");
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return reply(`CATEGORY: ${routerCalls <= 1 ? "write_edit" : "summarise"}`);
+    }
 
     // media_analysis, through whichever lens was asked for.
     if (/UI analyst/.test(sys)) {
@@ -193,12 +197,12 @@ test("a mockup flows through analysis → plan → step → vision-authored writ
 // Third-party providers: skills and MCP servers the user loads
 // ---------------------------------------------------------------------------
 
-/** A skill the host registers, scoped to two phases. */
+/** A skill the host registers, scoped to two categorizers. */
 const designSkill = defineSkill({
   id: "skill:design",
   name: "design-tokens",
   description: "Reads the project's design tokens.",
-  phases: ["plan", "perform"],
+  categorizers: ["read", "write_edit"],
   tools: [{
     name: "design_tokens",
     description: "Return the project's design tokens.",
@@ -245,12 +249,12 @@ test("a user-loaded skill and MCP server are first-class: listed, phase-scoped, 
   assert.equal(mcp.kind, "mcp");
   assert.ok(mcp.tools.some((t) => t.name === "figma_get_frame"));
 
-  // Phase scoping is honoured: the skill declared plan+perform and appears in
-  // exactly those, so a host's routing is not silently ignored.
-  const inPhase = (phase, name) => registry.selectPhaseTools(phase).some((t) => t.name === name);
-  assert.ok(inPhase("plan", "design_tokens"));
-  assert.ok(inPhase("perform", "design_tokens"));
-  assert.ok(!inPhase("prepare", "design_tokens"));
+  // Categorizer scoping is honoured: the skill declared read+write_edit and
+  // appears in exactly those, so a host's routing is not silently ignored.
+  const inScope = (id, name) => registry.selectCategorizerTools(id).some((t) => t.name === name);
+  assert.ok(inScope("read", "design_tokens"));
+  assert.ok(inScope("write_edit", "design_tokens"));
+  assert.ok(!inScope("activity_inspect", "design_tokens"));
 
   // An external provider is removable, and takes its tools with it.
   assert.equal(await registry.remove("mcp:figma"), true);

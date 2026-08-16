@@ -19,10 +19,9 @@ import assert from "node:assert/strict";
 
 import {
   PROJECT_LEARNING,
-  buildLoopSystemPrompt,
-  buildPhaseSystemPrompt,
   createProjectMemoryTool,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 test("both learning signals are named, with the user-correction case called out", () => {
   assert.match(PROJECT_LEARNING, /A STANDING PREFERENCE/);
@@ -80,16 +79,16 @@ test("the tool description carries the same two signals", () => {
 test("it reaches every phase that can observe a correction or a failure", () => {
   for (const phase of ["prepare", "plan", "perform", "perfect"]) {
     assert.match(
-      buildPhaseSystemPrompt(phase, ["read", "project_memory"]),
+      buildPhaseLikePrompt(phase, ["read", "project_memory"]),
       /LEARNING ACROSS RUNS/,
       `${phase} carries it`,
     );
   }
-  assert.match(buildLoopSystemPrompt(["read", "project_memory"]), /LEARNING ACROSS RUNS/);
+  assert.match(buildWorkPrompt(["read", "project_memory"]), /LEARNING ACROSS RUNS/);
 });
 
 test("and is absent when there is no memory tool to write to", () => {
-  assert.doesNotMatch(buildLoopSystemPrompt(["read", "write", "bash"]), /LEARNING ACROSS RUNS/);
+  assert.doesNotMatch(buildWorkPrompt(["read", "write", "bash"]), /LEARNING ACROSS RUNS/);
 });
 
 test("it stays compact — it rides on every run that has memory", () => {

@@ -30,7 +30,7 @@ export function createFileMemoryTool(memory: FileMemory): AgentTool {
         description:
           "Search or inspect the durable file-memory index. Actions: search, get, refresh, stats (default: inferred from the other arguments — `query`→search, `path`→get, `paths`→refresh, otherwise stats). Search uses path, summary, tags, keywords, symbols, dependencies, routes, and semantic metadata.",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["read", "write_edit", "activity_inspect"],
     parameters: {
       type: "object",
       properties: {

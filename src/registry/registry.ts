@@ -1,5 +1,5 @@
 /**
- * MCP / skills / tools registry (req #3).
+ * MCP / skills / tools registry.
  *
  * Holds every capability the harness can use, grouped into providers. A provider
  * is one of:
@@ -8,14 +8,14 @@
  *   - "skill" : a bundle of tools/behaviour packaged as a skill (internal or external)
  *
  * Every provider carries a `source` ("internal" = bundled, "external" = user-loaded)
- * and is categorized into one or more of the 4P phases. The public API is:
- *   - list()   -> providers + aggregated description + category + full tool defs
+ * and is scoped to one or more CATEGORIZER ids (v2; the 4P phases are retired).
+ * The public API is:
+ *   - list()   -> providers + aggregated description + scope + full tool defs
  *   - add()    -> register a provider (used when a user adds a new mcp/skill)
  *   - remove() -> delete a provider
- * plus phase-scoped resolution used by the orchestrator.
+ * plus categorizer-scoped resolution used by the chain.
  */
-import type { AgentTool, Phase, Tool } from "../types.js";
-import { PHASES } from "../types.js";
+import type { AgentTool, Tool } from "../types.js";
 import { categorizeTool } from "./categorize.js";
 
 export type ProviderKind = "tool" | "mcp" | "skill";
@@ -32,8 +32,8 @@ export interface ProviderInput {
   description?: string;
   /** The full tool definitions this provider exposes. */
   tools: AgentTool[];
-  /** Explicit 4P phases; if omitted they are inferred from the tools. */
-  phases?: Phase[];
+  /** Explicit categorizer ids; if omitted they are inferred from the tools. */
+  categorizers?: string[];
   /** Optional lifecycle hook to release external resources (mcp process, etc.). */
   dispose?: () => void | Promise<void>;
   /** Freeform metadata (transport, command, version...). */
@@ -41,26 +41,25 @@ export interface ProviderInput {
 }
 
 interface StoredProvider extends ProviderInput {
-  phases: Phase[];
+  categorizers: string[];
   description: string;
 }
 
 /**
- * Custom categorization strategy. Receives the built-in default phases for a tool
- * and returns the phases to actually use — lets an app redefine what each P
- * contains for its domain (mobile app, data pipeline, game, ...). (req: the fixed
- * per-P tools/mcps/skills must be customizable.)
+ * Custom scoping strategy. Receives the built-in default categorizer ids for a
+ * tool and returns the ids to actually use — lets an app redefine which
+ * categorizers a tool belongs to for its domain.
  */
-export type ToolCategorizer = (tool: AgentTool, defaultPhases: Phase[]) => Phase[];
+export type ToolCategorizer = (tool: AgentTool, defaults: string[]) => string[];
 
 export interface RegistryOptions {
   categorizer?: ToolCategorizer;
 }
 
-/** Declarative selection of a phase's toolset from the registry. */
-export interface PhaseToolFilter {
-  /** Start from the registry's category-resolved tools for the phase (default true). */
-  fromCategory?: boolean;
+/** Declarative selection of a categorizer's toolset from the registry. */
+export interface CategorizerToolFilter {
+  /** Start from the registry's scope-resolved tools for the categorizer (default true). */
+  fromScope?: boolean;
   /** Tool names to add (from anywhere in the registry). */
   include?: string[];
   /** Tool names to remove. */
@@ -73,16 +72,16 @@ export interface PhaseToolFilter {
   sources?: ProviderSource[];
 }
 
-/** A function that computes a phase's toolset from the live registry. */
-export type PhaseToolResolver = (registry: Registry, phase: Phase) => AgentTool[];
+/** A function that computes a categorizer's toolset from the live registry. */
+export type CategorizerToolResolver = (registry: Registry, categorizer: string) => AgentTool[];
 
 /**
- * Ways to define the "fixed" toolset for a phase:
- *   - `AgentTool[]`        — pin an exact list
- *   - `PhaseToolFilter`    — declaratively include/exclude on top of the category
- *   - `PhaseToolResolver`  — full programmatic control given the registry
+ * Ways to define a categorizer's "fixed" toolset:
+ *   - `AgentTool[]`              — pin an exact list
+ *   - `CategorizerToolFilter`    — declaratively include/exclude on top of the scope
+ *   - `CategorizerToolResolver`  — full programmatic control given the registry
  */
-export type PhaseToolSpec = AgentTool[] | PhaseToolFilter | PhaseToolResolver;
+export type CategorizerToolSpec = AgentTool[] | CategorizerToolFilter | CategorizerToolResolver;
 
 /** What `list()` returns per provider. */
 export interface ProviderListItem {
@@ -92,10 +91,10 @@ export interface ProviderListItem {
   name: string;
   /** Aggregated description derived from all the tools it holds. */
   description: string;
-  /** Which 4P phase(s) this provider serves. */
-  phases: Phase[];
-  /** Full tool definitions (name/description/parameters + mutates/phase hints). */
-  tools: Array<Tool & { mutates: boolean; phases: Phase[] }>;
+  /** Which categorizer(s) this provider serves. */
+  categorizers: string[];
+  /** Full tool definitions (name/description/parameters + mutates hints). */
+  tools: Array<Tool & { mutates: boolean; categorizers: string[] }>;
   metadata?: Record<string, unknown>;
 }
 
@@ -129,16 +128,16 @@ export class Registry {
 
     const description = input.description ?? synthesizeDescription(input);
 
-    // Normalize per-tool phases/mutates so downstream code never sees undefined.
-    // Per-tool phases: explicit → custom categorizer(default) → default.
+    // Normalize per-tool scopes/mutates so downstream code never sees undefined.
+    // Per-tool categorizers: explicit → custom categorizer(default) → default.
     const tools = input.tools.map((t) => ({
       ...t,
       mutates: t.mutates ?? false,
-      phases: t.phases?.length ? t.phases : this.categorizer(t, categorizeTool(t)),
+      categorizers: t.categorizers?.length ? t.categorizers : this.categorizer(t, categorizeTool(t)),
     }));
-    const phases = input.phases?.length
-      ? input.phases
-      : dedupePhases(tools.flatMap((t) => t.phases));
+    const categorizers = input.categorizers?.length
+      ? input.categorizers
+      : dedupeIds(tools.flatMap((t) => t.categorizers));
 
     // Validate ALL tool names for collisions BEFORE mutating any state, so a
     // conflict can't leave the registry half-populated.
@@ -150,7 +149,7 @@ export class Registry {
         );
     }
 
-    const stored: StoredProvider = { ...input, tools, phases, description };
+    const stored: StoredProvider = { ...input, tools, categorizers, description };
     this.providers.set(input.id, stored);
     for (const t of tools) this.toolIndex.set(t.name, input.id);
 
@@ -182,11 +181,11 @@ export class Registry {
   }
 
   /** List all providers with aggregated description + category + full tool defs. */
-  list(filter?: { source?: ProviderSource; kind?: ProviderKind; phase?: Phase }): ProviderListItem[] {
+  list(filter?: { source?: ProviderSource; kind?: ProviderKind; categorizer?: string }): ProviderListItem[] {
     let items = [...this.providers.values()].map((p) => this.toListItem(p));
     if (filter?.source) items = items.filter((i) => i.source === filter.source);
     if (filter?.kind) items = items.filter((i) => i.kind === filter.kind);
-    if (filter?.phase) items = items.filter((i) => i.phases.includes(filter.phase!));
+    if (filter?.categorizer) items = items.filter((i) => i.categorizers.includes(filter.categorizer!));
     return items;
   }
 
@@ -196,19 +195,20 @@ export class Registry {
     return p ? this.toListItem(p) : undefined;
   }
 
-  /** Resolve the executable AgentTools available to a given phase (by category). */
-  getToolsForPhase(phase: Phase): AgentTool[] {
+  /** Resolve the executable AgentTools available to a given categorizer (by scope). */
+  getToolsForCategorizer(categorizer: string): AgentTool[] {
     const out: AgentTool[] = [];
     for (const p of this.providers.values()) {
       for (const t of p.tools) {
-        const tphases = t.phases?.length ? t.phases : p.phases;
-        if (tphases.includes(phase)) out.push(t);
+        const scopes = t.categorizers?.length ? t.categorizers : p.categorizers;
+        if (scopes.includes(categorizer)) out.push(t);
       }
     }
-    // Only demote bash in phases that actually drive execution/verification
-    // (Perform, Perfect). Prepare/Plan are read-only by nature and benefit
-    // from keeping bash in its natural position.
-    if (phase === "perform" || phase === "perfect") return this.demoteFallbackTools(out);
+    // Demote bash in work-driving categorizers; read stays read-only by nature
+    // and benefits from keeping bash in its natural position.
+    if (["write_edit", "activity_inspect", "perform", "perfect"].includes(categorizer)) {
+      return this.demoteFallbackTools(out);
+    }
     return out;
   }
 
@@ -236,21 +236,21 @@ export class Registry {
   }
 
   /**
-   * Resolve a phase's toolset from a {@link PhaseToolSpec}. This is the single
-   * place the orchestrator asks "what tools does phase X get?", so an app can make
-   * the fixed per-P toolset anything it wants — an exact list, a filter over the
-   * category, or a function.
+   * Resolve a categorizer's toolset from a {@link CategorizerToolSpec}. This is
+   * the single place a caller asks "what tools does categorizer X get?", so an
+   * app can make the fixed toolset anything it wants — an exact list, a filter
+   * over the scope, or a function.
    */
-  selectPhaseTools(phase: Phase, spec?: PhaseToolSpec): AgentTool[] {
-    if (!spec) return this.getToolsForPhase(phase);
-    if (typeof spec === "function") return spec(this, phase);
+  selectCategorizerTools(categorizer: string, spec?: CategorizerToolSpec): AgentTool[] {
+    if (!spec) return this.getToolsForCategorizer(categorizer);
+    if (typeof spec === "function") return spec(this, categorizer);
     if (Array.isArray(spec)) return spec;
-    return this.applyPhaseFilter(phase, spec);
+    return this.applyCategorizerFilter(categorizer, spec);
   }
 
-  private applyPhaseFilter(phase: Phase, f: PhaseToolFilter): AgentTool[] {
+  private applyCategorizerFilter(categorizer: string, f: CategorizerToolFilter): AgentTool[] {
     const byName = new Map<string, AgentTool>();
-    if (f.fromCategory !== false) for (const t of this.getToolsForPhase(phase)) byName.set(t.name, t);
+    if (f.fromScope !== false) for (const t of this.getToolsForCategorizer(categorizer)) byName.set(t.name, t);
     for (const pid of f.providers ?? []) {
       const p = this.providers.get(pid);
       if (p) for (const t of p.tools) byName.set(t.name, t);
@@ -271,31 +271,32 @@ export class Registry {
   }
 
   /**
-   * Reassign the 4P phases of a single tool at runtime. Lets an app move a tool
-   * between phases (e.g. put a custom "screenshot" tool into Perfect) without
-   * re-registering its provider. Returns false if the tool is unknown.
+   * Reassign the categorizer scope of a single tool at runtime. Lets an app move
+   * a tool between categorizers (e.g. put a custom "screenshot" tool into
+   * activity_inspect) without re-registering its provider. Returns false if the
+   * tool is unknown.
    */
-  setToolPhases(toolName: string, phases: Phase[]): boolean {
+  setToolCategorizers(toolName: string, categorizers: string[]): boolean {
     const pid = this.toolIndex.get(toolName);
     if (!pid) return false;
     const p = this.providers.get(pid)!;
     const t = p.tools.find((x) => x.name === toolName);
     if (!t) return false;
-    (t as AgentTool).phases = dedupePhases(phases);
+    (t as AgentTool).categorizers = dedupeIds(categorizers);
     this.emit({ type: "changed", provider: this.toListItem(p) });
     return true;
   }
 
   /**
-   * Reassign the 4P phases of a whole provider (and all its tools) at runtime,
-   * e.g. put an entire MCP server into the Perfect phase. Returns false if unknown.
+   * Reassign the scope of a whole provider (and all its tools) at runtime, e.g.
+   * put an entire MCP server into activity_inspect. Returns false if unknown.
    */
-  setProviderPhases(providerId: string, phases: Phase[]): boolean {
+  setProviderCategorizers(providerId: string, categorizers: string[]): boolean {
     const p = this.providers.get(providerId);
     if (!p) return false;
-    const next = dedupePhases(phases);
-    p.phases = next;
-    for (const t of p.tools) (t as AgentTool).phases = [...next];
+    const next = dedupeIds(categorizers);
+    p.categorizers = next;
+    for (const t of p.tools) (t as AgentTool).categorizers = [...next];
     this.emit({ type: "changed", provider: this.toListItem(p) });
     return true;
   }
@@ -312,14 +313,13 @@ export class Registry {
     return [...this.providers.values()].flatMap((p) => p.tools);
   }
 
-  /** A phase→tool-definitions map, e.g. for handing the plan phase its toolbox. */
-  phaseMap(): Record<Phase, ProviderListItem["tools"]> {
-    const map = Object.fromEntries(PHASES.map((p) => [p, [] as ProviderListItem["tools"]])) as Record<
-      Phase,
-      ProviderListItem["tools"]
-    >;
+  /** A categorizer→tool-definitions map over every scope actually in use. */
+  categorizerMap(): Record<string, ProviderListItem["tools"]> {
+    const map: Record<string, ProviderListItem["tools"]> = {};
     for (const item of this.list()) {
-      for (const t of item.tools) for (const ph of t.phases) map[ph].push(t);
+      for (const t of item.tools) {
+        for (const id of t.categorizers) (map[id] ??= []).push(t);
+      }
     }
     return map;
   }
@@ -335,13 +335,13 @@ export class Registry {
       source: p.source,
       name: p.name,
       description: p.description,
-      phases: p.phases,
+      categorizers: p.categorizers,
       tools: p.tools.map((t) => ({
         name: t.name,
         description: t.description,
         parameters: t.parameters,
         mutates: t.mutates ?? false,
-        phases: t.phases?.length ? t.phases : p.phases,
+        categorizers: t.categorizers?.length ? t.categorizers : p.categorizers,
       })),
       metadata: p.metadata,
     };
@@ -357,8 +357,8 @@ export type RegistryEvent =
   | { type: "removed"; id: string }
   | { type: "changed"; provider: ProviderListItem };
 
-function dedupePhases(phases: Phase[]): Phase[] {
-  return [...new Set(phases)];
+function dedupeIds(ids: string[]): string[] {
+  return [...new Set(ids)];
 }
 
 /** Build a provider description from its tools (req #3: "based on all the tools it had"). */

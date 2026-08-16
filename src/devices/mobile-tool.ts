@@ -223,7 +223,7 @@ export function createMobileTool(): AgentTool {
       "the visual estimate with the UI tree — so it works on labelled controls, on icon-only ones with no " +
       "label, and on custom-drawn UI with no tree at all. All coordinates are LOGICAL POINTS.",
     mutates: true,
-    phases: ["perform", "perfect"],
+    categorizers: ["write_edit", "activity_inspect"],
     parameters: { type: "object", properties: PARAMS, required: ["action"] },
     async execute(id, args, ctx) {
       const action = String(args?.action ?? "").trim() as MobileAction;

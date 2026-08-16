@@ -653,7 +653,7 @@ export function createMediaAnalysisTool(
     mutates: false,
     // Available in every phase: understanding a mockup or a spec belongs at the
     // START of the work, not only at the verify step the old auditor was scoped to.
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["read", "write_edit", "activity_inspect"],
     complexityHint: 0.5,
     parameters: {
       type: "object",

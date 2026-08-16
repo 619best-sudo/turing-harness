@@ -95,7 +95,7 @@ test("createProjectSession creates and loads graph memory", async (t) => {
   assert.ok(first.graphMemory, "graphMemory should be attached");
   assert.equal(first.graphMemory.wasCreated, true, "graphMemory should be created on first open");
   assert.ok(first.session.graphMemory === first.graphMemory, "graphMemory should attach to session");
-  assert.ok(first.session.toolsForPhase("prepare").some((tool) => tool.name === "graph_memory"), "graph_memory tool should be available");
+  assert.ok(first.session.toolsForCategorizer("read").some((tool) => tool.name === "graph_memory"), "graph_memory tool should be available");
   await fs.access(path.join(cwd, ".turing", "graph.json"));
   await fs.access(path.join(cwd, ".turing", "GRAPH_MEMORY.md"));
   assert.ok(first.graphMemory.stats().totalFiles >= 3, "graph should index TS files");
@@ -110,7 +110,7 @@ test("graph_memory returns file deps, symbol deps, and blast radius in one call"
   const cwd = await mkproject();
   const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "graph_memory");
   assert.ok(tool, "graph_memory tool should exist");
 
   const fileDeps = await tool.execute("id", { action: "file_deps", path: path.join(cwd, "src", "b.ts"), direction: "inbound" }, toolCtx(cwd, harness));
@@ -146,7 +146,7 @@ test("graph memory stale detection and refresh work", async (t) => {
   const reopened = await harness.createProjectSession({ cwd, connectMcp: false });
   assert.equal(reopened.graphMemory?.getFileNode(target)?.stale, true, "reopen should mark changed graph file stale");
 
-  const tool = reopened.session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
+  const tool = reopened.session.toolsForCategorizer("read").find((entry) => entry.name === "graph_memory");
   assert.ok(tool, "graph_memory tool should exist");
   await tool.execute("id", { action: "refresh", path: target }, toolCtx(cwd, harness));
   assert.equal(reopened.graphMemory?.getFileNode(target)?.stale, false, "refresh should clear graph staleness");
@@ -183,7 +183,7 @@ test("memory:false disables graph memory", async (t) => {
   const { session, graphMemory } = await harness.createProjectSession({ cwd, memory: false, connectMcp: false });
   assert.equal(graphMemory, undefined, "graphMemory should be disabled");
   await assert.rejects(fs.access(path.join(cwd, ".turing", "graph.json")));
-  assert.ok(!session.toolsForPhase("prepare").some((tool) => tool.name === "graph_memory"), "graph_memory tool should be absent");
+  assert.ok(!session.toolsForCategorizer("read").some((tool) => tool.name === "graph_memory"), "graph_memory tool should be absent");
   await harness.dispose();
 });
 
@@ -388,7 +388,7 @@ test("framework overlays add convention edges and capability-aware query notes",
   const nextDeps = graphMemory?.fileDeps(nextPage, "outbound");
   assert.ok(nextDeps?.edges.some((edge) => edge.reason === "page uses layout"), "next overlay should add layout edge");
 
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "graph_memory");
   assert.ok(tool);
   const phpSymbol = await tool.execute("id", {
     action: "symbol_deps",

@@ -4,6 +4,7 @@
  *
  * Run: OPENROUTER_API_KEY=... node examples/live-solar-playwright.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import http from "node:http";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -129,7 +130,7 @@ async function main() {
     `and confirm the page has an "Animated Solar System" title or heading and the app loads successfully. ` +
     `End with "VERDICT: PASS" only if browser verification succeeds.`;
 
-  const result = await session.runChain(task);
+  const result = await session.run(task);
 
   console.log("\n===== RESULT =====");
   console.log("success:", result.success, "| iterations:", result.iterations, "| cost $", result.usage.cost.total.toFixed(4));

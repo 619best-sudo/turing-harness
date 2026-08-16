@@ -177,16 +177,14 @@ test("no false alarm when the model does return thinking", async () => {
 });
 
 /**
- * The conversational reply path must honour the configured reasoning level.
+ * The conversation categorizer must honour the configured reasoning level.
  *
- * `classifyIntent` routes anything it reads as conversational to
- * `streamConversationalReply`, which used to call the LLM with a hardcoded
- * `reasoning: "off"`. That silently defeated `thinkingLevel` for exactly the
- * prompts where a host most expects a thinking block — a plain question like
- * "what is 17*23?" — and nothing in the transcript explained why. The genuinely
- * internal calls (`classifyIntent`, `summarizeRun`) stay off deliberately.
+ * The router sends chat-shaped prompts to the `conversation` categorizer, whose
+ * loop turn is a USER-VISIBLE assistant reply — so it must carry the configured
+ * reasoning effort, not a hardcoded "off". (The genuinely internal calls — the
+ * router, the summary turn — stay off deliberately.)
  */
-test("the conversational reply path asks the model to reason", async () => {
+test("the conversation categorizer asks the model to reason", async () => {
   const { Orchestrator, LogStore: LS, PermissionGate: PG, Registry } = await import("../dist/index.js");
 
   const seen = [];
@@ -195,10 +193,24 @@ test("the conversational reply path asks the model to reason", async () => {
     id: slug, openRouterSlug: slug, reasoning: true, maxTokens: 32000,
     input: ["text"], cost: { input: 0, output: 0 },
   });
+  llm.complete = async (_model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      return msg([{ type: "text", text: "CATEGORY: conversation" }]);
+    }
+    if (/closing summary/.test(sys)) {
+      return msg([{ type: "text", text: "391" }]);
+    }
+    return msg([{ type: "text", text: "ok" }]);
+  };
   llm.stream = async function* (_model, _context, options) {
     seen.push(options?.reasoning);
     yield { type: "start", partial: msg([]) };
-    yield { type: "done", message: msg([{ type: "text", text: "391" }]) };
+    yield {
+      type: "done",
+      message: msg([{ type: "toolCall", id: "d1", name: "deliver", arguments: { summary: "391" } }]),
+      ...(false ? {} : {}),
+    };
   };
 
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-conv-reasoning-"));
@@ -209,17 +221,15 @@ test("the conversational reply path asks the model to reason", async () => {
     logStore: new LS(),
     cwd: tmp,
   });
-  orchestrator.setReasoning("prepare", "high");
+  orchestrator.setReasoning("high", "prepare");
 
-  // Reach the private path directly: `classifyIntent` needs a live model call to
-  // route, and that is not what this test is pinning.
-  await orchestrator.streamConversationalReply("What is 17*23?");
+  await orchestrator.run("What is 17*23?");
 
-  assert.equal(seen.length, 1, "expected exactly one conversational stream call");
-  assert.equal(seen[0], "high", `conversational reply must pass the configured level, got ${seen[0]}`);
+  assert.ok(seen.length >= 1, "expected at least one conversational stream call");
+  assert.equal(seen[0], "high", `conversation reply must pass the configured level, got ${seen[0]}`);
 });
 
-test("the conversational reply path sends nothing when no level is configured", async () => {
+test("the conversation categorizer sends nothing when no level is configured", async () => {
   const { Orchestrator, LogStore: LS, PermissionGate: PG, Registry } = await import("../dist/index.js");
 
   const seen = [];
@@ -228,10 +238,20 @@ test("the conversational reply path sends nothing when no level is configured", 
     id: slug, openRouterSlug: slug, reasoning: true, maxTokens: 32000,
     input: ["text"], cost: { input: 0, output: 0 },
   });
+  llm.complete = async (_model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      return msg([{ type: "text", text: "CATEGORY: conversation" }]);
+    }
+    if (/closing summary/.test(sys)) {
+      return msg([{ type: "text", text: "391" }]);
+    }
+    return msg([{ type: "text", text: "ok" }]);
+  };
   llm.stream = async function* (_model, _context, options) {
     seen.push("reasoning" in (options ?? {}) ? options.reasoning : "<absent>");
     yield { type: "start", partial: msg([]) };
-    yield { type: "done", message: msg([{ type: "text", text: "391" }]) };
+    yield { type: "done", message: msg([{ type: "toolCall", id: "d1", name: "deliver", arguments: { summary: "391" } }]) };
   };
 
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-conv-none-"));
@@ -239,7 +259,7 @@ test("the conversational reply path sends nothing when no level is configured", 
     llm, registry: new Registry(), permission: new PG("bypass"), logStore: new LS(), cwd: tmp,
   });
 
-  await orchestrator.streamConversationalReply("What is 17*23?");
+  await orchestrator.run("What is 17*23?");
 
   // Omitted, not "off" — an absent field means "provider default", which is what
   // an unconfigured host should get.

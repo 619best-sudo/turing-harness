@@ -26,16 +26,13 @@ import {
   DEBUGGING_LOOP,
   FILE_SEARCH_LADDER,
   INSPIRATION_REUSE,
-  LOOP_SYSTEM_PROMPT,
   MEDIA_UNDERSTANDING,
-  PHASE_PROMPTS,
   PROJECT_LEARNING,
   RUN_ORDER,
   VERIFY_WHAT_YOU_WROTE,
   WEB_AND_SCRAPING,
-  buildLoopSystemPrompt,
-  buildPhaseSystemPrompt,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 /** The block each tool is the reason for. */
 const GATED = [
@@ -52,13 +49,13 @@ const BARE = ["read", "write", "edit", "bash"];
 const EVERYTHING = [...BARE, ...GATED.map(([tool]) => tool)];
 
 test("no tool list means the full prompt — the static exports stay complete", () => {
-  assert.equal(buildPhaseSystemPrompt("perform"), PHASE_PROMPTS.perform);
-  assert.equal(buildLoopSystemPrompt(), LOOP_SYSTEM_PROMPT);
+  assert.equal(buildPhaseLikePrompt("perform"), CATEGORIZER_PROMPTS.write_edit);
+  assert.equal(buildWorkPrompt(), WORK_PROMPT);
 });
 
 test("a block is present when its tool is, and absent when it is not", () => {
-  const rich = buildPhaseSystemPrompt("perform", EVERYTHING);
-  const bare = buildPhaseSystemPrompt("perform", BARE);
+  const rich = buildPhaseLikePrompt("perform", EVERYTHING);
+  const bare = buildPhaseLikePrompt("perform", BARE);
   for (const [tool, block] of GATED) {
     assert.ok(rich.includes(block), `${tool} is attached but its guidance is missing`);
     assert.ok(!bare.includes(block), `${tool} is absent but its guidance was still injected`);
@@ -68,7 +65,7 @@ test("a block is present when its tool is, and absent when it is not", () => {
 });
 
 test("one present tool pulls in its own block and nothing else", () => {
-  const withMedia = buildPhaseSystemPrompt("perform", [...BARE, "media_analysis"]);
+  const withMedia = buildPhaseLikePrompt("perform", [...BARE, "media_analysis"]);
   assert.ok(withMedia.includes(MEDIA_UNDERSTANDING));
   assert.ok(!withMedia.includes(ASSETS_AND_SVG));
   assert.ok(!withMedia.includes(WEB_AND_SCRAPING));
@@ -78,25 +75,24 @@ test("an MCP-namespaced tool still matches its block", () => {
   // Servers prefix their tools (`mcp__foo__media_analysis`, `browser_navigate`),
   // so a literal-equality gate would silently drop guidance for a tool the phase
   // genuinely has.
-  const namespaced = buildPhaseSystemPrompt("perform", [...BARE, "mcp__vision__media_analysis"]);
+  const namespaced = buildPhaseLikePrompt("perform", [...BARE, "mcp__vision__media_analysis"]);
   assert.ok(namespaced.includes(MEDIA_UNDERSTANDING), "a namespaced tool name did not match");
 });
 
 test("filtering never removes the phase's own identity or contracts", () => {
-  const bare = buildPhaseSystemPrompt("perform", BARE);
-  assert.match(bare, /You are the PERFORM phase/);
-  assert.match(bare, /THE 4P CONTRACT/);
-  assert.match(bare, /COMMON HANDOFF OUTPUTS/);
-  assert.match(bare, /FILE MUTATION CONTRACT/);
+  const bare = buildPhaseLikePrompt("perform", BARE);
+  assert.match(bare, /You are the WRITE\/EDIT categorizer/);
+  assert.match(bare, /ALWAYS PLAN FIRST/);
+  assert.match(bare, /YOUR EXPECTATION/);
   assert.match(bare, /WHEN A TOOL KEEPS FAILING/);
   // The complexity scale routes models on every write/edit, so it is core, not
   // situational — a phase that can mutate always carries it.
   assert.ok(bare.includes(COMPLEXITY_CONTRACT));
 
-  const loop = buildLoopSystemPrompt(BARE);
-  assert.match(loop, /You are a coding agent working in the user's project/);
-  assert.match(loop, /PLANNING \(optional/);
-  assert.match(loop, /FINISH:/);
+  const loop = buildWorkPrompt(BARE);
+  assert.match(loop, /You are the WRITE\/EDIT categorizer/);
+  assert.match(loop, /ALWAYS PLAN FIRST/);
+  assert.match(loop, /deliver/);
   assert.ok(loop.includes(VERIFY_WHAT_YOU_WROTE), "the loop must still close out with a verification pass");
 });
 
@@ -106,11 +102,11 @@ test("every phase carries the complexity scale it is asked to produce ratings on
   // reach all three or the same word means three things.
   for (const phase of ["prepare", "plan", "perform"]) {
     assert.ok(
-      buildPhaseSystemPrompt(phase, BARE).includes(COMPLEXITY_CONTRACT),
+      buildPhaseLikePrompt(phase, BARE).includes(COMPLEXITY_CONTRACT),
       `${phase} produces complexity ratings without being told what they mean`,
     );
   }
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(COMPLEXITY_CONTRACT));
+  assert.ok(WORK_PROMPT.includes(COMPLEXITY_CONTRACT));
 });
 
 test("the scale says what a rating buys, and names the category axis separately", () => {
@@ -133,17 +129,18 @@ test("PERFORM is told to declare both axes on every mutation", () => {
   // The arguments are optional in the schema, and a model that omits them gets a
   // category guessed from the file extension — which is how UI work ends up
   // authored by a model picked for logic.
-  assert.match(PHASE_PROMPTS.perform, /DECLARE `complexity` AND `category` ON EVERY `write` AND `edit` CALL/);
-  assert.match(LOOP_SYSTEM_PROMPT, /pass `complexity` and `category` on every `write` and `edit`/);
+  assert.match(WORK_PROMPT, /DECLARE THE CALL: pass `complexity` and `category` on every `write` and `edit`/);
 });
 
-test("PERFECT verifies visual work by looking at it, with a verdict lens", () => {
-  const perfect = PHASE_PROMPTS.perfect;
-  assert.match(perfect, /ANY VISUAL CHANGE IS VERIFIED BY LOOKING AT IT/);
+test("activity_inspect verifies visual work by looking at it, with a verdict lens", () => {
+  const perfect = CATEGORIZER_PROMPTS.activity_inspect;
+  // The verdict-lens discipline now lives in the DRIVING/MEDIA guidance the
+  // inspect categorizer carries: judging a render is a qa-lens check, never
+  // prose over a screenshot.
+  assert.match(perfect, /VERIFYING A RENDER/);
   assert.match(perfect, /lens:"qa"/);
-  // A description is not a check: the default lens cannot fail anything.
-  assert.match(perfect, /the default lens only describes what it sees and cannot fail a check/);
-  assert.ok(perfect.includes(CODE_CHANGE_ATTENTION) === false, "PERFECT does not author code");
+  assert.match(perfect, /VISUAL QA OF UI YOU JUST BUILT/);
+  assert.ok(perfect.includes(CODE_CHANGE_ATTENTION) === false, "activity_inspect does not author code");
 });
 
 test("the loop closes the fix cycle itself — it has no PERFECT phase to hand a FIX to", () => {
@@ -155,29 +152,26 @@ test("the loop closes the fix cycle itself — it has no PERFECT phase to hand a
   // No stacking speculative fixes, and no silently dropping the failure.
   assert.match(VERIFY_WHAT_YOU_WROTE, /REVERT that attempt/);
   assert.match(VERIFY_WHAT_YOU_WROTE, /never quietly drop\s+a failing check/);
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(VERIFY_WHAT_YOU_WROTE));
+  assert.ok(WORK_PROMPT.includes(VERIFY_WHAT_YOU_WROTE));
 });
 
 test("a bug-fix run injects the reproduce-first directive; a normal run does not", () => {
   // The directive is PROACTIVE: it states the discipline at the top of the run,
   // before the model commits to a fix, so reproducing first is the plan rather
   // than a wall at edit time. A feature run must not carry it.
-  const feature = buildLoopSystemPrompt(BARE);
-  const bugfix = buildLoopSystemPrompt(BARE, { isBugFix: true });
+  const feature = buildWorkPrompt(BARE);
+  const bugfix = buildWorkPrompt(BARE, { isBugFix: true });
 
   // The directive's unique opening line — not the generic DEBUGGING guidance a
   // feature run may also carry.
   assert.ok(!feature.includes("THIS RUN IS FIXING A REPORTED BUG"), "a non-bug-fix run carries no bug-fix directive");
-  assert.ok(!feature.includes("observe the broken behaviour BEFORE you change any code"));
+  assert.ok(!feature.includes("fix exactly what its evidence shows"));
 
   assert.match(bugfix, /THIS RUN IS FIXING A REPORTED BUG/);
-  assert.match(bugfix, /observe the broken behaviour BEFORE you change any code/);
-  // It names the same options the gate's refusal does, so the model has seen the
-  // path before it ever trips the gate.
+  assert.match(bugfix, /fix exactly what its evidence shows/);
+  // It names the inspect pass — the v2 reproduction path — so the model has
+  // seen the route before it ever guesses a fix.
   assert.match(bugfix, /activity_inspect/);
-  assert.match(bugfix, /DECLARE_REPRODUCE/);
-  // And it warns about the bash escape explicitly.
-  assert.match(bugfix, /Do NOT apply a fix through .?bash/);
 });
 
 // ---------------------------------------------------------------------------
@@ -221,9 +215,9 @@ const EVERY_TOOL = [
 ];
 
 test("the flat loop carries every block PERFORM or PERFECT carries", () => {
-  const loop = buildLoopSystemPrompt(EVERY_TOOL);
-  const perform = buildPhaseSystemPrompt("perform", EVERY_TOOL);
-  const perfect = buildPhaseSystemPrompt("perfect", EVERY_TOOL);
+  const loop = buildWorkPrompt(EVERY_TOOL);
+  const perform = buildPhaseLikePrompt("perform", EVERY_TOOL);
+  const perfect = buildPhaseLikePrompt("perfect", EVERY_TOOL);
 
   const dropped = Object.entries(ALL_BLOCKS)
     .filter(([, text]) => perform.includes(text) || perfect.includes(text))
@@ -236,7 +230,7 @@ test("the flat loop carries every block PERFORM or PERFECT carries", () => {
 test("no carried block cross-references a section the loop omits", () => {
   // A dangling "see X" is worse than no reference: it tells the model there is
   // more detail somewhere and there is not.
-  const loop = buildLoopSystemPrompt(EVERY_TOOL);
+  const loop = buildWorkPrompt(EVERY_TOOL);
   // The reference is wrapped across lines in the source, so match across it.
   assert.match(loop, /see\s+BUILD \/ TYPECHECK \/ LINT/, "the cross-reference exists");
   assert.ok(
@@ -247,13 +241,13 @@ test("no carried block cross-references a section the loop omits", () => {
 
 test("the build block carries the command-not-found rule the flat loop needs", () => {
   // The specific sentence a real run needed and did not get.
-  const loop = buildLoopSystemPrompt(EVERY_TOOL);
+  const loop = buildWorkPrompt(EVERY_TOOL);
   assert.match(loop, /`command not found` IS NOT `not installed`/);
   assert.match(loop, /Never\s+downgrade verification/);
   assert.match(loop, /\.fvm\/flutter_sdk/, "names the pinned-toolchain shapes bash resolves");
 });
 
 test("a run with no shell does not carry build guidance it cannot act on", () => {
-  const noShell = buildLoopSystemPrompt(EVERY_TOOL.filter((t) => t !== "bash"));
+  const noShell = buildWorkPrompt(EVERY_TOOL.filter((t) => t !== "bash"));
   assert.ok(!noShell.includes("BUILD / TYPECHECK / LINT — one command covers"));
 });

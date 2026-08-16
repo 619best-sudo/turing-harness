@@ -18,7 +18,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { WEB_AND_SCRAPING, CODE_RISK_SITES, buildLoopSystemPrompt } from "../dist/index.js";
+import { WEB_AND_SCRAPING, CODE_RISK_SITES } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 test("the proactive trigger exists and is stated as before-you-write", () => {
   assert.match(WEB_AND_SCRAPING, /LOOK IT UP BEFORE YOU WRITE IT, not after it breaks/);
@@ -73,6 +74,6 @@ test("the reactive path is unchanged — both triggers coexist", () => {
 });
 
 test("all of it is gated on the web tools actually being present", () => {
-  assert.match(buildLoopSystemPrompt(["read", "web_search"]), /LOOK IT UP BEFORE YOU WRITE IT/);
-  assert.doesNotMatch(buildLoopSystemPrompt(["read", "write"]), /LOOK IT UP BEFORE YOU WRITE IT/);
+  assert.match(buildWorkPrompt(["read", "web_search"]), /LOOK IT UP BEFORE YOU WRITE IT/);
+  assert.doesNotMatch(buildWorkPrompt(["read", "write"]), /LOOK IT UP BEFORE YOU WRITE IT/);
 });

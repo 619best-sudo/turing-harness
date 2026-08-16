@@ -155,7 +155,7 @@ test("createProjectSession creates and loads file memory for large projects", as
   assert.equal(first.fileMemory.wasCreated, true, "fileMemory should be created on first open");
   assert.ok(first.session.fileMemory === first.fileMemory, "fileMemory should be attached to session");
   assert.ok(first.fileMemoryRuntime, "fileMemory runtime should be attached");
-  assert.ok(first.session.toolsForPhase("prepare").some((tool) => tool.name === "file_memory"), "file_memory tool should be available");
+  assert.ok(first.session.toolsForCategorizer("read").some((tool) => tool.name === "file_memory"), "file_memory tool should be available");
   await first.fileMemoryRuntime?.drain();
 
   await fs.access(path.join(cwd, ".turing", "files.json"));
@@ -173,7 +173,7 @@ test("file_memory search returns ranked results in one call across 100+ files", 
   const cwd = await mkproject();
   const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
 
   const result = await tool.execute("id", { action: "search", query: "search files in one go", limit: 5 }, toolCtx(cwd, harness));
@@ -189,7 +189,7 @@ test("file_memory search supports typo-aware fuzzy fallback for misspellings", a
   const cwd = await mkproject();
   const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
 
   const result = await tool.execute(
@@ -213,7 +213,7 @@ test("file_memory keeps exact matches ahead of fuzzy neighbors when direct ranki
   const cwd = await mkproject();
   const harness = makeHarness(t);
   const { session } = await harness.createProjectSession({ cwd, connectMcp: false });
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
 
   const result = await tool.execute(
@@ -237,7 +237,7 @@ test("file_memory tags and summaries cover representative non-JS ecosystems", as
   const cwd = await mkproject();
   const harness = makeHarness(t);
   const { session, fileMemory } = await harness.createProjectSession({ cwd, connectMcp: false });
-  const tool = session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
 
   const phpEntry = fileMemory.get(path.join(cwd, "composer.json"));
@@ -351,7 +351,7 @@ test("external edits become stale on reopen and refresh clears staleness", async
   assert.equal(staleEntry?.stale, true, "reopen should detect that the file became stale");
   assert.match(staleEntry?.staleReason ?? "", /filesystem changed/);
 
-  const tool = reopened.session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = reopened.session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert.ok(tool, "file_memory tool should exist");
   await tool.execute("id", { action: "refresh", path: target }, toolCtx(cwd, harness));
   const refreshed = reopened.fileMemory?.get(target);
@@ -367,7 +367,7 @@ test("memory:false disables file memory", async (t) => {
   const { session, fileMemory } = await harness.createProjectSession({ cwd, memory: false, connectMcp: false });
   assert.equal(fileMemory, undefined, "fileMemory should be disabled when memory:false");
   await assert.rejects(fs.access(path.join(cwd, ".turing", "files.json")));
-  assert.ok(!session.toolsForPhase("prepare").some((tool) => tool.name === "file_memory"), "file_memory tool should be absent");
+  assert.ok(!session.toolsForCategorizer("read").some((tool) => tool.name === "file_memory"), "file_memory tool should be absent");
   await harness.dispose();
 });
 

@@ -14,15 +14,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  coordinateRunHandoff,
-  detectSurfaces,
-} from "../dist/index.js";
-
-// The host's AskUserQuestionRequest.phase is typed as this exact union
-// (OpenWaggleMain src/shared/types/user-question.ts:18). Any phase the harness
-// emits MUST be in it, or the host's renderer won't render the question and the
-// resolve-match key won't match.
+// The host's AskUserQuestionRequest.phase is typed as a string union
+// (OpenWaggleMain src/shared/types/user-question.ts). In v2 the label is the
+// CATEGORIZER id driving the loop — hosts treating it as an opaque label keep
+// working; hosts keyed on 4P names should read "write_edit" as the work pass.
 const HOST_PHASE_UNION = new Set(["prepare", "plan", "perform", "perfect"]);
 
 // The host's ThreadRunDisposition validator accepts ONLY these values.
@@ -39,57 +34,6 @@ const stubRegistry = (names = []) => ({
   getTool: (n) => (names.includes(n) ? { name: n } : undefined),
 });
 
-test("the run-handoff question always carries a phase in the host's typed union", async () => {
-  // Visual method → handoff fires → question is asked. Assert its phase.
-  let captured;
-  await coordinateRunHandoff({
-    registry: stubRegistry(["mcp__playwright__browser_navigate"]),
-    askUserQuestion: async (req) => { captured = req; return "You drive it"; },
-    declaredMethods: ["visual"],
-  });
-  assert.ok(captured, "a question was asked");
-  assert.ok(
-    HOST_PHASE_UNION.has(captured.phase),
-    `phase "${captured.phase}" must be in the host union ${[...HOST_PHASE_UNION].join("|")}`,
-  );
-  assert.equal(captured.phase, "perfect"); // semantically the verify phase
-});
-
-test("the handoff question is a single-select with a free-text escape (host renders both)", async () => {
-  let captured;
-  await coordinateRunHandoff({
-    registry: stubRegistry([]),
-    askUserQuestion: async (req) => { captured = req; return "Skip verification"; },
-    declaredMethods: ["endpoint"],
-  });
-  assert.equal(captured.answerMode, "single-select");
-  assert.equal(captured.allowFreeText, true);
-  assert.ok(Array.isArray(captured.options) && captured.options.length >= 2);
-});
-
-test("detectSurfaces never throws on an empty/undefined registry (host may have none)", () => {
-  assert.deepEqual(detectSurfaces(undefined), { browser: false, mobile: false });
-  assert.deepEqual(detectSurfaces(stubRegistry()), { browser: false, mobile: false });
-});
-
-test("the handoff degrades gracefully when the host has NO askUserQuestion callback", async () => {
-  // OpenWaggleMain always installs one, but the contract must not require it.
-  const res = await coordinateRunHandoff({
-    registry: stubRegistry([]),
-    declaredMethods: ["visual"],
-  });
-  assert.ok(["agent", "skip"].includes(res.mode), "no callback ⇒ agent or skip, never a hang");
-});
-
-test("the handoff never throws — any host error degrades to skip", async () => {
-  const res = await coordinateRunHandoff({
-    registry: stubRegistry([]),
-    askUserQuestion: async () => { throw new Error("renderer exploded"); },
-    declaredMethods: ["visual"],
-  });
-  assert.equal(res.mode, "skip");
-});
-
 test("RunLoopResult.verified is boolean|undefined (never throws on access)", () => {
   // Structural: the field is optional. A host that does `result.verified` on a
   // conversational run gets undefined, not an error. Verified by TypeScript at
@@ -98,16 +42,6 @@ test("RunLoopResult.verified is boolean|undefined (never throws on access)", () 
   assert.equal(sample.verified, undefined);
   const verified = { ...sample, verified: true };
   assert.equal(verified.verified, true);
-});
-
-test("RunLoopResult.reproduction is additive (host ignores it, never breaks)", () => {
-  // The reproduction report is present only on bug-fix runs. A host that never
-  // reads it must not be affected — confirm the field is optional/undefined by
-  // default and additive when present.
-  const sample = { task: "x", route: "task", success: true, steps: [], refs: [], usage: {} };
-  assert.equal(sample.reproduction, undefined);
-  const withRepro = { ...sample, reproduction: { reproduced: true, askedUser: false, blocks: 0 } };
-  assert.equal(withRepro.reproduction.reproduced, true);
 });
 
 test("the host's disposition / followUpMode enums are unchanged", () => {

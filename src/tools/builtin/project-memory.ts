@@ -42,7 +42,7 @@ export function createProjectMemoryTool(memory: ProjectMemory): AgentTool {
       "otherwise get; `remember` must be explicit).",
     // Reads dominate; remembering a fact is a low-risk local note, not a code change.
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["read", "write_edit", "activity_inspect"],
     parameters: {
       type: "object",
       properties: {

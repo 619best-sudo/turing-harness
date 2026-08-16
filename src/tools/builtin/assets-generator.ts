@@ -486,7 +486,7 @@ export function createAssetsGeneratorTool(config: AssetsGeneratorConfig = {}): A
       "unlabelled path soup that cannot be themed, targeted or animated. A complex STATIC decorative SVG is a " +
       "fair use of this tool; the moment it needs to move, hand-author it instead.",
     mutates: true,
-    phases: ["perform"],
+    categorizers: ["write_edit"],
     complexityHint: 0.6,
     parameters: {
       type: "object",

@@ -4,7 +4,8 @@
  * Mirrors the surface of `@mariozechner/pi-agent`'s `Agent` class — `subscribe`,
  * `prompt(input, attachments?)`, `state`, `setModel`, `setThinkingLevel`, `abort`,
  * `reset` — and emits the same {@link AgentEvent} stream, so a pi UI can drive this
- * harness with minimal changes. Under the hood, `prompt` runs the 4P chain.
+ * harness with minimal changes. Under the hood, `prompt` runs the categorizer
+ * chain (v2): router → scoped categorizer hops → summary.
  */
 import type {
   AgentEvent,
@@ -12,23 +13,17 @@ import type {
   AskUserQuestionResult,
   AppMessage,
   Attachment,
-  MediaRef,
   Message,
-  Phase,
-  PhaseResult,
   PlanSet,
   RunLoopResult,
   RunStep,
   ThreadFollowUpContext,
-  VerificationReport,
-  ReproductionReport,
   ThreadRunSnapshot,
   ThinkingLevel,
   TranscriptMode,
   UserMessage,
 } from "./types.js";
-import type { ChainResult } from "./orchestrator/orchestrator.js";
-import { buildUserContent, refsFromAttachments } from "./multimodal/attachment.js";
+import { buildUserContent } from "./multimodal/attachment.js";
 
 /**
  * The minimal session surface an Agent drives. Both {@link Session} and the
@@ -37,13 +32,11 @@ import { buildUserContent, refsFromAttachments } from "./multimodal/attachment.j
  */
 export interface AgentHost {
   subscribe(fn: (e: AgentEvent) => void): () => void;
-  /** Flat loop driver — the primary entry point (pi-style loop + summary). */
-  run(task: string, opts?: { signal?: AbortSignal; askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>; followUpContext?: ThreadFollowUpContext; transcriptMode?: TranscriptMode; emitReasoning?: boolean; emitText?: boolean; images?: Array<{ path: string; mimeType: string }>; skipPlan?: boolean; maxStepsPerStep?: number; isBugFix?: boolean }): Promise<RunLoopResult>;
-  runChain(task: string, opts?: { signal?: AbortSignal; askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>; followUpContext?: ThreadFollowUpContext; transcriptMode?: TranscriptMode }): Promise<ChainResult>;
-  runPhase(phase: Phase, task: string, opts?: { priorRefs?: MediaRef[]; signal?: AbortSignal; askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>; followUpContext?: ThreadFollowUpContext; transcriptMode?: TranscriptMode }): Promise<PhaseResult>;
+  /** The categorizer chain driver — the primary (and only) execution entry point. */
+  run(task: string, opts?: { signal?: AbortSignal; askUserQuestion?: (request: AskUserQuestionRequest) => Promise<AskUserQuestionResult>; followUpContext?: ThreadFollowUpContext; transcriptMode?: TranscriptMode; emitReasoning?: boolean; emitText?: boolean; images?: Array<{ path: string; mimeType: string }>; planMode?: boolean; skipPlan?: boolean; maxStepsPerStep?: number; isBugFix?: boolean }): Promise<RunLoopResult>;
   orchestrator: {
-    setModel(target: Phase | "orchestrator", slug: string | undefined): void;
-    setReasoning(target: Phase, level: ThinkingLevel | undefined): void;
+    setModel(target: string, slug: string | undefined): void;
+    setReasoning(level: ThinkingLevel | undefined, target?: string): void;
   };
   readonly threadSnapshot?: ThreadRunSnapshot;
   clearThreadSnapshot?(): void;
@@ -59,17 +52,10 @@ export interface HarnessAgentState {
   isStreaming: boolean;
   streamMessage: Message | null;
   error?: string;
-  /** Whether the last run verified its written files. Set on BOTH the flat-loop
-   * `run` path (via the verify-what-you-wrote gate) and the legacy 4P chain. */
+  /** Whether the last run's writes passed the activity_inspect verdict. */
   lastVerified?: boolean;
-  /** Structured verification report from the flat loop's verify gate, if any. */
-  lastVerification?: VerificationReport;
-  /** Reproduce-gate report from the last bug-fix run, if any. */
-  lastReproduction?: ReproductionReport;
   pendingUserQuestion?: AskUserQuestionRequest;
-  /** Legacy 4P per-phase results (still populated when run via runChain/runPhase). */
-  lastPhaseResults?: Partial<Record<Phase, PhaseResult>>;
-  /** End-of-run summary from the flat loop driver. */
+  /** End-of-run summary from the chain's summary turn. */
   lastRunSummary?: string;
   /** Per-step progress from the flat loop driver (with isCompleted). */
   lastSteps?: RunStep[];
@@ -82,12 +68,6 @@ export interface HarnessAgentOptions {
   systemPrompt?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
-  /**
-   * Run mode. `"chain"` is the default and, despite the legacy name, drives the
-   * flat `run` loop — it is the primary path. Naming a `Phase` instead runs that
-   * single legacy 4P phase per prompt.
-   */
-  mode?: "chain" | Phase;
   transcriptMode?: TranscriptMode;
   /**
    * Emit the model's reasoning to the host. Defaults to `false` under
@@ -127,7 +107,6 @@ export class HarnessAgent {
   private unsubscribe: () => void;
   private abortController?: AbortController;
   private running?: Promise<void>;
-  private mode: "chain" | Phase;
   private transcriptMode: TranscriptMode;
   private emitReasoning?: boolean;
   private emitText?: boolean;
@@ -148,21 +127,19 @@ export class HarnessAgent {
       streamMessage: null,
       lastThreadSnapshot: this.harness.threadSnapshot,
     };
-    this.mode = opts.mode ?? "chain";
     this.transcriptMode = opts.transcriptMode ?? "full";
     this.emitReasoning = opts.emitReasoning;
     this.emitText = opts.emitText;
     this.maxStepsPerStep = opts.maxStepsPerStep;
     this.isBugFix = opts.isBugFix;
     if (opts.model) this.harness.orchestrator.setModel("orchestrator", opts.model);
-    // Propagate the (effective) thinking level into the orchestrator so every
-    // phase model is actually *asked* to reason (each model still gates on its
-    // own `reasoning` capability). Without this the model never produces
-    // thinking tokens, so there is nothing for the permission `reasoning` flag
-    // to emit. Uses the resolved level (defaults to "medium") so a host that
-    // omits `thinkingLevel` still gets reasoning; "off" disables it.
-    for (const phase of ["prepare", "plan", "perform", "perfect"] as Phase[]) {
-      this.harness.orchestrator.setReasoning(phase, this._state.thinkingLevel);
+    // Propagate the (effective) thinking level into the orchestrator so the
+    // categorizer drivers are actually *asked* to reason (each model still gates
+    // on its own `reasoning` capability). Uses the resolved level (defaults to
+    // "medium") so a host that omits `thinkingLevel` still gets reasoning; "off"
+    // disables it.
+    for (const slot of ["prepare", "perform", "perfect", "orchestrator"]) {
+      this.harness.orchestrator.setReasoning(this._state.thinkingLevel, slot);
     }
 
     // Forward orchestrator events to our subscribers and fold into state.
@@ -182,20 +159,21 @@ export class HarnessAgent {
     this._state.systemPrompt = v;
   }
 
-  /** Set the orchestrator (default) model. Per-phase models via setPhaseModel. */
+  /** Set the orchestrator (default) model. Per-categorizer models via setCategorizerModel. */
   setModel(slug: string): void {
     this._state.model = slug;
     this.harness.orchestrator.setModel("orchestrator", slug);
   }
 
-  setPhaseModel(phase: Phase, slug: string | undefined): void {
-    this.harness.orchestrator.setModel(phase, slug);
+  /** Pin the driver model of ONE categorizer (its own orchestrator, in v2 terms). */
+  setCategorizerModel(categorizerId: string, slug: string | undefined): void {
+    if (slug) this.harness.orchestrator.setModel(categorizerId, slug);
   }
 
   setThinkingLevel(l: ThinkingLevel): void {
     this._state.thinkingLevel = l;
-    for (const phase of ["prepare", "plan", "perform", "perfect"] as Phase[]) {
-      this.harness.orchestrator.setReasoning(phase, l);
+    for (const slot of ["prepare", "perform", "perfect", "orchestrator"]) {
+      this.harness.orchestrator.setReasoning(l, slot);
     }
   }
 
@@ -212,10 +190,7 @@ export class HarnessAgent {
     this._state.messages = [];
     this._state.error = undefined;
     this._state.lastVerified = undefined;
-    this._state.lastVerification = undefined;
-    this._state.lastReproduction = undefined;
     this._state.pendingUserQuestion = undefined;
-    this._state.lastPhaseResults = undefined;
     this._state.lastRunSummary = undefined;
     this._state.lastSteps = undefined;
     this._state.lastPlanSet = undefined;
@@ -231,17 +206,12 @@ export class HarnessAgent {
 
   /**
    * Prompt the agent. Appends the user message (with attachments carried by
-   * reference), runs the flat loop driver (or a single legacy phase, when
-   * `mode` is set to a specific phase), and resolves when done.
-   */
-  /**
-   * Run one turn.
+   * reference), runs the categorizer chain, and resolves when done.
    *
-   * `opts.planMode` turns the orchestrator's PLANNING TURN back on for this
-   * prompt: the model first emits a plan (or calls `create_plan`, which routes
-   * through the host's `planApproval`), and each approved step then runs in its
-   * own focused sub-loop. Off by default — see the `skipPlan` note below for
-   * why a flat loop is the better default for a single ask.
+   * `opts.planMode` controls the PLAN CARD: `create_plan` always runs inside
+   * write_edit, but the user only reviews it (host `planApproval` callback)
+   * when planMode is true. Off by default for chat-paced single asks; a host
+   * that wants plan review on every prompt passes true.
    */
   async prompt(
     input: string,
@@ -252,12 +222,9 @@ export class HarnessAgent {
     this._state.isStreaming = true;
     this._state.error = undefined;
     this._state.pendingUserQuestion = undefined;
-    this._state.lastPhaseResults = undefined;
     this._state.lastRunSummary = undefined;
     this._state.lastSteps = undefined;
     this._state.lastVerified = undefined;
-    this._state.lastVerification = undefined;
-    this._state.lastReproduction = undefined;
     this.emit({ type: "agent_start" });
 
     const content = await buildUserContent(input, attachments, false);
@@ -269,70 +236,38 @@ export class HarnessAgent {
     };
     this._state.messages.push(userMessage);
 
-    const refs = refsFromAttachments(attachments);
-    // The host installs the askUserQuestion callback on the session/harness
-    // itself (mirroring setPermissionCallback); the harness propagates it
-    // through to the loop. The agent does not need to forward it here.
     const run = (async () => {
       try {
-        if (this.mode === "chain") {
-          // Primary path: the flat loop driver. Image attachments are forwarded
-          // so a write/edit can author files from them via a vision model.
-          const scopedResult: RunLoopResult = await this.harness.run(input, {
-            signal: this.abortController!.signal,
-            transcriptMode: this.transcriptMode,
-            ...(this.emitReasoning !== undefined ? { emitReasoning: this.emitReasoning } : {}),
-            ...(this.emitText !== undefined ? { emitText: this.emitText } : {}),
-            // Default: skip the planning turn, so the model doesn't split a
-            // single ask (e.g. "find a price on this site") into plan tasks that
-            // each restart the browser from scratch. In a flat tool loop the
-            // model can still work across many turns — it just won't emit a
-            // synthetic plan that creates separate sub-runs.
-            //
-            // `planMode` opts back in, for a request big enough that the user
-            // WANTS to see and approve the decomposition before work starts.
-            skipPlan: !opts.planMode,
-            // With `skipPlan`, this single budget covers the whole task — the
-            // `create_plan` turn plus every step of the resulting plan.
-            ...(this.maxStepsPerStep ? { maxStepsPerStep: this.maxStepsPerStep } : {}),
-            ...(this.isBugFix ? { isBugFix: true } : {}),
-            ...(imageRefsFromAttachments(attachments).length
-              ? { images: imageRefsFromAttachments(attachments) }
-              : {}),
-            ...(fileRefsFromAttachments(attachments).length
-              ? { files: fileRefsFromAttachments(attachments) }
-              : {}),
-          });
-          this._state.pendingUserQuestion = scopedResult.pendingUserQuestion;
-          this._state.lastRunSummary = scopedResult.summary;
-          this._state.lastSteps = scopedResult.steps;
-          this._state.lastPlanSet = scopedResult.planSet;
-          this._state.lastThreadSnapshot = scopedResult.threadSnapshot;
-          // Surface verification state from the flat-loop verify gate. `verified`
-          // is undefined when the gate didn't run (no writes / conversational).
-          if (typeof scopedResult.verified === "boolean") {
-            this._state.lastVerified = scopedResult.verified;
-          }
-          if (scopedResult.verification) {
-            this._state.lastVerification = scopedResult.verification;
-          }
-          if (scopedResult.reproduction) {
-            this._state.lastReproduction = scopedResult.reproduction;
-          }
-          // Surface a hard failure (LLM/transport/tool error) so consumers see it
-          // instead of an empty, successful-looking turn. A user abort is not one.
-          if (scopedResult.error) this._state.error = scopedResult.error;
-        } else {
-          const r = await this.harness.runPhase(this.mode, input, {
-            priorRefs: refs,
-            signal: this.abortController!.signal,
-            transcriptMode: this.transcriptMode,
-          });
-          this._state.lastVerified = r.verified;
-          this._state.lastPhaseResults = { [this.mode]: r };
-          if (r.error && r.error !== "aborted") this._state.error = r.error;
-          this._state.lastThreadSnapshot = this.harness.threadSnapshot;
+        const result: RunLoopResult = await this.harness.run(input, {
+          signal: this.abortController!.signal,
+          transcriptMode: this.transcriptMode,
+          ...(this.emitReasoning !== undefined ? { emitReasoning: this.emitReasoning } : {}),
+          ...(this.emitText !== undefined ? { emitText: this.emitText } : {}),
+          // The plan CARD shows only in plan mode; the plan itself always runs
+          // inside write_edit.
+          planMode: opts.planMode === true,
+          ...(this.maxStepsPerStep ? { maxStepsPerStep: this.maxStepsPerStep } : {}),
+          ...(this.isBugFix ? { isBugFix: true } : {}),
+          ...(imageRefsFromAttachments(attachments).length
+            ? { images: imageRefsFromAttachments(attachments) }
+            : {}),
+          ...(fileRefsFromAttachments(attachments).length
+            ? { files: fileRefsFromAttachments(attachments) }
+            : {}),
+        });
+        this._state.pendingUserQuestion = result.pendingUserQuestion;
+        this._state.lastRunSummary = result.summary;
+        this._state.lastSteps = result.steps;
+        this._state.lastPlanSet = result.planSet;
+        this._state.lastThreadSnapshot = result.threadSnapshot;
+        // `verified` is undefined when no inspection ran (no writes /
+        // conversational route).
+        if (typeof result.verified === "boolean") {
+          this._state.lastVerified = result.verified;
         }
+        // Surface a hard failure (LLM/transport/tool error) so consumers see it
+        // instead of an empty, successful-looking turn. A user abort is not one.
+        if (result.error) this._state.error = result.error;
       } catch (err) {
         this._state.error = err instanceof Error ? err.message : String(err);
       } finally {

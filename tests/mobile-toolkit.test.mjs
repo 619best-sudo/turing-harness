@@ -50,8 +50,9 @@ test("the toolkit registers as a built-in provider, not a spawned MCP", () => {
   const provider = registry.list().find((p) => p.id === "builtin:mobile");
   assert.ok(provider, "builtin:mobile must exist — the mobile preset names it by id");
   assert.equal(provider.source, "internal");
-  // Perform AND Perfect: you cannot tap in a phase that cannot screenshot the result.
-  assert.deepEqual([...provider.phases].sort(), ["perfect", "perform"]);
+  // write_edit AND activity_inspect: you cannot tap in a categorizer that
+  // cannot screenshot the result.
+  assert.deepEqual([...provider.categorizers].sort(), ["activity_inspect", "write_edit"]);
   // ONE tool, not fifteen. Target resolution is deterministic code, so a single
   // call replaces a sequence rather than hiding an agent loop.
   assert.deepEqual(provider.tools.map((t) => t.name), ["mobile"]);

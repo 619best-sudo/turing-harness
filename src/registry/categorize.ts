@@ -1,20 +1,21 @@
 /**
- * 4P categorization heuristics (req #3).
+ * Categorizer scoping heuristics.
  *
- * Maps a tool to the phase(s) it naturally serves when the tool author didn't
- * declare `phases` explicitly. The model is:
- *   - Prepare : understand the request, project, folders, files (read-only, discovery)
- *   - Plan    : read files + light bash to form a plan
- *   - Perform : execution — reads AND mutations
- *   - Perfect : verification — browsers, screenshots, db checks, audits, tests
+ * Maps a tool to the categorizer id(s) it naturally serves when the tool author
+ * didn't declare `categorizers` explicitly. The model (v2 defaults):
+ *   - conversation     : (globals cover it — web/bash are setup-level)
+ *   - read             : read-only discovery (ls/grep/memory/readonly shell)
+ *   - write_edit       : execution — reads AND mutations
+ *   - activity_inspect : verification — browsers, screenshots, logs, traces, tests
  *
- * These are only defaults; a tool's explicit `phases` always wins, and the
- * orchestrator can be configured with a fixed per-phase toolset regardless.
+ * These are only defaults; a tool's explicit `categorizers` always wins, and a
+ * setup names its tools explicitly anyway (this drives fallback scoping and
+ * hosts that re-scope at runtime).
  */
-import type { AgentTool, Phase } from "../types.js";
+import type { AgentTool } from "../types.js";
 
-/** name/description substrings → phase affinity. */
-const PERFECT_HINTS = [
+/** name/description substrings → inspect affinity. */
+const INSPECT_HINTS = [
   "playwright",
   "puppeteer",
   "browser",
@@ -37,17 +38,21 @@ const PERFECT_HINTS = [
   "simulator",
   "device",
   "e2e",
-  // Backend verification: Perfect probes running endpoints (via bash/curl or an
-  // HTTP tool) to confirm behaviour — the user's "call api using bash" path.
+  "activity",
+  "trace",
+  "log",
+  "monitor",
+  "probe",
+  // Backend verification: inspect probes running endpoints (via bash/curl or an
+  // HTTP tool) to confirm behaviour.
   "api",
   "endpoint",
   "curl",
   "http",
 ];
 
-const PREPARE_HINTS = [
-  "bash",
-  "shell",
+const READ_HINTS = [
+  "bash_readonly",
   "ls",
   "list",
   "find",
@@ -58,11 +63,11 @@ const PREPARE_HINTS = [
   "stat",
   "which",
   "explore",
+  "read",
+  "memory",
 ];
 
-const PLAN_HINTS = ["read", "cat", "open", "fetch", "web", "docs", "outline", "diagram"];
-
-const PERFORM_MUTATION_HINTS = [
+const WRITE_MUTATION_HINTS = [
   "write",
   "edit",
   "create",
@@ -71,14 +76,13 @@ const PERFORM_MUTATION_HINTS = [
   "apply",
   "patch",
   "install",
-  "run",
-  "exec",
   "generate",
   "commit",
   "deploy",
   "mkdir",
   "mv",
   "cp",
+  "assets",
 ];
 
 function haystack(tool: AgentTool): string {
@@ -89,45 +93,37 @@ function anyHit(hay: string, needles: string[]): boolean {
   return needles.some((n) => hay.includes(n));
 }
 
-/** Categorize a single tool into one or more phases. */
-export function categorizeTool(tool: AgentTool): Phase[] {
-  if (tool.phases?.length) return tool.phases;
+/** Scope a single tool into one or more default categorizer ids. */
+export function categorizeTool(tool: AgentTool): string[] {
+  if (tool.categorizers?.length) return tool.categorizers;
 
   const hay = haystack(tool);
-  const phases = new Set<Phase>();
+  const ids = new Set<string>();
 
-  if (anyHit(hay, PERFECT_HINTS)) phases.add("perfect");
+  if (anyHit(hay, INSPECT_HINTS)) ids.add("activity_inspect");
 
-  // Mutations are the hallmark of Perform.
-  if (tool.mutates || anyHit(hay, PERFORM_MUTATION_HINTS)) phases.add("perform");
+  // Mutations are the hallmark of write_edit.
+  if (tool.mutates || anyHit(hay, WRITE_MUTATION_HINTS)) ids.add("write_edit");
 
-  // Read-only discovery serves Prepare and Plan.
-  if (anyHit(hay, PREPARE_HINTS)) {
-    phases.add("prepare");
-    phases.add("plan");
-  }
-  if (anyHit(hay, PLAN_HINTS)) {
-    phases.add("plan");
-    // A pure reader is also useful during Perform.
-    if (!tool.mutates) phases.add("perform");
+  // Read-only discovery serves read (and write_edit — a work pass reads too).
+  if (!tool.mutates && anyHit(hay, READ_HINTS)) {
+    ids.add("read");
+    if (!ids.has("write_edit")) ids.add("write_edit");
   }
 
-  // Fallback: a non-mutating tool with no hints is generically useful for
-  // understanding/planning; a mutating one belongs to Perform.
-  if (phases.size === 0) {
-    if (tool.mutates) phases.add("perform");
-    else {
-      phases.add("prepare");
-      phases.add("plan");
-    }
+  // Fallback: a mutating tool with no hints belongs to write_edit; a
+  // non-mutating one is generically useful wherever reading happens.
+  if (ids.size === 0) {
+    if (tool.mutates) ids.add("write_edit");
+    else ids.add("read");
   }
 
-  return [...phases];
+  return [...ids];
 }
 
-/** Categorize a provider as the union of its tools' phases. */
-export function categorizeProvider(tools: AgentTool[]): Phase[] {
-  const set = new Set<Phase>();
-  for (const t of tools) for (const p of categorizeTool(t)) set.add(p);
-  return set.size ? [...set] : ["perform"];
+/** Scope a provider as the union of its tools' categorizers. */
+export function categorizeProvider(tools: AgentTool[]): string[] {
+  const set = new Set<string>();
+  for (const t of tools) for (const id of categorizeTool(t)) set.add(id);
+  return set.size ? [...set] : ["write_edit"];
 }

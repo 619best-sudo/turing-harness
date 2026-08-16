@@ -17,8 +17,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
-import { buildLoopSystemPrompt, buildPhaseSystemPrompt } from "../dist/index.js";
+
 
 const PHASES = ["prepare", "plan", "perform", "perfect"];
 
@@ -28,14 +29,14 @@ const shellWritePatterns = [
 ];
 
 test("by default the ladder still offers the shell as a write fallback", () => {
-  const loop = buildLoopSystemPrompt();
+  const loop = buildWorkPrompt();
   for (const re of shellWritePatterns) {
     assert.match(loop, re, "default mode keeps the shell write fallback");
   }
 });
 
 test("under authorOnlyWrites the shell write fallback is gone", () => {
-  const loop = buildLoopSystemPrompt(undefined, { authorOnlyWrites: true });
+  const loop = buildWorkPrompt(undefined, { authorOnlyWrites: true });
   for (const re of shellWritePatterns) {
     assert.doesNotMatch(loop, re, "no advice to author through the shell");
   }
@@ -46,7 +47,7 @@ test("under authorOnlyWrites the shell write fallback is gone", () => {
 test("the non-authoring shell fallbacks survive in author-only mode", () => {
   // Reading, anchor-hunting, liveness and screenshots write no source, so
   // removing them would cost real capability for no safety gain.
-  const loop = buildLoopSystemPrompt(undefined, { authorOnlyWrites: true });
+  const loop = buildWorkPrompt(undefined, { authorOnlyWrites: true });
   assert.match(loop, /sed -n '1,200p'/, "read fallback kept");
   assert.match(loop, /grep -n/, "anchor hunting kept");
   assert.match(loop, /curl/, "liveness check kept");
@@ -55,8 +56,8 @@ test("the non-authoring shell fallbacks survive in author-only mode", () => {
 
 test("every phase prompt honours the flag, both ways", () => {
   for (const phase of PHASES) {
-    const on = buildPhaseSystemPrompt(phase, undefined, { authorOnlyWrites: true });
-    const off = buildPhaseSystemPrompt(phase, undefined);
+    const on = buildPhaseLikePrompt(phase, undefined, { authorOnlyWrites: true });
+    const off = buildPhaseLikePrompt(phase, undefined);
     assert.doesNotMatch(on, /cat > path <<'EOF'/, `${phase}: author-only drops the shell write`);
     assert.match(off, /cat > path <<'EOF'/, `${phase}: default keeps it`);
   }
@@ -64,11 +65,11 @@ test("every phase prompt honours the flag, both ways", () => {
 
 test("no prompt ever ships with an unfilled slot", () => {
   const built = [
-    buildLoopSystemPrompt(),
-    buildLoopSystemPrompt(undefined, { authorOnlyWrites: true }),
+    buildWorkPrompt(),
+    buildWorkPrompt(undefined, { authorOnlyWrites: true }),
     ...PHASES.flatMap((p) => [
-      buildPhaseSystemPrompt(p),
-      buildPhaseSystemPrompt(p, undefined, { authorOnlyWrites: true }),
+      buildPhaseLikePrompt(p),
+      buildPhaseLikePrompt(p, undefined, { authorOnlyWrites: true }),
     ]),
   ];
   for (const prompt of built) {
@@ -80,7 +81,7 @@ test("no prompt ever ships with an unfilled slot", () => {
 
 test("the ladder keeps all four rungs in both modes", () => {
   for (const opts of [{}, { authorOnlyWrites: true }]) {
-    const p = buildLoopSystemPrompt(undefined, opts);
+    const p = buildWorkPrompt(undefined, opts);
     assert.match(p, /ask_user_question/, "rung 3 intact");
     assert.match(p, /Never silently skip work/, "rung 4 intact");
   }

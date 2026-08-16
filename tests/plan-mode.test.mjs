@@ -1,11 +1,9 @@
 /**
- * `HarnessAgent.prompt(..., { planMode })`.
+ * `HarnessAgent.prompt(..., { planMode })` in v2.
  *
- * The agent deliberately runs the flat loop with `skipPlan: true`: a single ask
- * ("find a price on this site") should not be split into plan tasks that each
- * restart from scratch. But a host with a plan-mode affordance in its UI needs
- * to opt back in per prompt, and before this there was no way to — the flag was
- * hardcoded, so the toggle had nothing to talk to.
+ * `create_plan` ALWAYS runs inside write_edit; planMode only controls whether
+ * the user reviews the plan (the CARD, via the host's planApproval callback).
+ * These tests pin what `prompt()` passes to `run`.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -22,45 +20,35 @@ function recordingHost() {
       calls.push({ task, opts });
       return { summary: "done", steps: [], messages: [], usage: {}, refs: [] };
     },
-    async runChain() {
-      throw new Error("not used");
-    },
-    async runPhase() {
-      throw new Error("not used");
-    },
     orchestrator: { setModel() {}, setReasoning() {} },
   };
 }
 
-test("a plain prompt still skips the planning turn", async () => {
+test("a plain prompt runs without the plan card", async () => {
   const host = recordingHost();
   await new HarnessAgent(host).prompt("add a health endpoint");
-  assert.equal(host.calls[0].opts.skipPlan, true, "the flat loop stays the default");
+  assert.equal(host.calls[0].opts.planMode, false, "no card unless planMode is set");
 });
 
-test("planMode runs the planning turn", async () => {
+test("planMode turns the plan review card on", async () => {
   const host = recordingHost();
   await new HarnessAgent(host).prompt("build me a landing page", undefined, { planMode: true });
-  // `skipPlan: false` is what makes the orchestrator plan first and then run one
-  // sub-loop per step — which is what surfaces the plan for approval.
-  assert.equal(host.calls[0].opts.skipPlan, false);
+  assert.equal(host.calls[0].opts.planMode, true);
 });
 
 test("planMode: false is explicit, not just absent", async () => {
   const host = recordingHost();
   await new HarnessAgent(host).prompt("t", undefined, { planMode: false });
-  assert.equal(host.calls[0].opts.skipPlan, true);
+  assert.equal(host.calls[0].opts.planMode, false);
 });
 
 test("plan mode is per-prompt, not sticky", async () => {
-  // A host toggle can be flipped between sends; one planned run must not turn
-  // every later run into a planned one.
   const host = recordingHost();
   const agent = new HarnessAgent(host);
   await agent.prompt("one", undefined, { planMode: true });
   await agent.prompt("two");
   assert.deepEqual(
-    host.calls.map((c) => c.opts.skipPlan),
-    [false, true],
+    host.calls.map((c) => c.opts.planMode),
+    [true, false],
   );
 });

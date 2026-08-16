@@ -5,6 +5,7 @@
  *
  * Run:  node examples/multi-session.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import assert from "node:assert";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -64,7 +65,7 @@ async function main() {
   assert.equal(harness.listSessions().length, 2, "two sessions registered");
 
   // --- run both chains in parallel ---
-  const [ra, rb] = await Promise.all([a.runChain("build A"), b.runChain("build B")]);
+  const [ra, rb] = await Promise.all([a.run("build A"), b.run("build B")]);
 
   console.log("A success:", ra.success, "| B success:", rb.success);
   assert(ra.success && rb.success, "both chains verified");
@@ -99,13 +100,13 @@ async function main() {
   // 6) Close one session; the other keeps working.
   await harness.closeSession("A");
   assert.equal(harness.listSessions().length, 1, "A closed");
-  const rb2 = await b.runChain("build B again");
+  const rb2 = await b.run("build B again");
   assert(rb2.success, "B still runs after A closed");
 
   // 7) Backward-compatible default session still works alongside real sessions.
   const dirDefault = await fs.mkdtemp(path.join(os.tmpdir(), "sess-def-"));
   const def = new Harness({ llm: fakeLLM, cwd: dirDefault, permissionMode: "bypass" });
-  const rd = await def.runChain("build default");
+  const rd = await def.run("build default");
   assert(rd.success, "default-session proxy API still works");
   assert.equal(def.listSessions().length, 1, "default session auto-created");
 

@@ -679,7 +679,7 @@ export const bashTool: AgentTool = {
   mutates: true,
   // Mutating shell is only available once the chain reaches execution /
   // verification phases. Prepare/Plan must stay read-only.
-  phases: ["perform", "perfect"],
+  categorizers: ["write_edit", "activity_inspect"],
   parameters: {
     type: "object",
     properties: {
@@ -752,7 +752,7 @@ export const bashReadonlyTool: AgentTool = {
   description:
     "Run a read-only shell inspection command in Prepare/Plan. Blocks file writes, package install/start commands, and background processes.",
   mutates: false,
-  phases: ["prepare", "plan"],
+  categorizers: ["read"],
   parameters: {
     type: "object",
     properties: {
@@ -1456,7 +1456,7 @@ export const readTool: AgentTool = {
   name: "read",
   description: "Read a UTF-8 text file. Supports optional line offset/limit for large files.",
   mutates: false,
-  phases: ["prepare", "plan", "perform", "perfect"],
+  categorizers: ["read", "write_edit", "activity_inspect"],
   parameters: {
     type: "object",
     properties: { ...READ_PROPERTIES },
@@ -2274,7 +2274,7 @@ export function createWriteTool(authorOnly = false): AgentTool {
       ? "Create or overwrite a file. An authoring model writes the file contents from the task — do NOT pass content; supply the path and self-assessment only."
       : "Create or overwrite a file with the given contents.",
     mutates: true,
-    phases: ["perform"],
+    categorizers: ["write_edit"],
     parameters: writeParameters(authorOnly),
     async execute(_id, args, ctx) {
       return executeWrite(args, ctx, authorOnly);
@@ -2629,7 +2629,7 @@ export function createEditTool(authorOnly = false): AgentTool {
       ? "Replace an exact string in a file. An authoring model writes the replacement — supply path and oldString (the anchor), NOT newString. To add logging, use `add_log` instead: it writes your lines verbatim and is not a code change."
       : "Replace an exact string in a file with a new string. `oldString` must appear exactly once unless `replaceAll` is set.",
     mutates: true,
-    phases: ["perform"],
+    categorizers: ["write_edit"],
     parameters: editParameters(authorOnly),
     async execute(_id, args, ctx) {
       return executeEdit(args, ctx, authorOnly);
@@ -2644,7 +2644,7 @@ export const lsTool: AgentTool = {
   name: "ls",
   description: "List directory entries (non-recursive) to understand project structure.",
   mutates: false,
-  phases: ["prepare", "plan"],
+  categorizers: ["read"],
   parameters: {
     type: "object",
     properties: { path: { type: "string", description: "Directory (default: cwd)." } },
@@ -2690,7 +2690,7 @@ export const grepTool: AgentTool = {
     "Search files for an EXTENDED regex pattern (alternation `a|b`, groups `(a|b)`, `+`, `?` all work; " +
     "uses ripgrep when available, else `grep -rE`). Skips dependency, build and generated-index directories.",
   mutates: false,
-  phases: ["prepare", "plan"],
+  categorizers: ["read"],
   parameters: {
     type: "object",
     properties: {
@@ -2801,7 +2801,7 @@ export const markConcernLinesTool: AgentTool = {
   description:
     "Flag the specific lines of a file you just read that matter for the task (the lines a change targets, or the evidence for a finding). Call it right after `read` when specific lines stand out; skip it when the whole file is relevant or nothing does. Lines may be a range like \"42-44\" or a list like \"42,43,44\".",
   mutates: false,
-  phases: ["prepare", "plan", "perform", "perfect"],
+  categorizers: ["read", "write_edit", "activity_inspect"],
   parameters: {
     type: "object",
     properties: {

@@ -5,6 +5,7 @@
  *
  * Run:  OPENROUTER_API_KEY=... node examples/live-frontend-e2e.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import http from "node:http";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -182,7 +183,7 @@ async function main() {
     `  - the email and GitHub links\n` +
     `  - the "Show only Web" filter button\n` +
     `End with "VERDICT: PASS" only if all are present.`;
-  const r1 = await session.runChain(buildTask);
+  const r1 = await session.run(buildTask);
   unsub();
 
   console.log("\nfiles after build:", (await fs.readdir(OUT)).filter((f) => !f.startsWith(".")).join(", "));
@@ -212,7 +213,7 @@ async function main() {
     `  - the modal element with id "modal" exists in the DOM (it may be hidden)\n` +
     `  - the "Contact" section heading is still present\n` +
     `End with "VERDICT: PASS" only if all are present.`;
-  const r2 = await session.runChain(editTask);
+  const r2 = await session.run(editTask);
   unsub2();
 
   // ---- report ----

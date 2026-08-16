@@ -18,8 +18,8 @@ import {
   createAssetsGeneratorTool,
   createOpenRouterImageBackend,
   ASSETS_AND_SVG,
-  LOOP_SYSTEM_PROMPT,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 const PNG_B64 = Buffer.from("fake-png-bytes").toString("base64");
 
@@ -323,7 +323,7 @@ test("the prompts tell the model which side of the line a request falls on", () 
   // Practical shipping rules that keep a generated asset from wrecking the page.
   assert.match(ASSETS_AND_SVG, /aspect-ratio so the page does/);
   assert.match(ASSETS_AND_SVG, /A PLACEHOLDER IS NOT AN ASSET/);
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(ASSETS_AND_SVG), "the loop carries it verbatim");
+  assert.ok(WORK_PROMPT.includes(ASSETS_AND_SVG), "the loop carries it verbatim");
 });
 
 /**

@@ -220,6 +220,9 @@ test("an image the user attaches mid-run reaches the NEXT tool call's context", 
       name: "context_probe",
       description: "Records the tool context it was handed.",
       mutates: false,
+      // Explicit scope: the heuristic would file a "probe" under
+      // activity_inspect, but this probe must run in the reading hop.
+      categorizers: ["read"],
       parameters: { type: "object", properties: { when: { type: "string" } }, required: [] },
       async execute(_id, args, ctx) {
         probed.push({ when: args.when, images: (ctx.images ?? []).map((i) => i.path) });
@@ -231,8 +234,14 @@ test("an image the user attaches mid-run reaches the NEXT tool call's context", 
   // Turn 1: probe (before). Turn 2: ask for the file. Turn 3: probe (after).
   let turn = 0;
   const llm = new OpenRouterBridge();
-  llm.complete = async (_m, ctx) =>
-    msg([{ type: "text", text: /router at the front/i.test(String(ctx.systemPrompt ?? "")) ? "ROUTE: TASK\nBUGFIX: NO" : "done" }]);
+  let routerCalls = 0;
+  llm.complete = async (_m, ctx) => {
+    if (/CATEGORIZER ROUTER/.test(String(ctx.systemPrompt ?? ""))) {
+      routerCalls += 1;
+      return msg([{ type: "text", text: `CATEGORY: ${routerCalls <= 1 ? "read" : "summarise"}` }]);
+    }
+    return msg([{ type: "text", text: "done" }]);
+  };
   llm.stream = async function* () {
     turn += 1;
     yield { type: "start", partial: msg([]) };
@@ -303,6 +312,9 @@ test("a non-image answer file does NOT become vision input", async () => {
       name: "context_probe",
       description: "Records the tool context it was handed.",
       mutates: false,
+      // Explicit scope: the heuristic would file a "probe" under
+      // activity_inspect, but this probe must run in the reading hop.
+      categorizers: ["read"],
       parameters: { type: "object", properties: {}, required: [] },
       async execute(_id, _args, ctx) {
         probed.push((ctx.images ?? []).map((i) => i.path));
@@ -313,8 +325,14 @@ test("a non-image answer file does NOT become vision input", async () => {
 
   let turn = 0;
   const llm = new OpenRouterBridge();
-  llm.complete = async (_m, ctx) =>
-    msg([{ type: "text", text: /router at the front/i.test(String(ctx.systemPrompt ?? "")) ? "ROUTE: TASK\nBUGFIX: NO" : "done" }]);
+  let routerCalls = 0;
+  llm.complete = async (_m, ctx) => {
+    if (/CATEGORIZER ROUTER/.test(String(ctx.systemPrompt ?? ""))) {
+      routerCalls += 1;
+      return msg([{ type: "text", text: `CATEGORY: ${routerCalls <= 1 ? "read" : "summarise"}` }]);
+    }
+    return msg([{ type: "text", text: "done" }]);
+  };
   llm.stream = async function* () {
     turn += 1;
     yield { type: "start", partial: msg([]) };
@@ -359,8 +377,14 @@ test("a host that still returns a plain string keeps working end to end", async 
 
   let turn = 0;
   const llm = new OpenRouterBridge();
-  llm.complete = async (_m, ctx) =>
-    msg([{ type: "text", text: /router at the front/i.test(String(ctx.systemPrompt ?? "")) ? "ROUTE: TASK\nBUGFIX: NO" : "done" }]);
+  let routerCalls = 0;
+  llm.complete = async (_m, ctx) => {
+    if (/CATEGORIZER ROUTER/.test(String(ctx.systemPrompt ?? ""))) {
+      routerCalls += 1;
+      return msg([{ type: "text", text: `CATEGORY: ${routerCalls <= 1 ? "read" : "summarise"}` }]);
+    }
+    return msg([{ type: "text", text: "done" }]);
+  };
   llm.stream = async function* () {
     turn += 1;
     yield { type: "start", partial: msg([]) };

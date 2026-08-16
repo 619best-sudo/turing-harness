@@ -42,7 +42,28 @@
  * not a deadlock.
  */
 
-import { isMutationTool, shellAuthoringTarget } from "./reproduction-gate.js";
+import { detectShellAuthoring } from "../tools/builtin/coding.js";
+
+/** Whether a tool call is the harness's own file mutation pair. */
+export function isMutationTool(name: string): boolean {
+  return name === "write" || name === "edit";
+}
+
+/**
+ * Whether a tool call authors file CONTENTS through the shell — the bash escape
+ * path around the write/edit gate. Returns the offending path so the message can
+ * name it; `null` for a bash call that is not authoring (build/test/grep/mkdir)
+ * or for any non-bash tool.
+ */
+export function shellAuthoringTarget(
+  name: string,
+  args: Record<string, unknown> | undefined,
+): { path: string; form: string } | null {
+  if (name !== "bash") return null;
+  const command = typeof args?.command === "string" ? args.command : "";
+  if (!command) return null;
+  return detectShellAuthoring(command);
+}
 
 /** A refusal, or permission to proceed. */
 export type ClarifyDecision =

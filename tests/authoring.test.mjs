@@ -5,7 +5,7 @@
  *
  * Run via: npm test (builds first, then `node --test tests/*.test.mjs`).
  *
- * All offline — a stub LLM drives a full Orchestrator.runChain with no network.
+ * All offline — a stub LLM drives a full categorizer chain with no network.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -76,7 +76,24 @@ function makeStub({ mode, target, draft, oldString, bContent, bReplacement }) {
   // The authoring helper uses llm.complete — Model B authors here. Route by the
   // user message (stable across prompt rewrites): an edit carries the anchor
   // ("TEXT TO REPLACE"), a write does not.
+  let routerCalls = 0;
   llm.complete = async (_model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return msg(`CATEGORY: ${routerCalls <= 1 ? "write_edit" : "summarise"}`);
+    }
+    if (/breaking a task into an ordered implementation plan/.test(sys)) {
+      const plan = {
+        plans: [{ id: "p1", title: "The change", summary: "x",
+          tasks: [{ id: "t1", order: 1, title: "update", summary: "x", files: [target], fileMutations: { [target]: mode }, complexity: "high" }] }],
+        executionOrder: ["p1"],
+      };
+      return msg(`PLANS_JSON:\n${JSON.stringify(plan)}`);
+    }
+    if (/closing summary/.test(sys)) {
+      return msg("Chain summary.");
+    }
     const userMsg = ctx.messages?.[0];
     const userText = typeof userMsg?.content === "string"
       ? userMsg.content
@@ -92,11 +109,6 @@ function makeStub({ mode, target, draft, oldString, bContent, bReplacement }) {
   };
 
   llm.stream = async function* (_model, ctx) {
-    const sys = ctx.systemPrompt ?? "";
-    const isPrepare = /PREPARE phase/.test(sys);
-    const isPlan = /PLAN phase/.test(sys);
-    const isPerform = /PERFORM phase/.test(sys);
-    const isPerfect = /PERFECT phase/.test(sys);
     yield {
       type: "start",
       partial: {
@@ -104,97 +116,26 @@ function makeStub({ mode, target, draft, oldString, bContent, bReplacement }) {
         usage: zeroUsage(), stopReason: "stop", timestamp: 0,
       },
     };
-
-    if (isPrepare) {
-      yield {
-        type: "done",
-        message: msg([
-          "CATEGORY: backend",
-          "PROJECT: Node library -> no runtime needed",
-          "RUN: none", "STOP: none", "VERIFY: tests",
-          "CAPABILITIES: none",
-          "PROVIDER ASSIGNMENTS: PLAN => none, PERFORM => none, PERFECT => none",
-          "FILE SEARCH:",
-          `${target} | complexity=high | why=target file | blast=files=${target}`,
-          "TOOL TRANSCRIPT:",
-          `read | target=${target} | summary=Read the target`,
-          "UI SUMMARY: Found the target file.",
-          "TOOL CHAIN:",
-          `read | target=${target} | reasoning=core | complexity=high`,
-          "MEMORY UPDATES: none", "FILE MEMORY UPDATES: none",
-          "SUMMARY: prepared a one-file change",
-        ].join("\n")),
-      };
+    // The v2 chain runs ONE write_edit categorizer loop. Turn 0 plans, turn 1
+    // mutates, turn 2 delivers.
+    performTurn += 1;
+    if (performTurn === 1) {
+      yield { type: "done", message: toolMsg([{ type: "toolCall", id: "c-plan", name: "create_plan", arguments: { task: "update the service" } }]) };
       return;
     }
-
-    if (isPlan) {
-      const plan = {
-        plans: [
-          {
-            id: "p1", title: "The change", summary: "update the file",
-            tasks: [{
-              id: "t1", order: 1, title: "update", summary: "change the file",
-              files: [target], fileMutations: { [target]: mode }, complexity: "high",
-            }],
-          },
-        ],
-        executionOrder: ["p1"],
-      };
-      yield {
-        type: "done",
-        message: msg([
-          "CHAT SUMMARY: One plan.",
-          "PLANS_JSON:", JSON.stringify(plan),
-          "PLAN: update the file.",
-          "SUMMARY: A one-file implementation.",
-          "ACCEPTANCE: file updated.",
-          "UI SUMMARY: One file to change.",
-          "TOOL CHAIN:",
-          `read | target=${target} | reasoning=core | complexity=high`,
-          "DEBUG_LOGS: read the file",
-        ].join("\n")),
-      };
+    if (performTurn === 2) {
+      const call = mode === "edit"
+        ? { type: "toolCall", id: "c1", name: "edit", arguments: { path: target, oldString, newString: draft } }
+        : { type: "toolCall", id: "c1", name: "write", arguments: { path: target, content: draft } };
+      yield { type: "done", message: toolMsg([call]) };
       return;
     }
-
-    if (isPerform) {
-      performTurn += 1;
-      if (performTurn === 1) {
-        const call = mode === "edit"
-          ? { type: "toolCall", id: "c1", name: "edit", arguments: { path: target, oldString, newString: draft } }
-          : { type: "toolCall", id: "c1", name: "write", arguments: { path: target, content: draft } };
-        yield { type: "done", message: toolMsg([call]) };
-        return;
-      }
-      yield {
-        type: "done",
-        message: msg([
-          "SUMMARY: Updated the file.",
-          "UI SUMMARY: Updated the file.",
-          "TOOL CHAIN: write | reasoning=applied | complexity=high",
-          "CHANGES: wrote the file",
-        ].join("\n")),
-      };
-      return;
-    }
-
-    if (isPerfect) {
-      yield {
-        type: "done",
-        message: msg([
-          "QA_PLAN:", JSON.stringify({ stack: "node", checks: [] }),
-          "UI SUMMARY: Verified.",
-          "TOOL CHAIN: test | reasoning=ran suite | complexity=low",
-          "SUMMARY: Verified.",
-          "VERDICT: PASS",
-        ].join("\n")),
-      };
+    if (performTurn === 3) {
+      yield { type: "done", message: toolMsg([{ type: "toolCall", id: "c2", name: "deliver", arguments: { writes: [{ tool: mode, path: target }], notes: "done" } }]) };
       return;
     }
     yield { type: "done", message: msg("SUMMARY: done") };
   };
-
   return { llm };
 }
 
@@ -221,10 +162,9 @@ async function runChainWithDecision(decision) {
       return typeof decision === "function" ? decision(req) : decision;
     }),
     logStore: new LogStore(),
-    maxChainIterations: 1,
   });
 
-  const result = await orch.runChain("update the service");
+  const result = await orch.run("update the service");
   const onDisk = await fs.readFile(target, "utf8");
   return { result, onDisk, target, tmp, permissionCalls };
 }
@@ -267,60 +207,49 @@ test("backward-compat: decision.model (no authorModel) writes Model A's bytes an
 
 test("authorModel is ignored for read (no authoring on non-mutating tools)", async () => {
   // A read decision with authorModel must not trigger authoring — read is not
-  // write/edit. We can't easily get Perform to emit a read in this stub, so we
-  // verify the runner never even resolves authorModel for non-mutating tools by
-  // checking that a decision carrying authorModel on a read simply passes through
-  // and the read returns disk bytes unchanged.
+  // write/edit. The v2 route: read categorizer, one read tool call, deliver.
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-auth-read-"));
   const target = path.join(tmp, "data.txt");
   await fs.writeFile(target, "ON-DISK-BYTES");
 
   const llm = new OpenRouterBridge();
-  let performTurn = 0;
   const msg = (content) => ({
     role: "assistant",
     content: Array.isArray(content) ? content : [{ type: "text", text: content }],
     model: MODEL_A, api: "openrouter", provider: "test",
     usage: zeroUsage(), stopReason: "stop", timestamp: 0,
   });
-  // Authoring should never be invoked for a read. We can't assert complete()==0
-  // because llm.complete has legitimate non-authoring callers (intent routing,
-  // verdict elicitation). Instead we spy on tool executions: a read must not
-  // trigger any write/edit, and the file must be unchanged. If authoring HAD
-  // erroneously run, the file would contain this sentinel.
-  llm.complete = async () => msg("SHOULD_NOT_BE_USED");
-  llm.stream = async function* (_model, ctx) {
+  const toolMsg = (content) => ({
+    role: "assistant", content, model: MODEL_A, api: "openrouter", provider: "test",
+    usage: zeroUsage(), stopReason: "tool_use", timestamp: 0,
+  });
+  // Authoring should never be invoked for a read; if it were, the sentinel
+  // would land in an LLM call we assert never carries it.
+  let authoringCalls = 0;
+  let routerCalls = 0;
+  llm.complete = async (_m, ctx) => {
     const sys = ctx.systemPrompt ?? "";
-    yield { type: "start", partial: { role: "assistant", content: [], model: MODEL_A, api: "openrouter", provider: "test", usage: zeroUsage(), stopReason: "stop", timestamp: 0 } };
-    if (/PREPARE phase/.test(sys)) {
-      yield { type: "done", message: msg([
-        "CATEGORY: backend", "PROJECT: node", "RUN: none", "STOP: none", "VERIFY: tests",
-        "CAPABILITIES: none", "PROVIDER ASSIGNMENTS: none",
-        `FILE SEARCH: ${target} | complexity=low | why=data`,
-        "TOOL TRANSCRIPT: none", "UI SUMMARY: found", "TOOL CHAIN: none",
-        "MEMORY UPDATES: none", "FILE MEMORY UPDATES: none", "SUMMARY: prepared",
-      ].join("\n")) };
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return msg(`CATEGORY: ${routerCalls <= 1 ? "read" : "summarise"}`);
+    }
+    if (/closing summary/.test(sys)) return msg("read ok");
+    authoringCalls += 1;
+    return msg("SHOULD_NOT_BE_USED");
+  };
+  let turn = 0;
+  llm.stream = async function* () {
+    yield { type: "start", partial: msg([]) };
+    turn += 1;
+    if (turn === 1) {
+      yield { type: "done", message: toolMsg([{ type: "toolCall", id: "r1", name: "read", arguments: { path: target } }]) };
       return;
     }
-    if (/PLAN phase/.test(sys)) {
-      const plan = { plans: [{ id: "p1", title: "x", summary: "x", tasks: [{ id: "t1", order: 1, title: "x", summary: "x", files: [target], fileMutations: { [target]: "read" }, complexity: "low" }] }], executionOrder: ["p1"] };
-      yield { type: "done", message: msg(["PLANS_JSON:", JSON.stringify(plan), "SUMMARY: x", "UI SUMMARY: x", "ACCEPTANCE: x"]) };
+    if (turn === 2) {
+      yield { type: "done", message: toolMsg([{ type: "toolCall", id: "r2", name: "deliver", arguments: { files: [{ path: target }], codeSummary: "read it" } }]) };
       return;
     }
-    if (/PERFORM phase/.test(sys)) {
-      performTurn += 1;
-      if (performTurn === 1) {
-        yield { type: "done", message: { role: "assistant", content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: target } }], model: MODEL_A, api: "openrouter", provider: "test", usage: zeroUsage(), stopReason: "tool_use", timestamp: 0 } };
-        return;
-      }
-      yield { type: "done", message: msg(["SUMMARY: read it", "UI SUMMARY: read it", "TOOL CHAIN: read | reasoning=core | complexity=low", "CHANGES: read"]) };
-      return;
-    }
-    if (/PERFECT phase/.test(sys)) {
-      yield { type: "done", message: msg(["UI SUMMARY: ok", "SUMMARY: ok", "VERDICT: PASS"]) };
-      return;
-    }
-    yield { type: "done", message: msg("SUMMARY: done") };
+    yield { type: "done", message: msg("done") };
   };
 
   const toolExecs = [];
@@ -328,22 +257,18 @@ test("authorModel is ignored for read (no authoring on non-mutating tools)", asy
     cwd: tmp, llm, registry: newRegistryWithBuiltins(),
     permission: new PermissionGate("ask-all", async () => ({ allowed: true, authorModel: MODEL_B })),
     logStore: new LogStore(),
-    maxChainIterations: 1,
   });
-  orch.subscribe((e) => { if (e.type === "tool_execution_start") toolExecs.push(e.toolName); });
-
-  await orch.runChain("read the data file");
+  orch.subscribe((e) => {
+    if (e.type === "tool_execution_end" && e.toolName === "read") toolExecs.push(e);
+  });
+  const result = await orch.run("read the data file");
   const onDisk = await fs.readFile(target, "utf8");
-  assert.equal(onDisk, "ON-DISK-BYTES", "read must not mutate the file");
-  assert.ok(!toolExecs.some((n) => n === "write" || n === "edit"),
-    "no write/edit must execute on a read-only chain; got: " + JSON.stringify(toolExecs));
-});
 
-// ---------------------------------------------------------------------------
-// The escalation contract, from the client's side: the permission request must
-// carry the complexity the client decides on, and whatever model ends up
-// authoring must be aimed at the places code actually breaks.
-// ---------------------------------------------------------------------------
+  assert.equal(onDisk, "ON-DISK-BYTES", "the read must not mutate the file");
+  assert.ok(toolExecs.length >= 1, "the read call executed");
+  assert.equal(authoringCalls, 0, "no authoring pass may run for a read-only route");
+  assert.equal(result.success, true);
+});
 
 test("the write permission request carries the complexity the client decides on", async () => {
   const { permissionCalls } = await runChainWithDecision({ allowed: true, __mode: "write" });
@@ -379,9 +304,8 @@ test("Model B gets the format contract AND the risk checklist for code write/edi
       cwd: tmp, llm, registry: newRegistryWithBuiltins(),
       permission: new PermissionGate("ask-all", async () => ({ allowed: true, authorModel: MODEL_B })),
       logStore: new LogStore(),
-      maxChainIterations: 1,
     });
-    await orch.runChain("update the service");
+    await orch.run("update the service");
 
     // A `.ts` file is code, so the author gets the correctness checklist on top of
     // the format contract. The "prefer the boring version" closer stays gone — it

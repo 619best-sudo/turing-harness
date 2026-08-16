@@ -50,7 +50,7 @@ import { guessMimeType } from "../../multimodal/attachment.js";
 // per-task rating emitted here becomes the per-file floor when that step runs and
 // decides which model authors the bytes, so a private scale here would mean the
 // producer and the consumer disagree about what "medium" is.
-import { COMPLEXITY_CONTRACT } from "../../phases/prompts.js";
+import { COMPLEXITY_CONTRACT } from "../../categorizer/guidance.js";
 
 /**
  * The default planning prompt. Exported so a host can compose with it
@@ -163,7 +163,7 @@ export function createPlanTool(config: PlanToolConfig = {}): AgentTool<any, Crea
       "Returns the approved plan. Call this ONCE, before doing any implementation work, for any task that " +
       "spans more than one file or more than one step.",
     mutates: false,
-    phases: ["plan"],
+    categorizers: ["write_edit"],
     // Planning is the highest-leverage reasoning in a run; bias model selection up.
     complexityHint: 0.8,
     parameters: {

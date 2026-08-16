@@ -226,7 +226,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
     mutates: false,
     // Every phase: checking how a current API actually behaves belongs in
     // Prepare/Plan, not only once something has broken.
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     complexityHint: 0.3,
     parameters: {
       type: "object",
@@ -336,7 +336,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
       "anything repeatable, write a scraping script instead of calling this in a loop. Requires a browser " +
       "MCP (Playwright).",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     complexityHint: 0.2,
     parameters: {
       type: "object",
@@ -459,7 +459,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
       "content-extraction case (recreating a UI, pulling a table, reading a docs page). Same engine and result " +
       "as `web_fetch`; the two names exist so whichever the model or host uses resolves. Requires a browser MCP (Playwright).",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     complexityHint: 0.2,
     parameters: {
       type: "object",

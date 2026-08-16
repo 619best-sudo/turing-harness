@@ -23,12 +23,11 @@ import {
   FILE_SEARCH_LADDER,
   GUIDELINE_CONTRACT,
   INSPIRATION_REUSE,
-  LOOP_SYSTEM_PROMPT,
   MEDIA_UNDERSTANDING,
-  PHASE_PROMPTS,
   VERIFY_WHAT_YOU_WROTE,
   WEB_AND_SCRAPING,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 const BLOCKS = {
   GUIDELINE_CONTRACT,
@@ -45,12 +44,12 @@ const BLOCKS = {
 
 test("every block reaches the model it was written for", () => {
   for (const [name, text] of Object.entries(BLOCKS)) {
-    assert.ok(LOOP_SYSTEM_PROMPT.includes(text), `${name} is missing from the loop prompt`);
+    assert.ok(WORK_PROMPT.includes(text), `${name} is missing from the loop prompt`);
   }
-  // PERFORM is the 4P phase that reads, writes, generates and verifies, so it
-  // carries the same set. PREPARE/PLAN are read-only and deliberately do not.
+  // write_edit is the v2 categorizer that reads, writes, generates and carries
+  // the work-pass superset; read is read-only and deliberately does not.
   for (const name of ["FILE_SEARCH_LADDER", "CODE_CHANGE_ATTENTION", "MEDIA_UNDERSTANDING", "ASSETS_AND_SVG", "INSPIRATION_REUSE", "WEB_AND_SCRAPING", "GUIDELINE_CONTRACT", "ASKING_THE_USER", "DEBUGGING_LOOP"]) {
-    assert.ok(PHASE_PROMPTS.perform.includes(BLOCKS[name]), `${name} is missing from PERFORM`);
+    assert.ok(CATEGORIZER_PROMPTS.write_edit.includes(BLOCKS[name]), `${name} is missing from write_edit`);
   }
 });
 
@@ -68,11 +67,11 @@ test("the contract comes first: the user outranks every default", () => {
   // And the runtime notes are framed as advice from less context, not orders.
   assert.match(GUIDELINE_CONTRACT, /LESS context/);
 
-  const contractAt = LOOP_SYSTEM_PROMPT.indexOf(GUIDELINE_CONTRACT);
+  const contractAt = WORK_PROMPT.indexOf(GUIDELINE_CONTRACT);
   for (const [name, text] of Object.entries(BLOCKS)) {
     if (name === "GUIDELINE_CONTRACT") continue;
     assert.ok(
-      contractAt < LOOP_SYSTEM_PROMPT.indexOf(text),
+      contractAt < WORK_PROMPT.indexOf(text),
       `${name} appears before the contract that frames it`,
     );
   }
@@ -102,7 +101,7 @@ test("each block hands off to its neighbours instead of restating them", () => {
   // Escalating a blocker: the failure ladder owns the WHEN (after ~2 failures),
   // the asking block owns the HOW. Neither re-teaches the other.
   assert.match(ASKING_THE_USER, /that is the escalation rung of the tool-/);
-  assert.match(LOOP_SYSTEM_PROMPT, /call\n?\s*`ask_user_question` with a specific, answerable question/);
+  assert.match(WORK_PROMPT, /call\n?\s*`ask_user_question` with a specific, answerable question/);
 
   // Debugging reuses rather than restates: the risk sites say where to instrument,
   // media_analysis says how to look at a UI, asking says who runs the app.
@@ -124,8 +123,8 @@ test("the blocks do not contradict each other on the shell", () => {
   // the jobs it genuinely suits, without wording that reads as "never".
   assert.match(FILE_SEARCH_LADDER, /USE `grep`\/shell DIRECTLY when it is genuinely the better tool/);
   assert.doesNotMatch(FILE_SEARCH_LADDER, /never use (the )?(shell|grep)/i);
-  assert.match(LOOP_SYSTEM_PROMPT, /FALL BACK TO THE SHELL/);
-  assert.doesNotMatch(LOOP_SYSTEM_PROMPT, /never use (the )?(shell|bash)/i);
+  assert.match(WORK_PROMPT, /FALL BACK TO THE SHELL/);
+  assert.doesNotMatch(WORK_PROMPT, /never use (the )?(shell|bash)/i);
 });
 
 test("guidance is phrased as defaults, not as prohibitions with no way out", () => {

@@ -1,7 +1,7 @@
 {
   "name": "turing-harness",
   "version": "0.1.0",
-  "description": "Coding-agent orchestration library: a flat tool loop with per-call model escalation by complexity and category (4P chain kept as a back-compat path).",
+  "description": "Coding-agent orchestration library: a categorizer chain (router \u2192 focused categorizer hops \u2192 summary) with per-categorizer toolsets, prompts and orchestrator models, plus per-call model escalation by complexity and category.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./categorizer-setup": {
+      "import": "./dist/categorizer-setup.js",
+      "types": "./dist/categorizer-setup.d.ts"
     }
   },
   "files": [

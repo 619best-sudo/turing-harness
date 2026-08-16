@@ -13,7 +13,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  LOOP_SYSTEM_PROMPT,
   LogStore,
   Registry,
   createWebTools,
@@ -21,6 +20,7 @@ import {
   findBrowserTool,
   registerBuiltins,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 /**
  * A registry holding fake Playwright MCP tools. `evaluate` is handed the page
@@ -263,10 +263,10 @@ test("extractJsonPayload survives the shapes browser_evaluate returns", () => {
 test("the web tools are registered read-only and available in every phase", () => {
   const reg = new Registry();
   registerBuiltins(reg, { logStore: new LogStore() });
-  for (const phase of ["prepare", "plan", "perform", "perfect"]) {
-    const names = reg.selectPhaseTools(phase, undefined).map((t) => t.name);
-    assert.ok(names.includes("web_search"), `${phase} should expose web_search`);
-    assert.ok(names.includes("web_fetch"), `${phase} should expose web_fetch`);
+  for (const id of ["conversation", "read", "write_edit", "activity_inspect"]) {
+    const names = reg.selectCategorizerTools(id, undefined).map((t) => t.name);
+    assert.ok(names.includes("web_search"), `${id} should expose web_search`);
+    assert.ok(names.includes("web_fetch"), `${id} should expose web_fetch`);
   }
   assert.equal(reg.getTool("web_search").mutates, false);
   assert.equal(reg.getTool("web_fetch").mutates, false);
@@ -275,44 +275,44 @@ test("the web tools are registered read-only and available in every phase", () =
 test("the work loop's system prompt teaches when to go to the internet", () => {
   // A tool the model cannot discover may as well not exist — the same failure the
   // activity tools hit, where the model narrated the intent and then ran bash.
-  assert.ok(LOOP_SYSTEM_PROMPT.includes("web_search"));
-  assert.ok(LOOP_SYSTEM_PROMPT.includes("web_fetch"));
-  assert.match(LOOP_SYSTEM_PROMPT, /a stuck build is usually a version fact/);
-  assert.match(LOOP_SYSTEM_PROMPT, /NOT a cue to try bash\+curl/);
+  assert.ok(WORK_PROMPT.includes("web_search"));
+  assert.ok(WORK_PROMPT.includes("web_fetch"));
+  assert.match(WORK_PROMPT, /a stuck build is usually a version fact/);
+  assert.match(WORK_PROMPT, /NOT a cue to try bash\+curl/);
   // Version first, primary sources over blogs, changelog on a breaking change.
-  assert.match(LOOP_SYSTEM_PROMPT, /lockfile/);
-  assert.match(LOOP_SYSTEM_PROMPT, /CHANGELOG/);
-  assert.match(LOOP_SYSTEM_PROMPT, /the WEB WINS/);
+  assert.match(WORK_PROMPT, /lockfile/);
+  assert.match(WORK_PROMPT, /CHANGELOG/);
+  assert.match(WORK_PROMPT, /the WEB WINS/);
 });
 
 test("the work loop's system prompt treats scraping and automation as the job", () => {
   // Scraping/automation is work the user asks for outright; a prompt that hedges
   // here produces an agent that asks permission for its own task.
-  assert.match(LOOP_SYSTEM_PROMPT, /it is the JOB, so do it/);
-  assert.match(LOOP_SYSTEM_PROMPT, /WRITE A SCRIPT/, "repetitive work becomes a re-runnable script");
-  assert.match(LOOP_SYSTEM_PROMPT, /CHEAPEST LAYER THAT WORKS/, "API before DOM before headless browser");
-  assert.match(LOOP_SYSTEM_PROMPT, /rate-limit with jitter/);
-  assert.match(LOOP_SYSTEM_PROMPT, /fail LOUDLY on zero rows/, "an empty CSV must not read as success");
+  assert.match(WORK_PROMPT, /it is the JOB, so do it/);
+  assert.match(WORK_PROMPT, /WRITE A SCRIPT/, "repetitive work becomes a re-runnable script");
+  assert.match(WORK_PROMPT, /CHEAPEST LAYER THAT WORKS/, "API before DOM before headless browser");
+  assert.match(WORK_PROMPT, /rate-limit with jitter/);
+  assert.match(WORK_PROMPT, /fail LOUDLY on zero rows/, "an empty CSV must not read as success");
   // The boundaries: get the user involved rather than defeating a gate, and never
   // handle their credentials.
-  assert.match(LOOP_SYSTEM_PROMPT, /Do not try to\n?\s*defeat a bot check/);
-  assert.match(LOOP_SYSTEM_PROMPT, /never type someone's credentials yourself/);
+  assert.match(WORK_PROMPT, /Do not try to\n?\s*defeat a bot check/);
+  assert.match(WORK_PROMPT, /never type someone's credentials yourself/);
 });
 
 test("the work loop's system prompt explains capturing a UI to rebuild it", () => {
-  assert.match(LOOP_SYSTEM_PROMPT, /CAPTURING A UI TO RECREATE IT/);
+  assert.match(WORK_PROMPT, /CAPTURING A UI TO RECREATE IT/);
   // The analysis half lives in media_analysis; the web block must POINT there
   // rather than teach a second, drifting version of it.
-  assert.match(LOOP_SYSTEM_PROMPT, /the analysis belongs to "media_analysis"/);
-  assert.match(LOOP_SYSTEM_PROMPT, /lens:"ui" turns it into a rebuild/);
+  assert.match(WORK_PROMPT, /the analysis belongs to "media_analysis"/);
+  assert.match(WORK_PROMPT, /lens:"ui" turns it into a rebuild/);
   // What the web tools uniquely contribute: real copy, and exact computed values.
-  assert.match(LOOP_SYSTEM_PROMPT, /the STRUCTURE and the COPY/);
-  assert.match(LOOP_SYSTEM_PROMPT, /computed styles|COMPUTED styles/);
-  assert.match(LOOP_SYSTEM_PROMPT, /trademarked or copyrighted assets/);
+  assert.match(WORK_PROMPT, /the STRUCTURE and the COPY/);
+  assert.match(WORK_PROMPT, /computed styles|COMPUTED styles/);
+  assert.match(WORK_PROMPT, /trademarked or copyrighted assets/);
   // And the rebuild-from-the-system rule is stated exactly once, in the media block.
   assert.equal(
-    LOOP_SYSTEM_PROMPT.split("Extract the SYSTEM, not the markup").length - 1 +
-      LOOP_SYSTEM_PROMPT.split("build from the SYSTEM it reports").length - 1,
+    WORK_PROMPT.split("Extract the SYSTEM, not the markup").length - 1 +
+      WORK_PROMPT.split("build from the SYSTEM it reports").length - 1,
     1,
     "the replication rule is not duplicated across blocks",
   );

@@ -245,11 +245,11 @@ test("backend receives a child ctx whose signal aborts on timeout", async () => 
   assert.equal(observedAborted, true);
 });
 
-test("tool meta: internal source, perform+perfect phases, non-mutating", () => {
+test("tool meta: internal source, write_edit+activity_inspect phases, non-mutating", () => {
   const tool = createInspirationGeneratorTool({ backend: async () => null });
   assert.equal(tool.name, "inspiration_generator");
   assert.equal(tool.mutates, false);
-  assert.deepEqual(tool.phases, ["perform", "perfect"]);
+  assert.deepEqual([...tool.categorizers].sort(), ["activity_inspect", "write_edit"]);
   assert.ok(tool.parameters.required.includes("keywords"));
   // kind enum is web-ui|mobile-ui|poster (no "parallax", no old "ui"/"poster"-only)
   const kindEnum = tool.parameters.properties.kind.enum;

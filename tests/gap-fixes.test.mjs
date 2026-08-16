@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  INTENT_ROUTER_PROMPT,
+  DEFAULT_ROUTER_PROMPT,
   OpenRouterBridge,
   createMediaAnalysisTool,
   createInspirationGeneratorTool,
@@ -72,15 +72,15 @@ function ctxFor(llm, dir, extra = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// G1 — two-line INTENT_ROUTER_PROMPT + BUGFIX line
+// G1 — the v2 router prompt: one CATEGORY line, bug-report guidance
 // ---------------------------------------------------------------------------
 
-test("G1: INTENT_ROUTER_PROMPT asks for a two-line ROUTE/BUGFIX reply", () => {
-  // The contract the parser in classifyIntent depends on.
-  assert.match(INTENT_ROUTER_PROMPT, /ROUTE:\s*TASK\|CONVERSATIONAL/);
-  assert.match(INTENT_ROUTER_PROMPT, /BUGFIX:\s*YES\|NO/);
-  // The bug-fix hint should be conservative (default NO on doubt).
-  assert.match(INTENT_ROUTER_PROMPT, /When in doubt on BUGFIX, answer NO/);
+test("G1: DEFAULT_ROUTER_PROMPT asks for a single CATEGORY reply", () => {
+  // The contract routeCategorizer's parser depends on.
+  assert.match(DEFAULT_ROUTER_PROMPT, /CATEGORY:\s*<categorizer id from the choices, or summarise>/);
+  // Bug reports route read-first, inspection before mutation.
+  assert.match(DEFAULT_ROUTER_PROMPT, /A bug report usually needs read/);
+  assert.match(DEFAULT_ROUTER_PROMPT, /Never repeat the categorizer that just ran/);
 });
 
 test("G1: BUGFIX hint resolution — host true wins; explicit false suppresses; unset consults hint", () => {

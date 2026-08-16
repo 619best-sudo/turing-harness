@@ -14,12 +14,12 @@
  *     tools: [docsFetchTool, ...],
  *   }));
  *
- * `phases` is optional: when omitted the registry infers phases per-tool from the
- * 4P categorizer. Declaring it explicitly is preferred for skills, because a
- * skill's intent (research vs. mutation vs. verification) is usually known to its
- * author and should not be guessed from tool names.
+ * `categorizers` is optional: when omitted the registry infers scope per-tool
+ * from the categorizer heuristics. Declaring it explicitly is preferred for
+ * skills, because a skill's intent (research vs. mutation vs. verification) is
+ * usually known to its author and should not be guessed from tool names.
  */
-import type { AgentTool, Phase } from "../types.js";
+import type { AgentTool } from "../types.js";
 import type { ProviderInput } from "./registry.js";
 
 export interface SkillDefinition {
@@ -27,12 +27,12 @@ export interface SkillDefinition {
   id: string;
   /** Display name. */
   name: string;
-  /** Human/LLM description; used by Prepare to route the skill to phases. */
+  /** Human/LLM description; used by the router/mention resolution to route the skill. */
   description: string;
   /** The tools this skill exposes. */
   tools: AgentTool[];
-  /** Which 4P phase(s) this skill serves. Omit to infer per-tool. */
-  phases?: Phase[];
+  /** Which categorizer id(s) this skill serves. Omit to infer per-tool. */
+  categorizers?: string[];
   /** Whether the skill's tools mutate state (default false — skills are usually
    *  read/assist). Applied to any tool that doesn't declare its own `mutates`. */
   mutates?: boolean;
@@ -46,15 +46,16 @@ export interface SkillDefinition {
 
 /**
  * Build a {@link ProviderInput} for a skill, ready to hand to `registry.add(...)`.
- * When `phases` is declared it is applied both to the provider and to every tool
- * that doesn't already carry its own `phases`, so the skill lands in exactly the
- * phase(s) its author intended rather than the categorizer's guess.
+ * When `categorizers` is declared it is applied both to the provider and to every
+ * tool that doesn't already carry its own `categorizers`, so the skill lands in
+ * exactly the categorizer(s) its author intended rather than the heuristic's
+ * guess.
  */
 export function defineSkill(def: SkillDefinition): ProviderInput {
   const tools: AgentTool[] = def.tools.map((tool) => ({
     ...tool,
     mutates: tool.mutates ?? def.mutates ?? false,
-    ...(def.phases && !tool.phases?.length ? { phases: [...def.phases] } : {}),
+    ...(def.categorizers && !tool.categorizers?.length ? { categorizers: [...def.categorizers] } : {}),
   }));
   return {
     id: def.id,
@@ -63,7 +64,7 @@ export function defineSkill(def: SkillDefinition): ProviderInput {
     name: def.name,
     description: def.description,
     tools,
-    ...(def.phases?.length ? { phases: [...def.phases] } : {}),
+    ...(def.categorizers?.length ? { categorizers: [...def.categorizers] } : {}),
     ...(def.dispose ? { dispose: def.dispose } : {}),
     metadata: { ...(def.metadata ?? {}), skill: true },
   };

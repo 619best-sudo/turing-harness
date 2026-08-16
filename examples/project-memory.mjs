@@ -5,6 +5,7 @@
  *
  * Run:  node examples/project-memory.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import assert from "node:assert";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,7 +21,7 @@ async function mkproject(files) {
   return dir;
 }
 
-// minimal fake model so runChain works offline; also records per-phase model
+// minimal fake model so the chain works offline; also records per-model usage
 function makeFake(rec = []) {
   const msg = (text) => ({ role: "assistant", content: [{ type: "text", text }], api: "openrouter", provider: "openrouter", model: "fake", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 });
   const phaseOf = (sp = "") => (sp.match(/You are the (PREPARE|PLAN|PERFORM|PERFECT) phase/)?.[1] ?? "PERFECT").toLowerCase();
@@ -79,7 +80,7 @@ async function main() {
   assert.equal(memory.category, "mobile", "auto-detected mobile");
   assert(session.memory === memory, "memory attached to session");
   // mobile preset policy is applied from the memory-derived category.
-  await session.runChain("build");
+  await session.run("build");
   assert(session.toolsForPhase("perfect").some((t) => t.name === "media_analysis"), "mobile preset verification tool applied from memory-derived category");
   // project_memory tool registered
   assert(session.toolsForPhase("prepare").some((t) => t.name === "project_memory"), "project_memory tool available");

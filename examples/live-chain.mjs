@@ -5,6 +5,7 @@
  *
  * Run:  OPENROUTER_API_KEY=... node examples/live-chain.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -52,7 +53,7 @@ async function main() {
     "Create `test.js` that requires it, asserts add(2,3) === 5 (throw on failure), and prints 'ok'. " +
     "Make `npm test` pass.";
 
-  const result = await harness.runChain(task);
+  const result = await harness.run(task);
 
   console.log(`\n===== RESULT (${((Date.now() - t0) / 1000).toFixed(0)}s) =====`);
   console.log("success:", result.success, "| iterations:", result.iterations, "| cost $", result.usage.cost.total.toFixed(4));

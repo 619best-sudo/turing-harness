@@ -28,7 +28,6 @@ import type {
   AskUserQuestionOption,
   AskUserQuestionRequest,
   AskUserQuestionResult,
-  Phase,
 } from "../../types.js";
 
 interface AskUserQuestionDetails {
@@ -248,7 +247,7 @@ export const askUserQuestionTool: AgentTool = {
   // that cannot be asked at the moment it usually arises — mid-implementation,
   // when the ambiguity actually bites, or when a trace needs the user to exercise
   // the app. The failure ladder also escalates here from any phase.
-  phases: ["prepare", "plan", "perform", "perfect"],
+  categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
   parameters: {
     type: "object",
     properties: {
@@ -364,7 +363,7 @@ export const askUserQuestionTool: AgentTool = {
       // Report where the question actually came from. The tool used to hardcode
       // "plan" because that was the only phase it was registered for; it now runs
       // in all of them, and a mislabeled question is one a host routes wrong.
-      phase: (ctx?.phase as Phase | undefined) ?? "plan",
+      phase: ctx?.phase ?? "conversation",
       question,
       ...(reason ? { reason } : {}),
       ...(placeholder ? { placeholder } : {}),

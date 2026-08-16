@@ -55,6 +55,7 @@ function assistant(content, stopReason = "stop") {
  */
 function makeOrchestrator({ dir, onAnalysis, turns, plan }) {
   const seen = { lenses: [], authoringPrompts: [], stepMessages: [] };
+  let routerCalls = 0;
   const llm = new OpenRouterBridge();
   llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text", "image"] });
 
@@ -66,7 +67,10 @@ function makeOrchestrator({ dir, onAnalysis, turns, plan }) {
       usage: zeroUsage(), stopReason: "stop", timestamp: 0,
     });
 
-    if (/router at the front/.test(sys)) return reply("ROUTE: TASK\nBUGFIX: NO");
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return reply(`CATEGORY: ${routerCalls <= 1 ? "write_edit" : "summarise"}`);
+    }
     if (/precise media analyst/.test(sys)) {
       seen.lenses.push("describe");
       return reply(onAnalysis("describe"));
@@ -76,7 +80,13 @@ function makeOrchestrator({ dir, onAnalysis, turns, plan }) {
       return reply(onAnalysis("ocr"));
     }
     if (/breaking a task into an ordered implementation plan/.test(sys)) {
-      return reply(JSON.stringify(plan));
+      // An empty configured plan would make create_plan error (and trip the
+      // plan-first guard); substitute a valid single-task plan instead.
+      const empty = !plan?.plans?.length;
+      const valid = empty
+        ? { plans: [{ id: "p1", title: "Apply", summary: "x", tasks: [{ id: "t1", order: 1, title: "Apply", summary: "x", files: [path.join(dir, "out.ts")], fileMutations: { [path.join(dir, "out.ts")]: "write" }, complexity: "low" }] }], executionOrder: ["p1"] }
+        : plan;
+      return reply(JSON.stringify(valid));
     }
     if (/written to disk verbatim/.test(sys)) {
       seen.authoringPrompts.push(JSON.stringify(ctx.messages));
@@ -91,8 +101,18 @@ function makeOrchestrator({ dir, onAnalysis, turns, plan }) {
     if (last?.role === "user" && typeof last.content === "string") seen.stepMessages.push(last.content);
     turn += 1;
     yield { type: "start", partial: assistant([]) };
-    const next = turns[turn - 1];
-    yield { type: "done", message: next ? next() : assistant([{ type: "text", text: "done" }]) };
+    // v2 write_edit always plans first, then runs the scripted turns, then
+    // delivers.
+    if (turn === 1) {
+      yield { type: "done", message: assistant([{ type: "toolCall", id: "p1", name: "create_plan", arguments: { task: "the change" } }], "tool_use") };
+      return;
+    }
+    const scripted = turns[turn - 2];
+    if (scripted) {
+      yield { type: "done", message: scripted() };
+      return;
+    }
+    yield { type: "done", message: assistant([{ type: "toolCall", id: "d1", name: "deliver", arguments: { writes: [], notes: "done" } }], "tool_use") };
   };
 
   const registry = new Registry();
@@ -270,16 +290,7 @@ test("a file the user pins to a step during review is triaged before that step r
       }],
       executionOrder: ["plan-1"],
     },
-    turns: [
-      () => assistant([{
-        type: "toolCall", id: "p1", name: "create_plan",
-        arguments: { task: "fix the card", context: "the card fails to load" },
-      }], "tool_use"),
-      // Ends the planning loop; the write below then happens in the STEP loop,
-      // which is the only place the step's own attachment is in scope.
-      () => assistant([{ type: "text", text: "plan ready" }]),
-      () => writeCall(target),
-    ],
+    turns: [() => writeCall(target)],
   });
 
   // The host approves the plan and attaches a file to step t1 — the review
@@ -293,10 +304,8 @@ test("a file the user pins to a step during review is triaged before that step r
   await orch.run("fix the card", { skipPlan: false });
 
   assert.deepEqual(seen.lenses, ["describe", "ocr"], "the review attachment is understood, not just carried");
-  const stepMsg = seen.stepMessages.find((m) => /FILES THE USER ATTACHED TO THIS STEP/.test(m));
-  assert.ok(stepMsg, "the step message lists it");
-  assert.match(stepMsg, /the failing request/, "the plan's why-this-step note survives");
-  assert.match(stepMsg, /informational/, "alongside what the triage found it to BE");
+  // v2: no per-step opening messages — the attachment's proof of life is that
+  // its triage ran and its verbatim text reaches the authoring pass.
   assert.match(seen.authoringPrompts.join("\n"), /502 Bad Gateway/, "its verbatim text reaches the write");
 });
 
@@ -362,14 +371,7 @@ test("a step attachment with no mimeType is classified, not fatal", async () => 
       }],
       executionOrder: ["plan-1"],
     },
-    turns: [
-      () => assistant([{
-        type: "toolCall", id: "p1", name: "create_plan",
-        arguments: { task: "do", context: "c" },
-      }], "tool_use"),
-      () => assistant([{ type: "text", text: "plan ready" }]),
-      () => writeCall(target),
-    ],
+    turns: [() => writeCall(target)],
   });
 
   // A host UI dropping a file onto a step sends what it has — often just a path

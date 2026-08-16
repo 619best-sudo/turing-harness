@@ -21,10 +21,9 @@
  * for Frontend Developers", github.com/mobile-next/mobilecli,
  * strayspark.studio game-dev MCP guide, bytebase.com top Postgres MCP servers.
  */
-import type { Phase } from "../types.js";
 import type { McpServerOptions } from "../mcp/client.js";
 import type { PhaseModelConfig } from "../orchestrator/orchestrator.js";
-import type { PhaseToolFilter } from "../registry/registry.js";
+import type { CategorizerToolFilter } from "../registry/registry.js";
 import type { Session } from "../session.js";
 
 export type ProjectCategory = "frontend" | "mobile" | "games" | "backend";
@@ -45,8 +44,8 @@ export interface PresetApplyContext {
 /** One recommended MCP server in a preset. */
 export interface PresetMcpEntry {
   id: string;
-  /** 4P phases this server serves once connected. */
-  phases: Phase[];
+  /** Categorizer ids this server serves once connected. */
+  categorizers: string[];
   /** Not connected unless explicitly requested / config present. */
   optional?: boolean;
   /** Setup note (what the user must have installed / configured). */
@@ -60,8 +59,8 @@ export interface PresetMcpEntry {
 export interface ProjectPreset {
   category: ProjectCategory;
   description: string;
-  /** Phase → tool policy (built-in category tools + named MCP providers). */
-  phaseTools: Partial<Record<Phase, PhaseToolFilter>>;
+  /** Categorizer → tool policy (built-in scoped tools + named MCP providers). */
+  categorizerTools: Partial<Record<string, CategorizerToolFilter>>;
   /** Recommended MCP servers (connected only on opt-in). */
   mcp: PresetMcpEntry[];
   /** Recommended per-phase model defaults. */
@@ -72,30 +71,30 @@ export interface ProjectPreset {
 // Reusable MCP entries
 // ---------------------------------------------------------------------------
 
-const context7 = (phases: Phase[]): PresetMcpEntry => ({
+const context7 = (categorizers: string[]): PresetMcpEntry => ({
   id: "context7",
-  phases,
+  categorizers,
   note: "Live, version-correct library docs. Runs via npx (@upstash/context7-mcp).",
   build: () => ({ id: "context7", name: "Context7", command: "npx", args: ["-y", "@upstash/context7-mcp"], mutates: false }),
 });
 
 const playwright: PresetMcpEntry = {
   id: "playwright",
-  phases: ["perfect"],
+  categorizers: ["activity_inspect"],
   note: "Microsoft Playwright MCP — E2E, accessibility snapshots. npx @playwright/mcp.",
   build: () => ({ id: "playwright", name: "Playwright", command: "npx", args: ["-y", "@playwright/mcp@latest"], mutates: true }),
 };
 
 const chromeDevtools: PresetMcpEntry = {
   id: "chrome-devtools",
-  phases: ["perfect"],
+  categorizers: ["activity_inspect"],
   note: "Chrome DevTools MCP — console, network, performance from a live Chrome.",
   build: () => ({ id: "chrome-devtools", name: "Chrome DevTools", command: "npx", args: ["-y", "chrome-devtools-mcp@latest"], mutates: false }),
 };
 
 const figma: PresetMcpEntry = {
   id: "figma",
-  phases: ["plan", "perform"],
+  categorizers: ["write_edit"],
   optional: true,
   requires: ["env.FIGMA_API_KEY"],
   note: "Figma MCP — read design spec/tokens. Requires FIGMA_API_KEY in env.",
@@ -123,7 +122,7 @@ const figma: PresetMcpEntry = {
 
 const godot: PresetMcpEntry = {
   id: "godot",
-  phases: ["prepare", "plan", "perform", "perfect"],
+  categorizers: ["read", "write_edit", "activity_inspect"],
   optional: true,
   note: "Godot MCP — scene mgmt, GDScript, run project, screenshot capture, input injection, debug output. Requires the Godot editor + the MCP bridge configured; override the launch command via engineCommand.",
   build: (ctx) => ({
@@ -138,7 +137,7 @@ const godot: PresetMcpEntry = {
 
 const postgres: PresetMcpEntry = {
   id: "postgres",
-  phases: ["prepare", "plan", "perform", "perfect"],
+  categorizers: ["read", "write_edit", "activity_inspect"],
   requires: ["dbUrl"],
   note: "Postgres MCP — schema introspection (Prepare/Plan), scoped writes/migrations (Perform), query to verify (Perfect). Use a read-only connection where possible; Postgres MCP Pro adds EXPLAIN/health.",
   build: (ctx) =>
@@ -149,7 +148,7 @@ const postgres: PresetMcpEntry = {
 
 const filesystem: PresetMcpEntry = {
   id: "filesystem",
-  phases: ["prepare", "perform"],
+  categorizers: ["read", "write_edit"],
   optional: true,
   note: "Filesystem MCP scoped to a directory (finer-grained access than built-in read/write).",
   build: (ctx) => ({
@@ -169,17 +168,12 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
   frontend: {
     category: "frontend",
     description: "Web frontend: design-to-code + browser/visual verification.",
-    phaseTools: {
-      prepare: { fromCategory: true, providers: ["context7"] },
-      plan: { fromCategory: true, providers: ["context7", "figma"] },
-      // Perform uses dedicated read/write/edit + figma. `bash` is excluded so
-      // the model can't reach for shell/curl checks during the build phase —
-      // it must produce the artifact with the file tools and let Perfect
-      // verify it via the browser.
-      perform: { fromCategory: true, providers: ["figma"], exclude: ["bash"] },
-      perfect: { fromCategory: true, providers: ["playwright", "chrome-devtools"] },
+    categorizerTools: {
+      read: { fromScope: true, providers: ["context7"] },
+      write_edit: { fromScope: true, providers: ["figma"] },
+      activity_inspect: { fromScope: true, providers: ["playwright", "chrome-devtools"] },
     },
-    mcp: [context7(["prepare", "plan"]), figma, playwright, chromeDevtools],
+    mcp: [context7(["read", "write_edit"]), figma, playwright, chromeDevtools],
     models: {
       orchestrator: "xiaomi/mimo-v2.5",
       prepare: "xiaomi/mimo-v2.5",
@@ -192,22 +186,14 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
   mobile: {
     category: "mobile",
     description: "Mobile apps: build + on-device/simulator verification.",
-    phaseTools: {
-      prepare: { fromCategory: true, providers: ["context7"] },
-      plan: { fromCategory: true, providers: ["context7"] },
-      // Same `bash`-as-fallback policy as the frontend preset: in Perform
-      // the model produces code with read/write/edit and lets Perfect drive
-      // the simulator. bash is excluded so the model can't fall back to
-      // `npx expo start` etc. from inside the harness. The built-in mobile
-      // toolkit is named explicitly so it is present for env validation.
-      perform: { fromCategory: true, providers: ["builtin:mobile"], exclude: ["bash"] },
-      // Perfect: mobile tools FIRST (mandatory, not just first-listed) +
-      // media_analysis. bash is explicitly included as a fallback for STEP
-      // 0 (starting Metro) and cleanup, but the demote-bash-last ordering in
-      // the registry keeps it behind every mobile_* tool in the tool list.
-      perfect: { fromCategory: true, providers: ["builtin:mobile", "builtin:media_analysis"] },
+    categorizerTools: {
+      read: { fromScope: true, providers: ["context7"] },
+      // The built-in mobile toolkit is named explicitly so it is present for
+      // env validation; the demote-bash-last registry ordering keeps the
+      // mobile_* tools ahead of bash in the tool list.
+      activity_inspect: { fromScope: true, providers: ["builtin:mobile", "builtin:media_analysis"] },
     },
-    mcp: [context7(["prepare", "plan"])],
+    mcp: [context7(["read", "write_edit"])],
     models: {
       orchestrator: "xiaomi/mimo-v2.5",
       prepare: "xiaomi/mimo-v2.5",
@@ -220,11 +206,10 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
   games: {
     category: "games",
     description: "Games (Godot): engine-driven build + playtest verification.",
-    phaseTools: {
-      prepare: { fromCategory: true, providers: ["godot"] },
-      plan: { fromCategory: true, providers: ["godot"] },
-      perform: { fromCategory: true, providers: ["godot"] }, // + built-in assets_generator (sprites/audio/3d)
-      perfect: { fromCategory: true, providers: ["godot"] },
+    categorizerTools: {
+      read: { fromScope: true, providers: ["godot"] },
+      write_edit: { fromScope: true, providers: ["godot"] }, // + built-in assets_generator (sprites/audio/3d)
+      activity_inspect: { fromScope: true, providers: ["godot"] },
     },
     mcp: [godot],
     models: {
@@ -239,13 +224,12 @@ export const PROJECT_PRESETS: Record<ProjectCategory, ProjectPreset> = {
   backend: {
     category: "backend",
     description: "Backend services & APIs: DB-aware build + data/API verification.",
-    phaseTools: {
-      prepare: { fromCategory: true, providers: ["context7", "postgres"] },
-      plan: { fromCategory: true, providers: ["context7", "postgres"] },
-      perform: { fromCategory: true, providers: ["postgres", "filesystem"] },
-      perfect: { fromCategory: true, providers: ["postgres"] }, // + bash for tests/curl
+    categorizerTools: {
+      read: { fromScope: true, providers: ["context7", "postgres"] },
+      write_edit: { fromScope: true, providers: ["postgres", "filesystem"] },
+      activity_inspect: { fromScope: true, providers: ["postgres"] }, // + bash for tests/curl
     },
-    mcp: [context7(["prepare", "plan"]), postgres, filesystem],
+    mcp: [context7(["read", "write_edit"]), postgres, filesystem],
     models: {
       orchestrator: "xiaomi/mimo-v2.5",
       prepare: "xiaomi/mimo-v2.5",
@@ -277,7 +261,7 @@ export interface ApplyPresetOptions extends Omit<PresetApplyContext, "cwd"> {
 
 export interface ApplyPresetReport {
   category: ProjectCategory;
-  phaseTools: Phase[];
+  categorizerTools: string[];
   modelsSet: boolean;
   connected: string[];
   skipped: Array<{ id: string; reason: string }>;
@@ -302,18 +286,19 @@ export async function applyProjectPreset(
     filesystemDir: opts.filesystemDir,
     engineCommand: opts.engineCommand,
   };
-  const report: ApplyPresetReport = { category, phaseTools: [], modelsSet: false, connected: [], skipped: [], failed: [] };
+  const report: ApplyPresetReport = { category, categorizerTools: [], modelsSet: false, connected: [], skipped: [], failed: [] };
 
-  // 1. Phase-tool policy (runtime overrides — win over prior config).
+  // 1. Categorizer-tool policy (runtime overrides — win over prior config).
   if (opts.applyPolicy !== false) {
-    for (const phase of Object.keys(preset.phaseTools) as Phase[]) {
-      session.setPhaseTools(phase, preset.phaseTools[phase]);
-      report.phaseTools.push(phase);
+    for (const id of Object.keys(preset.categorizerTools)) {
+      session.setCategorizerTools(id, preset.categorizerTools[id]!);
+      report.categorizerTools.push(id);
     }
-    // 2. Model defaults.
+    // 2. Model defaults (role slots: prepare=router/conversation, perform=work,
+    //    perfect=summary).
     if (opts.setModels !== false) {
       for (const [target, slug] of Object.entries(preset.models)) {
-        if (slug) session.orchestrator.setModel(target as Phase | "orchestrator", slug);
+        if (slug) session.orchestrator.setModel(target, slug);
       }
       report.modelsSet = true;
     }
@@ -338,7 +323,7 @@ export async function applyProjectPreset(
         }
         try {
           const item = await session.addMcpServer(options);
-          session.setProviderPhases(item.id, entry.phases);
+          session.setProviderCategorizers(item.id, entry.categorizers);
           report.connected.push(entry.id);
         } catch (err) {
           report.failed.push({ id: entry.id, error: (err as Error).message });
@@ -349,11 +334,11 @@ export async function applyProjectPreset(
   return report;
 }
 
-/** The phase-tool policy + models a preset applies (for merging at construction). */
+/** The categorizer-tool policy + models a preset applies (for merging at construction). */
 export function presetPolicy(category: ProjectCategory): {
-  phaseTools: Partial<Record<Phase, PhaseToolFilter>>;
+  categorizerTools: Partial<Record<string, CategorizerToolFilter>>;
   models: PhaseModelConfig;
 } {
   const p = PROJECT_PRESETS[category];
-  return { phaseTools: p.phaseTools, models: p.models };
+  return { categorizerTools: p.categorizerTools, models: p.models };
 }

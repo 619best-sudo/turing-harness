@@ -13,14 +13,13 @@ import assert from "node:assert/strict";
 
 import {
   ASKING_THE_USER,
-  LOOP_SYSTEM_PROMPT,
   LogStore,
-  PHASE_PROMPTS,
   Registry,
   askUserQuestionTool,
   registerBuiltins,
   sanitizeChoices,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 const ctx = (extra = {}) => ({ cwd: process.cwd(), log: () => {}, ...extra });
 
@@ -29,10 +28,10 @@ test("it is reachable from every phase, not just planning", () => {
   // it usually arises: mid-implementation, when the ambiguity actually bites.
   const reg = new Registry();
   registerBuiltins(reg, { logStore: new LogStore() });
-  for (const phase of ["prepare", "plan", "perform", "perfect"]) {
+  for (const id of ["conversation", "read", "write_edit", "activity_inspect"]) {
     assert.ok(
-      reg.selectPhaseTools(phase).some((t) => t.name === "ask_user_question"),
-      `missing in ${phase}`,
+      reg.selectCategorizerTools(id).some((t) => t.name === "ask_user_question"),
+      `missing in ${id}`,
     );
   }
 });
@@ -53,7 +52,7 @@ test("the question reports the phase it actually came from", async () => {
     { question: "Which datastore?" },
     ctx({ askUserQuestion: async (req) => { fallback.push(req); return "x"; } }),
   );
-  assert.equal(fallback[0].phase, "plan");
+  assert.equal(fallback[0].phase, "conversation", "v2 fallback label");
 });
 
 test("choices carry their trade-offs, and exactly one recommendation", async () => {
@@ -173,9 +172,9 @@ test("the guidance draws the line between their decisions and yours", () => {
   assert.match(ASKING_THE_USER, /do not ask a question the plan review already puts in front of them/);
   assert.match(ASKING_THE_USER, /ask them to\n?\s*exercise the app/);
 
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(ASKING_THE_USER));
-  for (const phase of ["plan", "perform"]) {
-    assert.ok(PHASE_PROMPTS[phase].includes(ASKING_THE_USER), `missing from ${phase}`);
+  assert.ok(WORK_PROMPT.includes(ASKING_THE_USER));
+  for (const id of ["read", "activity_inspect"]) {
+    assert.ok(CATEGORIZER_PROMPTS[id].includes(ASKING_THE_USER), `missing from ${id}`);
   }
 });
 

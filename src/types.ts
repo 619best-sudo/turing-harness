@@ -577,11 +577,12 @@ export interface ToolContext {
   /** Call another model via OpenRouter (used by asset/audit tools). */
   llm?: LLMBridge;
   /**
-   * The 4P phase this call is running in, when the caller knows it. Tools that
-   * report back to the host (asking the user, say) need it to label the request
-   * honestly instead of assuming one.
+   * The categorizer this call is running in, when the caller knows it (v2's
+   * replacement for the old 4P phase label). Tools that report back to the host
+   * (asking the user, say) need it to label the request honestly instead of
+   * assuming one.
    */
-  phase?: Phase;
+  phase?: string;
   /**
    * The detected project category, threaded live from the orchestrator. Tools
    * that only make sense for UI projects (inspiration/assets) decline with a
@@ -614,8 +615,20 @@ export interface AgentTool<
    * spawning processes). Drives the "ask only for mutation calls" permission mode.
    */
   mutates?: boolean;
-  /** Which 4P phase(s) this tool belongs to. Empty ⇒ available to all phases. */
-  phases?: Phase[];
+  /**
+   * Which categorizer(s) this tool belongs to, by id (e.g. ["read",
+   * "write_edit"]). Used by the registry's categorizer scoping when a setup does
+   * not name tools explicitly. Empty/absent ⇒ scoped by the default categorizer
+   * of `categorizeTool`.
+   */
+  categorizers?: string[];
+  /**
+   * A terminal tool ENDS its loop once it executes successfully — the tool-call
+   * turn completes (every call in the turn keeps its result), then the loop stops
+   * instead of prompting another turn. This is how a categorizer's `deliver`
+   * tool signals "expectation met" deterministically.
+   */
+  terminal?: boolean;
   /**
    * Optional static complexity hint (0..1) used for model selection before the
    * call runs. The tool may also return a measured complexity in its result.
@@ -715,27 +728,28 @@ export type AgentEvent =
   // advisory: a host may ignore every update and still see start → end.
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; progress: ToolProgress }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: unknown; isError: boolean }
-  // ---- 4P orchestration extensions (namespaced so pi UIs can ignore them) ----
-  | { type: "phase_start"; phase: Phase; model: string }
-  | { type: "phase_end"; phase: Phase; result: PhaseResult }
-  // Lightweight end-of-phase signal for UI/IPC hosts: just the user-facing
-  // uiSummary string + the structured handoff object, without forcing the host
-  // to unpack the heavy PhaseResult carried by phase_end. Emitted once at the
-  // very end of each phase (after phase_end). pi UIs can ignore it.
-  | { type: "phase_summary"; phase: Phase; uiSummary?: string; handoff?: PhaseHandoff }
-  | { type: "chain_start"; task: string }
-  | { type: "chain_iteration"; iteration: number }
-  | { type: "chain_end"; success: boolean; iterations: number }
+  // ---- categorizer chain extensions (namespaced so pi UIs can ignore them) ----
+  /** A categorizer hop is starting (router picked it; tools are scoped). */
+  | { type: "categorizer_start"; categorizer: string; model: string }
+  /**
+   * A categorizer hop finished: one-line summary, its structured deliverable,
+   * and the paths it wrote/read. Lightweight by design — hosts render a card,
+   * not a transcript.
+   */
+  | {
+      type: "categorizer_end";
+      categorizer: string;
+      summary: string;
+      deliverable?: unknown;
+      writtenPaths?: string[];
+      readPaths?: string[];
+    }
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_decision"; request: PermissionRequest; decision: PermissionDecision };
 
 // ---------------------------------------------------------------------------
-// The 4P model (req #3, #4)
+// Run continuity records
 // ---------------------------------------------------------------------------
-
-export type Phase = "prepare" | "plan" | "perform" | "perfect";
-
-export const PHASES: Phase[] = ["prepare", "plan", "perform", "perfect"];
 
 export interface ToolSnippet {
   tool: string;
@@ -755,14 +769,9 @@ export interface RegisteredProviderSummary {
   kind: "tool" | "mcp" | "skill";
   name: string;
   description: string;
-  phases: Phase[];
+  /** Categorizer ids this provider serves (v2; formerly 4P phases). */
+  categorizers: string[];
   toolNames: string[];
-}
-
-export interface PrepareProviderAssignmentMap {
-  plan?: string[];
-  perform?: string[];
-  perfect?: string[];
 }
 
 export interface PrepareBlastRadiusSummary {
@@ -778,11 +787,6 @@ export interface PrepareRelevantFile {
   blastRadius?: PrepareBlastRadiusSummary;
 }
 
-export interface PrepareToolTranscriptEntry {
-  tool: string;
-  target?: string;
-  summary: string;
-}
 
 export interface ReadFileContent {
   path: string;
@@ -980,68 +984,9 @@ export type PlanApprovalCallback = (
   request: PlanApprovalRequest,
 ) => Promise<PlanApprovalDecision> | PlanApprovalDecision;
 
-/**
- * A QA check Perfect derives from the tech stack + changed files. Verified
- * against the running project; a failed check contributes to the FIX handoff.
- */
-export interface QaCheck {
-  id: string;
-  /** What is being verified (e.g. "landing page renders the new title"). */
-  description: string;
-  /** How it is verified: the tool/surface Perfect should use. */
-  method: "browser" | "mobile" | "api" | "test" | "typecheck" | "static" | "screenshot";
-  /** Files/surfaces this check covers. */
-  targets?: string[];
-  /** Filled in after running: did the check pass? */
-  passed?: boolean;
-  /** Evidence / observed-vs-expected note. */
-  evidence?: string;
-}
 
-/** Perfect's tech-stack-aware QA plan over the changed files. */
-export interface QaPlan {
-  /** The stack Perfect inferred the checks from (echoed from the profile). */
-  stack?: string;
-  checks: QaCheck[];
-}
 
-/**
- * A single continuity entry in a phase's tool-chain handover. Unlike the raw
- * LLM transcript, this is the curated set of tool activity a phase decides is
- * worth carrying forward (relevant reads + their reasoning + complexity).
- */
-export interface ToolChainEntry {
-  tool: string;
-  /** Path or query the tool acted on. */
-  target?: string;
-  /** One-line reasoning: why this activity matters downstream. */
-  reasoning: string;
-  /** Complexity of the activity, if known (inherited by later phases). */
-  complexity?: ComplexityRating;
-}
 
-/**
- * The structured, per-phase handoff object every phase produces for the next
- * phase. It complements (does not replace) the individual PhaseResult fields;
- * hosts and downstream phases can consume this single object for continuity.
- */
-export interface PhaseHandoff {
-  from: Phase;
-  /** The phase intended to consume this handoff next. */
-  to?: Phase;
-  /** Files that matter downstream, with reasoning + complexity. */
-  files: PrepareRelevantFile[];
-  /** Curated tool-chain continuity (not the raw transcript). */
-  toolChain: ToolChainEntry[];
-  /**
-   * The next-phase briefing — the `SUMMARY:` section (what a later phase needs to
-   * continue the work). NOT the user-facing `UI SUMMARY:` card: uiSummary flows
-   * to the host only via {@link PhaseResult.uiSummary} and the `phase_summary`
-   * event. Kept distinct so the structured handoff carries the next-phase
-   * context and the UI card stays a pure render artifact.
-   */
-  reasoning?: string;
-}
 
 /**
  * One offered answer. A bare label is often not enough for the user to choose
@@ -1117,7 +1062,8 @@ export interface AskUserQuestionAnswer {
 export type AskUserQuestionResult = string | AskUserQuestionAnswer;
 
 export interface AskUserQuestionRequest {
-  phase: Phase;
+  /** Categorizer id the question came from (formerly the 4P phase). */
+  phase?: string;
   question: string;
   kind?: "clarification" | "plan_review";
   reason?: string;
@@ -1182,11 +1128,6 @@ export interface ThreadRunSnapshot {
   writtenPaths?: string[];
   relevantFiles?: PrepareRelevantFile[];
   verified?: boolean;
-  /**
-   * For a bug-fix run: whether the broken behaviour was ever observed, and how the
-   * gate was satisfied or skipped. Present only when the reproduce gate was armed.
-   */
-  reproduction?: ReproductionReport;
   pendingUserQuestion?: AskUserQuestionRequest;
   error?: string;
 }
@@ -1201,53 +1142,9 @@ export interface ThreadFollowUpContext {
  * {@link PlanTask} but carries the post-run state the loop filled in — chiefly
  * whether the step's sub-loop finished (`isCompleted`) and any hard error.
  */
-/**
- * Structured verification report. Mirrors the gate's `VerificationReport` shape
- * (defined in src/orchestrator/verification-gate.ts) structurally so types.ts
- * stays free of orchestrator imports.
- */
-export interface VerificationReport {
-  /** Runtime files with evidence behind them this run. */
-  checked: Array<{ path: string; tool: string }>;
-  /** Files the model certified as needing no runtime check, with reasons. */
-  certified: Array<{ path: string; reason: string }>;
-  /** Files still lacking evidence when the run ended (may be non-empty). */
-  unverified: Array<{ path: string; method?: string; reason?: string }>;
-}
 
-/** Options for the verify-what-you-wrote gate. */
-export interface VerifyOptions {
-  /** Absolute cap on verification sub-loops per run. Default 3. */
-  maxRounds?: number;
 
-}
 
-/**
- * Reproduce-before-edit report. Mirrors the gate's `ReproductionReport` (defined
- * in src/orchestrator/reproduction-gate.ts) structurally so types.ts stays free
- * of orchestrator imports.
- */
-export interface ReproductionReport {
-  /** True if the model observed the bug (capture/trace/log) before editing. */
-  reproduced: boolean;
-  /** True if the run asked the user for reproduction steps. */
-  askedUser: boolean;
-  /** How many times the gate refused a mutation. */
-  blocks: number;
-  /** Present when the model declared the fix straightforward and skipped. */
-  declaredStraightforward?: { reason: string };
-  /**
-   * True when the gate was lifted by the harness-side straightforwardness
-   * assessor (evidence-based) rather than the model's own declaration.
-   */
-  assessedStraightforward?: boolean;
-  /** Present when the gate gave up after maxBlocks refusals. */
-  gaveUpAfterBlocks?: number;
-  /** True once `activity_trace_start` opened a trace session in this run. */
-  traceOpened?: boolean;
-  /** Files edited under the instrumentation exemption (probe add/strip). */
-  instrumentedForTrace?: string[];
-}
 
 export interface RunStep {
   planId: string;
@@ -1296,131 +1193,15 @@ export interface RunLoopResult {
   /** Continuity snapshot for the next prompt in the same session. */
   threadSnapshot?: ThreadRunSnapshot;
   /**
-   * Whether the run's written files were verified. `true` when the verify gate
-   * is satisfied (every runtime file has evidence, or is certified static);
-   * `false` when the gate ran but left gaps; `undefined` when the gate did not
-   * run (no writes, conversational route, or `RunOptions.verify: false`).
+   * Whether the run's written files were verified. In v2 this comes from the
+   * last `activity_inspect` deliverable's verdict: `true` on "pass", `false`
+   * on "fail", and `undefined` when no inspection ran (no writes,
+   * conversational route, or `RunOptions.verify: false`).
    */
   verified?: boolean;
-  /**
-   * Structured verification report: which files were checked, certified as
-   * static, or left unverified. Absent when the gate did not run.
-   */
-  verification?: VerificationReport;
-  /**
-   * Reproduce-before-edit report for a bug-fix run: whether the bug was
-   * observed before editing, declared straightforward (with reason), or given
-   * up on after maxBlocks. Absent for non-bug-fix runs.
-   */
-  reproduction?: ReproductionReport;
 }
 
-export interface PhaseDisplayArtifact {
-  /** Host-facing markdown phase summary meant for chat/timeline cards. */
-  summary: string;
-  /** Optional phase label override for hosts that want to render a custom title. */
-  label?: string;
-  /** Ordered tool calls the phase emitted, for hosts that want to group them. */
-  toolCallIds?: string[];
-}
 
-export interface PhaseResult {
-  phase: Phase;
-  /** Freeform summary the next phase / orchestrator can reason about. */
-  summary: string;
-  /** Host-facing display artifact, separate from the reasoning/handoff summary. */
-  display?: PhaseDisplayArtifact;
-  /**
-   * Short, user-message-anchored UI summary with light markdown styling
-   * (bold/inline-code for files & commands, bullet or numbered lists when long).
-   * This is the "ui-summary" common parameter each phase produces for the client.
-   * Distinct from `summary` (the reasoning/handoff briefing for the next phase).
-   */
-  uiSummary?: string;
-  /**
-   * The curated tool-chain continuity this phase hands to the next phase — the
-   * relevant tool activity with reasoning + complexity, NOT the raw transcript.
-   */
-  toolChain?: ToolChainEntry[];
-  /** The structured handoff object for the next phase (files + toolChain + reasoning). */
-  handoff?: PhaseHandoff;
-  /** Structured artifacts produced (plan steps, file addresses, findings...). */
-  artifacts?: Record<string, unknown>;
-  /** Media produced/consumed, carried by reference (address + summary). */
-  refs?: MediaRef[];
-  /** Absolute paths this phase confirmed exist (read/write/edit/ls/grep). Carried
-   *  forward into the next phase's opening so it doesn't have to guess from prose.
-   *  Only SUCCESSFUL tool calls contribute — failed/rejected calls never pollute
-   *  the handover. */
-  discoveredPaths?: string[];
-  /** Absolute file paths this phase SUCCESSFULLY read (`read`/`ls`/`grep`/`cat`).
-   *  Handed to the next phase (Prepare→Plan, Plan→Perform) so it knows exactly
-   *  what was inspected without re-reading. */
-  readPaths?: string[];
-  /** Last 1-2 successful tool outputs (truncated), for short context carry-over. */
-  recentToolSnippets?: ToolSnippet[];
-  /** Files actually written/edited by `write` or `edit` in this chain (SUCCESS
-   *  only). Handed to Perfect to verify, and carried across retry iterations so
-   *  they aren't re-written or re-verified. */
-  writtenPaths?: string[];
-  /** The project profile Prepare established — its type/stack and how to run &
-   *  verify it (e.g. "static HTML site (no package.json) → static file server").
-   *  Threaded into every later phase so Plan/Perform/Perfect pick correct
-   *  run/verify commands instead of re-guessing the stack each phase. */
-  projectProfile?: string;
-  /** The coarse project category Prepare inferred from evidence, used by the host
-   *  to reconcile stale project memory/presets before Plan starts. */
-  projectCategory?: "frontend" | "mobile" | "games" | "backend";
-  /** Structured runbook Prepare established for later phases. These are kept
-   *  separate from the one-line project profile so the host can thread concrete
-   *  run/stop/verify commands forward without asking later phases to re-derive
-   *  them from prose. */
-  projectRunbook?: {
-    run?: string;
-    stop?: string;
-    verify?: string;
-  };
-  /** The MCP servers / skills / tools Prepare identified as relevant to the task.
-   *  Threaded forward so Plan can plan around them, Perform prefers them over
-   *  bash, and Perfect verifies with them. */
-  capabilities?: string;
-  /** Structured provider assignments Prepare selected for downstream phases. */
-  providerAssignments?: PrepareProviderAssignmentMap;
-  /** The focused relevant-file shortlist Prepare assembled for downstream phases. */
-  relevantFiles?: PrepareRelevantFile[];
-  /** Compact transcript of successful Prepare tool work, derived from real tool calls. */
-  toolTranscript?: PrepareToolTranscriptEntry[];
-  /** Full contents of files successfully read during the phase, used for direct handoff. */
-  readFileContents?: ReadFileContent[];
-  /** Lines the reading phase flagged as relevant to the task, per file. Populated
-   *  from successful `mark_concern_lines` calls; surfaces to the host both live
-   *  (via `tool_execution_end`) and here at phase end for highlight anchoring. */
-  lineConcerns?: LineConcern[];
-  /** Metadata-only view of the registered providers Prepare saw while deciding
-   *  which MCPs/skills/providers later phases should use. */
-  registeredProvidersSeen?: RegisteredProviderSummary[];
-  /** Durable project-memory corrections/facts Prepare wants the host to persist
-   *  after validating the filesystem. Interpreted by the session/host layer. */
-  memoryUpdates?: string[];
-  /** Durable file-memory updates Prepare wants the host to persist after it has
-   *  inspected key files. */
-  fileMemoryUpdates?: FileMemoryUpdate[];
-  /** Structured clarification request emitted when a phase must pause for user input. */
-  pendingUserQuestion?: AskUserQuestionRequest;
-  /** Structured multi-plan output (Plan phase). One plan for a single-repo task,
-   *  several ordered plans for a complex/multi-repo task. Normalized from either
-   *  the new `PLANS_JSON` block or a legacy `PLAN_JSON` step array. */
-  planSet?: PlanSet;
-  /** Perfect's tech-stack-aware QA plan over the changed files. */
-  qaPlan?: QaPlan;
-  /** Only meaningful for the "perfect" phase: did verification pass? */
-  verified?: boolean;
-  /** Measured complexity of the work done in this phase (0..1). */
-  complexity: number;
-  usage: Usage;
-  messages: Message[];
-  error?: string;
-}
 
 // ---------------------------------------------------------------------------
 // Complexity + model selection (req #7)
@@ -1481,7 +1262,14 @@ export interface PermissionRequest {
   complexitySource?: ComplexitySource;
   /** Attachments/refs relevant to this call (address + summary, not bytes). */
   refs?: MediaRef[];
-  phase?: Phase;
+  /**
+   * Label of the loop driving this call. In v2 that is the categorizer id
+   * ("read" | "write_edit" | …); the old 4P names are gone. Kept as a plain
+   * string so hosts keying on the field keep compiling.
+   */
+  phase?: string;
+  /** The categorizer id (same value as `phase` in v2; explicit for new hosts). */
+  categorizer?: string;
   /** Optional named choices the host may present to the user. */
   options?: PermissionOption[];
 }

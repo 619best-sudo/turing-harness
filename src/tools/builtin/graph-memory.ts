@@ -31,7 +31,7 @@ export function createGraphMemoryTool(memory: GraphMemory, fileMemory?: FileMemo
     description:
       "Query durable dependency and symbol graphs. Actions: stats, refresh, file_deps, symbol_deps, blast_radius, get_file_node, get_symbol_node, find_symbol (default: inferred — paths→refresh, symbol/qualifiedName→find_symbol, path→file_deps, otherwise stats).",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["read", "write_edit", "activity_inspect"],
     parameters: {
       type: "object",
       properties: {

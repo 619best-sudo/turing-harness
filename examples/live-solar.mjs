@@ -5,6 +5,7 @@
  *
  * Run:  OPENROUTER_API_KEY=... node examples/live-solar.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
@@ -39,7 +40,7 @@ async function main() {
     else if (e.type === "chain_end") console.log(`\n■ success=${e.success} iterations=${e.iterations}`);
   });
 
-  const result = await harness.runChain("create an animated solar system in single file index.html");
+  const result = await harness.run("create an animated solar system in single file index.html");
 
   console.log(`\n===== RESULT (${((Date.now() - t0) / 1000).toFixed(0)}s) =====`);
   console.log("success:", result.success, "| iterations:", result.iterations, "| cost $", result.usage.cost.total.toFixed(4));

@@ -10,6 +10,7 @@
  * Run:
  *   OPENROUTER_API_KEY=... node examples/live-expo-mobile.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { Harness } from "../dist/index.js";
@@ -164,7 +165,7 @@ async function main() {
     `    5. media_analysis on ${path.join(OUT, "counterplus-simulator.png")} — ask it to confirm a "CounterPlus" title, the count label, and three buttons (Increment, Decrement, Reset) are visible.\n` +
     `Preconditions for "VERDICT: PASS": (a) Metro is up, (b) ${path.join(OUT, "counterplus-simulator.png")} exists and is non-empty, (c) the auditor confirms all required UI elements. End with "VERDICT: PASS" only if all three are true. If any precondition fails, end with "VERDICT: FAIL" and a "FIX:" section explaining what to try.`;
 
-  const result = await session.runChain(task);
+  const result = await session.run(task);
 
   console.log("\n===== RESULT =====");
   console.log("success:", result.success, "| iterations:", result.iterations, "| cost $", result.usage.cost.total.toFixed(4));

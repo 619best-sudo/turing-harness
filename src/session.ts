@@ -2,10 +2,10 @@
  * Session — an isolated, independently-runnable unit of work.
  *
  * Each session owns its OWN registry, log store, permission gate, orchestrator
- * (with its own per-phase model overrides), working directory, event stream, and
- * abort scope. Two sessions share nothing mutable, so any number of them can run
- * `runChain`/`runPhase` concurrently in a single process (e.g. one Electron app
- * driving several project tabs at once) without cross-talk.
+ * (with its own model overrides and categorizer setup), working directory, event
+ * stream, and abort scope. Two sessions share nothing mutable, so any number of
+ * them can run concurrently in a single process (e.g. one Electron app driving
+ * several project tabs at once) without cross-talk.
  *
  * The stateless {@link LLMBridge} is shared from the {@link Harness} manager; the
  * model catalog is read-only at runtime. Everything else is per-session.
@@ -19,35 +19,23 @@ import type {
   LLMBridge,
   PermissionCallback,
   PermissionMode,
-  Phase,
-  PhaseResult,
-  PrepareProviderAssignmentMap,
-  RegisteredProviderSummary,
   RunLoopResult,
   ThreadFollowUpContext,
-  ThreadRunDisposition,
   ThreadRunSnapshot,
   TranscriptMode,
 } from "./types.js";
 import {
   Registry,
-  type PhaseToolFilter,
-  type PhaseToolSpec,
+  type CategorizerToolSpec,
   type ProviderInput,
   type ProviderListItem,
   type ToolCategorizer,
 } from "./registry/registry.js";
+import type { CategorizerDefinition, CategorizerHop } from "./categorizer/types.js";
+import { createCategorizerSetup, type CategorizerSetup } from "./categorizer/setup.js";
 import { LogStore } from "./logging/logger.js";
 import { PermissionGate } from "./orchestrator/permission.js";
-import {
-  buildThreadRunSummary,
-  Orchestrator,
-  type ChainResult,
-  type PhaseModelConfig,
-  type RunChainOptions,
-  type RunPhaseOptions,
-  type RunOptions,
-} from "./orchestrator/orchestrator.js";
+import { Orchestrator, type PhaseModelConfig, type RunOptions } from "./orchestrator/orchestrator.js";
 import { registerBuiltins } from "./tools/index.js";
 import { connectMcpServer, type McpServerOptions } from "./mcp/client.js";
 import { McpRuntimePool, wrapPooledProvider, mcpServerSignature } from "./mcp/runtime-pool.js";
@@ -69,7 +57,7 @@ export interface SessionOptions {
   id?: string;
   /**
    * Apply a project preset's phase-tool policy + model defaults at construction
-   * (offline-safe; no MCP spawned). Explicit `phaseTools`/`models` below override
+   * (offline-safe; no MCP spawned). Explicit `categorizerTools`/`models` below override
    * the preset per key. Use `Harness.createProjectSession` (or `applyProjectPreset`)
    * to also connect the preset's recommended MCP servers.
    */
@@ -82,14 +70,23 @@ export interface SessionOptions {
   toolModelCandidates?: string[];
   /** Host-owned escalation routing: (kind, rating) → model slug. See ModelRouter. */
   routeModel?: import("./types.js").ModelRouter;
-  /** Customize the fixed toolset per phase (exact list, filter, or resolver). */
-  phaseTools?: Partial<Record<Phase, PhaseToolSpec>>;
-  /** Custom 4P categorization strategy for this session's registry. */
+  /**
+   * The categorizer setup driving runs (the categories, their tools/prompts/
+   * models/transitions). Defaults to the four built-in categories; see
+   * `categorizer-setup`.
+   */
+  categorizerSetup?: CategorizerSetup | CategorizerDefinition[];
+  /**
+   * Declarative EXTRA tools per categorizer (filter over the registry scope, an
+   * exact list, or a resolver) — merged on top of each categorizer's own tools.
+   * How presets scope their MCP servers into categories.
+   */
+  categorizerTools?: Partial<Record<string, CategorizerToolSpec>>;
+  /** Custom scoping strategy for this session's registry (defaults per tool). */
   categorizer?: ToolCategorizer;
-  maxSteps?: Partial<Record<Phase, number>>;
-  reasoning?: Partial<Record<Phase, import("./types.js").ThinkingLevel>>;
-  temperature?: Partial<Record<Phase, number>>;
-  maxChainIterations?: number;
+  maxSteps?: number;
+  reasoning?: import("./types.js").ThinkingLevel;
+  temperature?: number;
   /** Register the bundled internal tools into this session (default true). */
   registerBuiltins?: boolean;
   assets?: AssetsGeneratorConfig;
@@ -143,41 +140,6 @@ export interface SessionInfo {
 interface RunLifecycleHooks {
   onRunStart?: () => Promise<void> | void;
   onRunEnd?: () => Promise<void> | void;
-}
-
-function deriveStandaloneDisposition(result: PhaseResult): ThreadRunDisposition {
-  if (result.pendingUserQuestion) return "pending_user_question";
-  if (result.error === "aborted") return "aborted";
-  if (result.error) return "failed";
-  return "completed";
-}
-
-function buildStandaloneThreadSnapshot(task: string, result: PhaseResult): ThreadRunSnapshot {
-  const disposition = deriveStandaloneDisposition(result);
-  const planJson = Array.isArray(result.artifacts?.planJson) ? result.artifacts.planJson : undefined;
-  return {
-    timestamp: Date.now(),
-    task,
-    route: "task",
-    disposition,
-    recommendedFollowUpMode: disposition === "pending_user_question" ? "fresh" : "structured_continue",
-    summary: buildThreadRunSummary({
-      task,
-      disposition,
-      phases: { [result.phase]: result },
-      ...(result.error && result.error !== "aborted" ? { error: result.error } : {}),
-      ...(result.pendingUserQuestion ? { pendingUserQuestion: result.pendingUserQuestion } : {}),
-    }),
-    ...(result.readFileContents?.length ? { contextFiles: result.readFileContents.slice(0, 4) } : {}),
-    ...(planJson?.length ? { planJson: planJson.slice(0, 12) } : {}),
-    ...(result.discoveredPaths?.length ? { discoveredPaths: result.discoveredPaths.slice(0, 24) } : {}),
-    ...(result.readPaths?.length ? { readPaths: result.readPaths.slice(0, 24) } : {}),
-    ...(result.writtenPaths?.length ? { writtenPaths: result.writtenPaths.slice(0, 24) } : {}),
-    ...(result.relevantFiles?.length ? { relevantFiles: result.relevantFiles.slice(0, 12) } : {}),
-    ...(typeof result.verified === "boolean" ? { verified: result.verified } : {}),
-    ...(result.pendingUserQuestion ? { pendingUserQuestion: result.pendingUserQuestion } : {}),
-    ...(result.error && result.error !== "aborted" ? { error: result.error } : {}),
-  };
 }
 
 export class Session implements AgentHost {
@@ -235,18 +197,15 @@ export class Session implements AgentHost {
     }
     for (const p of opts.providers ?? []) this.registry.add(p);
 
-    // Merge a project preset's policy (phase tools + model defaults) with explicit
-    // options; explicit options win per key. MCP servers are NOT spawned here —
-    // use Harness.createProjectSession / applyProjectPreset(connectMcp).
+    // Merge a project preset's policy (categorizer tools + model defaults) with
+    // explicit options; explicit options win per key. MCP servers are NOT spawned
+    // here — use Harness.createProjectSession / applyProjectPreset(connectMcp).
     const policy = opts.preset ? presetPolicy(opts.preset) : undefined;
     const models = policy ? { ...policy.models, ...opts.models } : opts.models;
-    const prepareMemoryOnly: PhaseToolFilter = {
-      fromCategory: false,
-      include: ["project_memory", "file_memory", "graph_memory", "read"],
+    const categorizerTools = {
+      ...(policy?.categorizerTools ?? {}),
+      ...(opts.categorizerTools ?? {}),
     };
-    const phaseTools = policy
-      ? { ...policy.phaseTools, prepare: prepareMemoryOnly, ...(opts.phaseTools ?? {}) }
-      : { prepare: prepareMemoryOnly, ...(opts.phaseTools ?? {}) };
 
     this.orchestrator = new Orchestrator({
       cwd: this.cwd,
@@ -259,18 +218,20 @@ export class Session implements AgentHost {
       toolModelCandidates: opts.toolModelCandidates,
       ...(opts.visionModel ? { visionModel: opts.visionModel } : {}),
       ...(opts.routeModel ? { routeModel: opts.routeModel } : {}),
-      phaseTools,
+      ...(opts.categorizerSetup ? { categorizerSetup: normalizeCategorizerSetup(opts.categorizerSetup) } : {}),
       maxSteps: opts.maxSteps,
-      reasoning: opts.reasoning,
-      temperature: opts.temperature,
-      maxChainIterations: opts.maxChainIterations,
+      ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
+      ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       transcriptMode: opts.transcriptMode,
       ...(opts.autoTriageAttachments === false ? { autoTriageAttachments: false } : {}),
     });
+    for (const [id, spec] of Object.entries(categorizerTools)) {
+      if (spec) this.orchestrator.setCategorizerTools(id, spec);
+    }
     // Seed the live category from the preset so the non-UI skip is in effect
-    // even before Prepare runs. Corrected live in `reconcileAfterPrepare`.
+    // before the first read hop runs. Corrected live in `reconcileAfterRead`.
     if (opts.preset) this.orchestrator.projectCategory = opts.preset;
-    this.orchestrator.setAfterPrepareHook((prepare, { signal }) => this.reconcileAfterPrepare(prepare, signal));
+    this.orchestrator.setAfterCategorizerHook((hop, signal) => this.reconcileAfterCategorizer(hop, signal));
 
     this.logStore.append({ tags: ["session", `session:${this.id}`], level: "info", message: `session ${this.id} created (cwd=${this.cwd})` });
   }
@@ -317,23 +278,24 @@ export class Session implements AgentHost {
   addSkill(input: Omit<ProviderInput, "kind"> & { kind?: "skill" }): ProviderListItem {
     return this.registry.add({ ...input, kind: "skill" });
   }
-  toolsForPhase(phase: Phase): AgentTool[] {
-    return this.orchestrator.resolvePhaseTools(phase);
+  /** Extra tools the given categorizer receives on top of its own setup list. */
+  toolsForCategorizer(id: string): AgentTool[] {
+    return this.orchestrator.extraToolsFor(id);
   }
 
-  // ---- Per-phase toolset customization (the fixed P toolset is customizable) --
+  // ---- Per-categorizer toolset customization --------------------------------
 
-  /** Set/clear the toolset for a phase at runtime (exact list, filter, or resolver). */
-  setPhaseTools(phase: Phase, spec: PhaseToolSpec | undefined): void {
-    this.orchestrator.setPhaseTools(phase, spec);
+  /** Set/clear EXTRA tools for a categorizer (exact list, filter, or resolver). */
+  setCategorizerTools(id: string, spec: CategorizerToolSpec | undefined): void {
+    this.orchestrator.setCategorizerTools(id, spec);
   }
-  /** Move a single tool between phases (e.g. a custom screenshot tool → Perfect). */
-  setToolPhases(toolName: string, phases: Phase[]): boolean {
-    return this.registry.setToolPhases(toolName, phases);
+  /** Move a single tool between categorizers (e.g. a custom screenshot tool → activity_inspect). */
+  setToolCategorizers(toolName: string, ids: string[]): boolean {
+    return this.registry.setToolCategorizers(toolName, ids);
   }
-  /** Move a whole provider/MCP between phases. */
-  setProviderPhases(providerId: string, phases: Phase[]): boolean {
-    return this.registry.setProviderPhases(providerId, phases);
+  /** Move a whole provider/MCP between categorizers. */
+  setProviderCategorizers(providerId: string, ids: string[]): boolean {
+    return this.registry.setProviderCategorizers(providerId, ids);
   }
 
   /** Configure how this project session should re-apply presets after Prepare. */
@@ -420,40 +382,8 @@ export class Session implements AgentHost {
 
   // ---- Execution ---------------------------------------------------------
 
-  async runPhase(phase: Phase, task: string, opts: RunPhaseOptions = {}): Promise<PhaseResult> {
-    this.assertLive();
-    const { signal, done } = await this.beginRun(opts.signal);
-    const followUpContext = this.resolveFollowUpContext(opts.followUpContext);
-    const inheritedReadPaths = followUpContext?.previousRun.readPaths;
-    const inheritedContextFiles = followUpContext?.previousRun.contextFiles;
-    try {
-      const result = await this.orchestrator.runPhase(phase, task, {
-        ...opts,
-        priorReadPaths:
-          inheritedReadPaths?.length && !opts.priorReadPaths?.length
-            ? inheritedReadPaths
-            : opts.priorReadPaths,
-        attachedContextFiles:
-          inheritedContextFiles?.length && !opts.attachedContextFiles?.length
-            ? inheritedContextFiles
-            : opts.attachedContextFiles,
-        availableProviders: opts.availableProviders ?? (phase === "prepare" ? summarizeRegisteredProviders(this.registry.list()) : undefined),
-        signal,
-        ...(followUpContext ? { followUpContext } : {}),
-        ...(opts.askUserQuestion || this.askUserQuestion
-          ? { askUserQuestion: opts.askUserQuestion ?? this.askUserQuestion }
-          : {}),
-      });
-      this.lastThreadSnapshot = buildStandaloneThreadSnapshot(task, result);
-      return result;
-    } finally {
-      await done();
-    }
-  }
-
   /**
-   * Run the flat loop driver (the primary entry point). `runPhase`/`runChain`
-   * remain as back-compat shims; new code should call this.
+   * Run the categorizer chain — the primary (and only) execution entry point.
    */
   async run(task: string, opts: RunOptions = {}): Promise<RunLoopResult> {
     this.assertLive();
@@ -461,26 +391,6 @@ export class Session implements AgentHost {
     const followUpContext = this.resolveFollowUpContext(opts.followUpContext);
     try {
       const result = await this.orchestrator.run(task, {
-        ...opts,
-        signal,
-        ...(followUpContext ? { followUpContext } : {}),
-        ...(opts.askUserQuestion || this.askUserQuestion
-          ? { askUserQuestion: opts.askUserQuestion ?? this.askUserQuestion }
-          : {}),
-      });
-      this.lastThreadSnapshot = result.threadSnapshot;
-      return result;
-    } finally {
-      await done();
-    }
-  }
-
-  async runChain(task: string, opts: RunChainOptions = {}): Promise<ChainResult> {
-    this.assertLive();
-    const { signal, done } = await this.beginRun(opts.signal);
-    const followUpContext = this.resolveFollowUpContext(opts.followUpContext);
-    try {
-      const result = await this.orchestrator.runChain(task, {
         ...opts,
         signal,
         ...(followUpContext ? { followUpContext } : {}),
@@ -512,13 +422,6 @@ export class Session implements AgentHost {
     return new HarnessAgent(this, opts);
   }
 
-  phaseTools(): AgentTool[] {
-    return this.orchestrator.phaseTools();
-  }
-  chainTool(): AgentTool {
-    return this.orchestrator.chainTool();
-  }
-
   info(): SessionInfo {
     return { id: this.id, cwd: this.cwd, createdAt: this.createdAt, running: this.isRunning, metadata: this.metadata };
   }
@@ -546,171 +449,54 @@ export class Session implements AgentHost {
     return { mode: "structured_continue", previousRun: this.lastThreadSnapshot };
   }
 
-  private async reconcileAfterPrepare(prepare: PhaseResult, _signal?: AbortSignal): Promise<PhaseResult> {
-    const patched: PhaseResult = {
-      ...prepare,
-      projectRunbook: prepare.projectRunbook ? { ...prepare.projectRunbook } : undefined,
-      memoryUpdates: prepare.memoryUpdates ? [...prepare.memoryUpdates] : undefined,
-      fileMemoryUpdates: prepare.fileMemoryUpdates ? [...prepare.fileMemoryUpdates] : undefined,
-    };
+  /**
+   * Host-side reconciliation after each categorizer hop. The read categorizer's
+   * deliverable carries the durable corrections the old Prepare phase used to
+   * emit: project category, memory updates. Presets re-apply when the category
+   * changed. Provider assignment plumbing is retired — mention-resolved and
+   * preset-scoped tools flow through the categorizer toolset directly.
+   */
+  private async reconcileAfterCategorizer(hop: CategorizerHop, _signal?: AbortSignal): Promise<void> {
+    if (hop.id !== "read") return;
+    const deliverable = hop.deliverable as
+      | { memoryUpdates?: string[]; projectCategory?: import("./presets/project-presets.js").ProjectCategory }
+      | undefined;
+    if (!deliverable) return;
+    const { memoryUpdates, projectCategory } = deliverable;
 
-    if (this.memory && patched.projectCategory && this.memory.category !== patched.projectCategory) {
-      await this.memory.setCategory(patched.projectCategory, { auto: false });
+    if (this.memory && projectCategory && this.memory.category !== projectCategory) {
+      await this.memory.setCategory(projectCategory, { auto: false });
     }
     // Thread the corrected category live to the orchestrator so the non-UI skip
-    // (inspiration/assets/design-skill) reflects the post-scan verdict, not the
-    // preset guess. Memory is the source of truth once Prepare has reconciled.
-    const liveCategory = this.memory?.category ?? patched.projectCategory;
+    // (inspiration/assets/design-skill) reflects the post-read verdict, not the
+    // preset guess. Memory is the source of truth once the read reconciled.
+    const liveCategory = this.memory?.category ?? projectCategory;
     if (liveCategory) this.orchestrator.projectCategory = liveCategory;
 
-    if (this.memory && patched.memoryUpdates?.length) {
+    if (this.memory && memoryUpdates?.length) {
       const known = new Set(this.memory.data.facts.map((f) => f.text.trim().toLowerCase()));
-      for (const update of patched.memoryUpdates) {
+      for (const update of memoryUpdates) {
         const text = update.trim();
         if (!text || known.has(text.toLowerCase())) continue;
-        await this.memory.remember(text, { tags: ["prepare", "handoff"], source: "prepare" });
+        await this.memory.remember(text, { tags: ["read", "handoff"], source: "read" });
         known.add(text.toLowerCase());
       }
     }
 
-    if (this.fileMemory && patched.fileMemoryUpdates?.length) {
-      const known = new Set(
-        Object.values(this.fileMemory.data.files).map((entry) => `${entry.path.trim().toLowerCase()}::${entry.summary.trim().toLowerCase()}`),
-      );
-      for (const update of patched.fileMemoryUpdates) {
-        const filePath = update.path.trim();
-        const summary = update.summary.trim();
-        if (!filePath || !summary) continue;
-        const sig = `${filePath.toLowerCase()}::${summary.toLowerCase()}`;
-        if (known.has(sig)) continue;
-        await this.fileMemory.remember(filePath, summary, {
-          tags: update.tags,
-          role: update.role,
-          source: "prepare",
-        });
-        known.add(sig);
-      }
-    }
-
-    if (patched.projectCategory && this.projectPresetReconciliation) {
-      await applyProjectPreset(this, patched.projectCategory, {
+    if (projectCategory && this.projectPresetReconciliation && this.orchestrator.projectCategory !== projectCategory) {
+      await applyProjectPreset(this, projectCategory, {
         ...this.projectPresetReconciliation,
         applyPolicy: true,
         setModels: false,
       });
     }
 
-    const structuredAssignments = this.reconcileStructuredProviderAssignments(patched.providerAssignments);
-    this.applyStructuredProviderAssignments(structuredAssignments);
-    const resolved =
-      structuredAssignments.plan.length || structuredAssignments.perform.length || structuredAssignments.perfect.length
-        ? [...structuredAssignments.plan, ...structuredAssignments.perform, ...structuredAssignments.perfect]
-        : this.reconcileProvidersFromCapabilities(patched.capabilities);
-    if (resolved.length) {
-      const existing = new Set(
-        (patched.capabilities ?? "")
-          .split("\n")
-          .map((line) => line.trim().toLowerCase())
-          .filter(Boolean),
-      );
-      const extra = resolved
-        .map((provider) => `- resolved provider ${provider.id}: ${provider.name} [phases: ${provider.phases.join(", ")}]`)
-        .filter((line) => !existing.has(line.trim().toLowerCase()));
-      patched.capabilities = [patched.capabilities?.trim(), ...extra].filter(Boolean).join("\n");
-    }
-
     this.logStore.append({
-      tags: ["phase", "handoff", "prepare", "plan", "capabilities", `session:${this.id}`],
+      tags: ["categorizer", "handoff", "read", `session:${this.id}`],
       level: "info",
-      message: "prepare reconciliation complete",
-      data: {
-        projectCategory: patched.projectCategory,
-        declaredCapabilities: patched.capabilities,
-        structuredProviderAssignments: patched.providerAssignments,
-        resolvedProviders: resolved.map((provider) => ({
-          id: provider.id,
-          name: provider.name,
-          kind: provider.kind,
-          phases: provider.phases,
-          tools: provider.tools.map((tool) => tool.name),
-        })),
-        providerAssignmentsByPhase: summarizeProviderAssignments(this.registry.list()),
-        toolAssignmentsByPhase: {
-          prepare: this.toolsForPhase("prepare").map((tool) => tool.name),
-          plan: this.toolsForPhase("plan").map((tool) => tool.name),
-          perform: this.toolsForPhase("perform").map((tool) => tool.name),
-          perfect: this.toolsForPhase("perfect").map((tool) => tool.name),
-        },
-      },
+      message: "read reconciliation complete",
+      data: { projectCategory, memoryUpdates: memoryUpdates?.length ?? 0 },
     });
-
-    return patched;
-  }
-
-  private reconcileStructuredProviderAssignments(
-    assignments?: PrepareProviderAssignmentMap,
-  ): Record<"plan" | "perform" | "perfect", ProviderListItem[]> {
-    const registryById = new Map(this.registry.list().map((provider) => [provider.id, provider]));
-    const resolve = (phase: "plan" | "perform" | "perfect") =>
-      (assignments?.[phase] ?? [])
-        .map((id) => registryById.get(id))
-        .filter((provider): provider is ProviderListItem => Boolean(provider));
-    return {
-      plan: resolve("plan"),
-      perform: resolve("perform"),
-      perfect: resolve("perfect"),
-    };
-  }
-
-  private applyStructuredProviderAssignments(
-    assignments: Record<"plan" | "perform" | "perfect", ProviderListItem[]>,
-  ): void {
-    for (const phase of ["plan", "perform", "perfect"] as const) {
-      const providers = assignments[phase];
-      if (!providers.length) continue;
-      const tools = new Map<string, AgentTool>();
-      for (const tool of this.toolsForPhase(phase)) tools.set(tool.name, tool);
-      for (const provider of providers) {
-        for (const tool of provider.tools) {
-          const executable = this.registry.getTool(tool.name);
-          if (executable) tools.set(executable.name, executable);
-        }
-      }
-      this.setPhaseTools(phase, [...tools.values()]);
-    }
-  }
-
-  private reconcileProvidersFromCapabilities(capabilities?: string): ProviderListItem[] {
-    if (!capabilities || /^none\b/i.test(capabilities.trim())) return [];
-    const lines = capabilities
-      .split("\n")
-      .map((line) => line.replace(/^\s*[-*]\s*/, "").trim().toLowerCase())
-      .filter(Boolean);
-    if (!lines.length) return [];
-
-    const matched: ProviderListItem[] = [];
-    for (const provider of this.registry.list()) {
-      const hay = [
-        provider.id,
-        provider.name,
-        provider.description,
-        ...provider.tools.flatMap((tool) => [tool.name, tool.description ?? ""]),
-      ]
-        .join(" ")
-        .toLowerCase();
-      const providerTokens = tokenize(provider.id, provider.name, provider.description, ...provider.tools.map((tool) => tool.name));
-      const phases = [...new Set(provider.tools.flatMap((tool) => tool.phases))];
-      const isMatch = lines.some((line) => {
-        if (hay.includes(line)) return true;
-        const lineTokens = tokenize(line);
-        const overlap = [...lineTokens].filter((token) => providerTokens.has(token)).length;
-        return overlap >= 2 || (overlap >= 1 && /mcp|skill|browser|mobile|docs|search|database|sql|audit|test/.test(line));
-      });
-      if (!isMatch) continue;
-      if (phases.length) this.setProviderPhases(provider.id, phases);
-      matched.push({ ...provider, phases: phases.length ? phases : provider.phases });
-    }
-    return matched;
   }
 
   /** Create a run-scoped abort signal linked to any external signal + session abort. */
@@ -747,61 +533,9 @@ export class Session implements AgentHost {
   }
 }
 
-function tokenize(...parts: string[]): Set<string> {
-  return new Set(
-    parts
-      .join(" ")
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .map((token) => token.trim())
-      .filter((token) => token.length >= 3 && !STOP_TOKENS.has(token)),
-  );
-}
-
-const STOP_TOKENS = new Set([
-  "the",
-  "and",
-  "for",
-  "with",
-  "that",
-  "this",
-  "from",
-  "later",
-  "phase",
-  "phases",
-  "tool",
-  "tools",
-  "built",
-  "only",
-  "none",
-  "use",
-]);
-
-function summarizeProviderAssignments(providers: ProviderListItem[]): Record<Phase, Array<{ id: string; name: string; kind: string }>> {
-  const out = {
-    prepare: [] as Array<{ id: string; name: string; kind: string }>,
-    plan: [] as Array<{ id: string; name: string; kind: string }>,
-    perform: [] as Array<{ id: string; name: string; kind: string }>,
-    perfect: [] as Array<{ id: string; name: string; kind: string }>,
-  };
-  for (const provider of providers) {
-    for (const phase of provider.phases) {
-      out[phase].push({ id: provider.id, name: provider.name, kind: provider.kind });
-    }
-  }
-  for (const phase of Object.keys(out) as Phase[]) {
-    out[phase].sort((a, b) => a.id.localeCompare(b.id));
-  }
-  return out;
-}
-
-function summarizeRegisteredProviders(providers: ProviderListItem[]): RegisteredProviderSummary[] {
-  return providers.map((provider) => ({
-    id: provider.id,
-    kind: provider.kind,
-    name: provider.name,
-    description: provider.description,
-    phases: provider.phases,
-    toolNames: provider.tools.map((tool) => tool.name),
-  }));
+/** Accept either a full setup or a bare category list (defaults filled in). */
+function normalizeCategorizerSetup(
+  setup: CategorizerSetup | CategorizerDefinition[],
+): CategorizerSetup {
+  return Array.isArray(setup) ? createCategorizerSetup({ categories: setup }) : setup;
 }

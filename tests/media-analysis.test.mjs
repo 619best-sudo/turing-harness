@@ -16,7 +16,6 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  LOOP_SYSTEM_PROMPT,
   MEDIA_UNDERSTANDING,
   OpenRouterBridge,
   Registry,
@@ -25,6 +24,7 @@ import {
   lensSystemPrompt,
   resolveLens,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 // A 1x1 PNG — enough to prove the bytes are read and base64-encoded.
 const PNG_BYTES = Buffer.from(
@@ -567,7 +567,7 @@ test("the prompts put analysis before planning, and name the lens for each job",
   assert.match(MEDIA_UNDERSTANDING, /lens:"compare"[\s\S]*as `reference`/);
   assert.match(MEDIA_UNDERSTANDING, /is not a check/);
   assert.match(MEDIA_UNDERSTANDING, /re-compare until it/, "a MISMATCH is acted on, not just reported");
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(MEDIA_UNDERSTANDING), "the loop carries it verbatim");
+  assert.ok(WORK_PROMPT.includes(MEDIA_UNDERSTANDING), "the loop carries it verbatim");
 });
 
 test("media_analysis: the default analysis model is gemini-3.7-flash (pinned)", async () => {

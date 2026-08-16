@@ -395,7 +395,7 @@ export function createInspirationGeneratorTool(
       "project's content and theme tokens. On 'no match', proceed without a reference — do not retry with " +
       "reworded keywords.",
     mutates: false,
-    phases: ["perform", "perfect"],
+    categorizers: ["write_edit", "activity_inspect"],
     parameters: {
       type: "object",
       properties: {

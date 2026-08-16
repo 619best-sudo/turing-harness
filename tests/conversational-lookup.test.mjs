@@ -59,9 +59,13 @@ async function conversationalTurn({ extraTools = [], userText = "what is the lat
   const seen = { systems: [], toolsOffered: [], calledTools: [] };
 
   const llm = new OpenRouterBridge();
-  // classifyIntent uses complete(); force the CONVERSATIONAL route.
-  llm.complete = async (model) => {
-    return msg([{ type: "text", text: "CONVERSATIONAL" }]);
+  // The v2 router uses complete(); force the conversation route.
+  llm.complete = async (model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      return msg([{ type: "text", text: "CATEGORY: conversation" }]);
+    }
+    return msg([{ type: "text", text: "ok" }]);
   };
 
   let turn = 0;
@@ -101,7 +105,7 @@ async function conversationalTurn({ extraTools = [], userText = "what is the lat
 test("with no web tools registered, the conversational path is unchanged — no tools, base prompt", async () => {
   const { seen } = await conversationalTurn();
   assert.equal(seen.systems.length, 1, "one turn, no loop");
-  assert.equal(seen.systems[0], CONVERSATIONAL_PROMPT, "the base prompt is used verbatim");
+  assert.ok(seen.systems[0].startsWith(CONVERSATIONAL_PROMPT), "the base prompt leads, verbatim");
   assert.doesNotMatch(seen.systems[0], /LOOKING THINGS UP/);
 });
 
@@ -118,16 +122,18 @@ test("the lookup clause keeps the no-project-access guarantee explicit", () => {
   assert.match(CONVERSATIONAL_LOOKUP, /Do NOT search for stable conceptual questions/);
 });
 
-test("ONLY lookup tools reach the conversational path — never project tools", async () => {
-  // The allowlist is the point: a read/grep here would make the cheap path a
-  // second, unbounded work loop.
+test("ONLY lookup/global tools reach the conversational path — never project tools", async () => {
+  // v2 globals (bash, web, ask_user_question, clearing_doubt) reach every
+  // categorizer by design (this bare registry registers none of them); PROJECT
+  // tools do not — a read/grep here would make the cheap path a second,
+  // unbounded work loop.
   const { seen } = await conversationalTurn({
-    extraTools: [stubTool("web_search"), stubTool("read"), stubTool("grep"), stubTool("bash"), stubTool("write")],
+    extraTools: [stubTool("web_search"), stubTool("read"), stubTool("grep"), stubTool("write")],
   });
   const offered = seen.toolsOffered.flat();
   assert.ok(offered.length, "the turn was actually offered tools (guards against a vacuous assertion)");
   assert.ok(offered.includes("web_search"), "lookup is offered");
-  for (const forbidden of ["read", "grep", "bash", "write"]) {
+  for (const forbidden of ["read", "grep", "write"]) {
     assert.ok(!offered.includes(forbidden), `${forbidden} is NOT offered to a conversational turn`);
   }
 });

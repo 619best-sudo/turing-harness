@@ -11,8 +11,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { buildLoopSystemPrompt } from "../dist/index.js";
-import { DRIVING_AUTOMATION } from "../dist/phases/prompts.js";
+
+import { DRIVING_AUTOMATION } from "../dist/categorizer/guidance.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 const BASE = ["read", "write", "edit", "bash", "media_analysis", "ask_user_question"];
 const WITH_MOBILE = [...BASE, "mobile_list_elements_on_screen", "mobile_click_on_screen_at_coordinates", "mobile_take_screenshot"];
@@ -32,17 +33,17 @@ test("DRIVING_AUTOMATION states element-over-pixel for BOTH surfaces and the med
 });
 
 test("the loop prompt includes driving guidance when MOBILE tools are present", () => {
-  assert.match(buildLoopSystemPrompt(WITH_MOBILE), /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/);
+  assert.match(buildWorkPrompt(WITH_MOBILE), /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/);
 });
 
 test("the loop prompt includes driving guidance when BROWSER (playwright) tools are present", () => {
   // MCP-namespaced playwright tools must trip the gate via the __endsWith match.
-  assert.match(buildLoopSystemPrompt(WITH_BROWSER), /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/);
+  assert.match(buildWorkPrompt(WITH_BROWSER), /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/);
 });
 
 test("the loop prompt omits driving guidance when neither surface is drivable", () => {
   assert.doesNotMatch(
-    buildLoopSystemPrompt(BASE),
+    buildWorkPrompt(BASE),
     /ACT ON ELEMENTS, NOT PIXELS OR GUESSED SELECTORS/,
     "no browser/device tools ⇒ no driving block",
   );

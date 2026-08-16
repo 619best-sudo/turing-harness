@@ -4,14 +4,14 @@
  * A Harness holds shared, stateless configuration (the OpenRouter LLM bridge, model
  * defaults, asset/audit backends) and mints isolated {@link Session}s. Each session
  * runs independently, so a single process — e.g. one Electron app with several
- * project tabs — can run many `runChain`/`runPhase` operations in parallel with no
- * cross-talk (separate registries, logs, permission gates, model overrides, event
- * streams, and abort scopes).
+ * project tabs — can run many categorizer chains in parallel with no cross-talk
+ * (separate registries, logs, permission gates, model overrides, event streams,
+ * and abort scopes).
  *
  * For convenience and backward compatibility, the Harness also exposes a lazily
  * created **default session** and proxies the single-session methods
- * (`runChain`, `runPhase`, `subscribe`, registry APIs, ...) to it. New multi-session
- * code should call {@link Harness.createSession} explicitly.
+ * (`run`, `subscribe`, registry APIs, ...) to it. New multi-session code should
+ * call {@link Harness.createSession} explicitly.
  *
  * Runs in Node and in an Electron main process (pure Node built-ins + fetch).
  */
@@ -23,14 +23,12 @@ import type {
   LLMBridge,
   PermissionCallback,
   PermissionMode,
-  Phase,
-  PhaseResult,
   RunLoopResult,
   ThreadRunSnapshot,
   TranscriptMode,
 } from "./types.js";
 import type {
-  PhaseToolSpec,
+  CategorizerToolSpec,
   ProviderInput,
   ProviderListItem,
   Registry,
@@ -38,7 +36,7 @@ import type {
 } from "./registry/registry.js";
 import type { LogStore } from "./logging/logger.js";
 import type { PermissionGate } from "./orchestrator/permission.js";
-import type { ChainResult, Orchestrator, OrchestratorConfig, RunChainOptions, RunOptions, RunPhaseOptions } from "./orchestrator/orchestrator.js";
+import type { Orchestrator, OrchestratorConfig, RunOptions } from "./orchestrator/orchestrator.js";
 import { OpenRouterBridge } from "./llm/bridge.js";
 import type { McpServerOptions } from "./mcp/client.js";
 import type { AssetsGeneratorConfig } from "./tools/builtin/assets-generator.js";
@@ -114,8 +112,15 @@ export interface HarnessConfig extends Omit<OrchestratorConfig, "registry" | "lo
    * model is configured; default false keeps today's behaviour.
    */
   authorOnlyWrites?: boolean;
-  /** Default custom 4P categorization strategy for new sessions' registries. */
+  /** Default custom scoping strategy for new sessions' registries. */
   categorizer?: ToolCategorizer;
+  /**
+   * Default categorizer setup for new sessions (categories/tools/prompts/models/
+   * transitions). See `categorizer-setup`.
+   */
+  categorizerSetup?: import("./categorizer/setup.js").CategorizerSetup;
+  /** Default extra-tools policy per categorizer for new sessions. */
+  categorizerTools?: Partial<Record<string, CategorizerToolSpec>>;
   /** Default transcript emission mode for new sessions. */
   transcriptMode?: TranscriptMode;
 }
@@ -174,11 +179,11 @@ export class Harness implements AgentHost {
       models: this.config.models,
       toolModelCandidates: this.config.toolModelCandidates,
       ...(this.config.routeModel ? { routeModel: this.config.routeModel } : {}),
-      phaseTools: this.config.phaseTools,
+      categorizerTools: this.config.categorizerTools,
       maxSteps: this.config.maxSteps,
       reasoning: this.config.reasoning,
       temperature: this.config.temperature,
-      maxChainIterations: this.config.maxChainIterations,
+      ...(this.config.categorizerSetup ? { categorizerSetup: this.config.categorizerSetup } : {}),
       transcriptMode: this.config.transcriptMode,
       registerBuiltins: this.config.registerBuiltins,
       assets: this.config.assets,
@@ -398,17 +403,17 @@ export class Harness implements AgentHost {
   addSkill(input: Omit<ProviderInput, "kind"> & { kind?: "skill" }): ProviderListItem {
     return this.default.addSkill(input);
   }
-  toolsForPhase(phase: Phase): AgentTool[] {
-    return this.default.toolsForPhase(phase);
+  toolsForCategorizer(id: string): AgentTool[] {
+    return this.default.toolsForCategorizer(id);
   }
-  setPhaseTools(phase: Phase, spec: PhaseToolSpec | undefined): void {
-    this.default.setPhaseTools(phase, spec);
+  setCategorizerTools(id: string, spec: CategorizerToolSpec | undefined): void {
+    this.default.setCategorizerTools(id, spec);
   }
-  setToolPhases(toolName: string, phases: Phase[]): boolean {
-    return this.default.setToolPhases(toolName, phases);
+  setToolCategorizers(toolName: string, ids: string[]): boolean {
+    return this.default.setToolCategorizers(toolName, ids);
   }
-  setProviderPhases(providerId: string, phases: Phase[]): boolean {
-    return this.default.setProviderPhases(providerId, phases);
+  setProviderCategorizers(providerId: string, ids: string[]): boolean {
+    return this.default.setProviderCategorizers(providerId, ids);
   }
   setPermissionMode(mode: PermissionMode): void {
     this.default.setPermissionMode(mode);
@@ -421,13 +426,7 @@ export class Harness implements AgentHost {
   setPermissionCallback(cb: PermissionCallback | undefined): void {
     this.default.setPermissionCallback(cb);
   }
-  runPhase(phase: Phase, task: string, opts?: RunPhaseOptions): Promise<PhaseResult> {
-    return this.default.runPhase(phase, task, opts);
-  }
-  runChain(task: string, opts?: RunChainOptions): Promise<ChainResult> {
-    return this.default.runChain(task, opts);
-  }
-  /** Flat loop driver — the primary entry point (delegates to the default session). */
+  /** The categorizer chain driver — the primary entry point (delegates to the default session). */
   run(task: string, opts?: RunOptions): Promise<RunLoopResult> {
     return this.default.run(task, opts);
   }
@@ -436,12 +435,6 @@ export class Harness implements AgentHost {
   }
   clearThreadSnapshot(): void {
     this.default.clearThreadSnapshot();
-  }
-  phaseTools(): AgentTool[] {
-    return this.default.phaseTools();
-  }
-  chainTool(): AgentTool {
-    return this.default.chainTool();
   }
   createAgent(opts?: HarnessAgentOptions): HarnessAgent {
     return this.default.createAgent(opts);

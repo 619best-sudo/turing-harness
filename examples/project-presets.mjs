@@ -5,6 +5,7 @@
  *
  * Run:  node examples/project-presets.mjs
  */
+// v2 note: this example now drives the categorizer chain via run().
 import assert from "node:assert";
 import { Harness, PROJECT_PRESETS, resolveModel } from "../dist/index.js";
 
@@ -54,7 +55,7 @@ async function main() {
   const rec = [];
   const h2 = new Harness({ llm: makeFake(rec), permissionMode: "bypass" });
   const s2 = h2.createSession({ preset: "mobile" });
-  await s2.runChain("build a screen");
+  await s2.run("build a screen");
   const modelFor = (p) => rec.find((r) => r.phase === p)?.model;
   assert.equal(modelFor("plan"), "anthropic/claude-opus-4.8", "mobile plan → opus");
   assert.equal(modelFor("perform"), "anthropic/claude-sonnet-4.5", "mobile perform → sonnet");
@@ -64,7 +65,7 @@ async function main() {
   const rec2 = [];
   const h3 = new Harness({ llm: makeFake(rec2), permissionMode: "bypass" });
   const s3 = h3.createSession({ preset: "frontend", models: { perform: "anthropic/claude-haiku-4.5" } });
-  await s3.runChain("tweak css");
+  await s3.run("tweak css");
   assert.equal(rec2.find((r) => r.phase === "perform")?.model, "anthropic/claude-haiku-4.5", "explicit model overrides preset");
 
   // ---- 4. Opt-in MCP connect: graceful skip (missing config) + fail paths ----

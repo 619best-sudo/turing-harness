@@ -251,50 +251,77 @@ test("a driver that smuggles content anyway is ignored — the author still writ
 
 /** Run the orchestrator over one edit and report the authoring task the tool saw. */
 async function runOrchestrated({ skipPlan }) {
+  // v2: `skipPlan` no longer gates a planning turn (create_plan always runs in
+  // write_edit); both shapes exercise the same chain here.
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `matrix-orch-${skipPlan}-`));
   const target = path.join(dir, "index.html");
   await fs.writeFile(target, SEED);
 
   let seenTask = null;
+  let seenPlanJson = null;
   const spyEdit = {
     ...createCodingTools({ authorOnlyWrites: true }).find((t) => t.name === "edit"),
     async execute(_id, _a, ctx) {
       seenTask = ctx.authoringContext?.task ?? null;
+      seenPlanJson = ctx.authoringContext?.planJson ?? null;
       return { output: "edited" };
     },
   };
 
   const llm = new OpenRouterBridge();
-  llm.complete = async (model) => ({
-    role: "assistant", content: [{ type: "text", text: "ok" }],
-    model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
-    usage: zeroUsage(), stopReason: "stop", timestamp: 0,
-  });
+  let routerCalls = 0;
+  llm.complete = async (model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return {
+        role: "assistant", content: [{ type: "text", text: `CATEGORY: ${routerCalls <= 1 ? "write_edit" : "summarise"}` }],
+        model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+        usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+      };
+    }
+    if (/breaking a task into an ordered implementation plan/.test(sys)) {
+      return {
+        role: "assistant", content: [{ type: "text", text: `PLANS_JSON:\n${JSON.stringify({
+          plans: [{
+            id: "p1", title: "Rename the page title", summary: INTENT,
+            tasks: [{
+              id: "t1", order: 1, title: "Rename the page title",
+              summary: "Set the document title to ToottyFruity",
+              files: [target], fileMutations: { [target]: "edit" }, complexity: "low",
+              verification: "the title reads ToottyFruity",
+            }],
+          }],
+          executionOrder: ["p1"],
+        })}` }],
+        model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+        usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+      };
+    }
+    return {
+      role: "assistant", content: [{ type: "text", text: "ok" }],
+      model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+      usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+    };
+  };
 
   let turn = 0;
   llm.stream = async function* () {
     turn += 1;
     yield { type: "start", partial: msg([]) };
-    // In planned mode the first turn is the planning turn: emit a plan, then edit.
-    if (!skipPlan && turn === 1) {
-      yield { type: "done", message: msg([{ type: "text", text: `PLAN_JSON\n${JSON.stringify({
-        task: INTENT,
-        tasks: [{
-          id: "t1", order: 1, title: "Rename the page title",
-          summary: "Set the document title to ToottyFruity",
-          files: [target], complexity: "low", verification: "the title reads ToottyFruity",
-        }],
-      })}` }]) };
+    // v2 write_edit: plan → edit → deliver.
+    if (turn === 1) {
+      yield { type: "done", message: msg([{ type: "toolCall", id: "p1", name: "create_plan", arguments: { task: INTENT } }], "tool_use") };
       return;
     }
-    if (!seenTask) {
+    if (turn === 2) {
       yield { type: "done", message: msg([{
         type: "toolCall", id: "e1", name: "edit",
         arguments: { path: target, oldString: "<title>Realistic Solar System Animation</title>" },
       }], "tool_use") };
       return;
     }
-    yield { type: "done", message: msg([{ type: "text", text: "done" }]) };
+    yield { type: "done", message: msg([{ type: "toolCall", id: "d1", name: "deliver", arguments: { writes: [{ tool: "edit", path: target }], notes: "done" } }], "tool_use") };
   };
 
   const registry = new Registry();
@@ -305,24 +332,24 @@ async function runOrchestrated({ skipPlan }) {
     logStore: new LogStore(),
     models: { plan: "test/cheap", perform: "test/cheap" },
   });
-  orch.resolveLoopTools = () => [spyEdit];
+  // The spy edit replaces the registered one for this run's write_edit hop.
+  orch.setCategorizerTools("write_edit", [spyEdit, registry.getTool("create_plan"), registry.getTool("deliver")].filter(Boolean));
 
   await orch.run(INTENT, { skipPlan });
-  return seenTask;
+  return { seenTask, seenPlanJson };
 }
 
 test("planless (the agent default) hands the author the run task", async () => {
-  const task = await runOrchestrated({ skipPlan: true });
-  assert.ok(task, "planless builds an authoring context");
-  assert.match(task, /ToottyFruity/);
+  const { seenTask } = await runOrchestrated({ skipPlan: true });
+  assert.ok(seenTask, "planless builds an authoring context");
+  assert.match(seenTask, /ToottyFruity/);
 });
 
-test("planned mode hands the author the STEP's intent, not just the run task", async () => {
-  const task = await runOrchestrated({ skipPlan: false });
-  assert.ok(task, "planned mode builds an authoring context");
-  assert.match(task, /ToottyFruity/);
-  assert.match(task, /This step:/, "the step's own goal is stated");
-  assert.match(task, /Done when:/, "the step's verification reaches the author");
+test("planned mode hands the author the plan's tasks, not just the run task", async () => {
+  const { seenTask, seenPlanJson } = await runOrchestrated({ skipPlan: false });
+  assert.ok(seenTask, "planned mode builds an authoring context");
+  assert.match(seenTask, /ToottyFruity/);
+  assert.ok(Array.isArray(seenPlanJson) && seenPlanJson.length, "the plan's tasks reach the author");
 });
 
 // ---------------------------------------------------------------------------

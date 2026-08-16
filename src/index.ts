@@ -1,12 +1,12 @@
 /**
- * turing-harness — a 4P (Prepare, Plan, Perform, Perfect) coding-agent
- * orchestration library.
+ * turing-harness — a categorizer-chain coding-agent orchestration library (v2).
  *
  * - Multimodal (file/image/video/audio)                          (req #1)
  * - pi-compatible types & event stream                           (req #2)
- * - MCP/skills/tools registry with get/add/delete + 4P category  (req #3)
- * - Orchestrated 4P chain with Perfect→Perform verify/retry      (req #4)
- * - Customizable per-phase & per-tool models over OpenRouter     (req #5)
+ * - MCP/skills/tools registry scoped by categorizer              (req #3)
+ * - Categorizer chain: router → focused categorizer hops →
+ *   summary, with per-categorizer orchestrator models            (req #4)
+ * - Customizable per-categorizer & per-tool models over OpenRouter (req #5)
  * - Internal tools: assets_generator, media_analysis,
  *   activity_monitor                                             (req #6)
  * - Orchestrator does no file reasoning / no writes; permission
@@ -38,28 +38,36 @@ export {
   type AgentHost,
 } from "./agent.js";
 
-// ---- Orchestrator / phases / permissions ----
+// ---- Orchestrator / categorizers / permissions ----
 export {
   Orchestrator,
   type OrchestratorConfig,
-  type ChainResult,
   type ChainRoute,
-  type AfterPrepareHook,
-  type RunPhaseOptions,
   type RunOptions,
   type PhaseModelConfig,
+  buildRunThreadSnapshotForTest,
 } from "./orchestrator/orchestrator.js";
-export { PermissionGate } from "./orchestrator/permission.js";
+// The categorizer chain (v2 run driver) + setup/mention/router/deliver pieces.
 export {
-  VerificationGate,
-  parseDeclarations,
-  type VerificationDeclaration,
-  type VerificationGap,
-  type VerificationReport,
-  type VerificationGateOptions,
-  type VerificationMethod,
-  type VerificationOutcome,
-} from "./orchestrator/verification-gate.js";
+  runCategorizerChain,
+  type CategorizerChainInput,
+  type CategorizerChainResult,
+} from "./categorizer/chain.js";
+export { routeCategorizer, heuristicRoute, type RouterChoice, type RouteCategorizerInput, type RouteCategorizerResult } from "./categorizer/router.js";
+export {
+  createDeliverTool,
+  deriveFallbackDeliverable,
+  DELIVER_TOOL_NAME,
+  type DeliverBox,
+} from "./categorizer/deliver.js";
+export { createClearingDoubtTool, CLEARING_DOUBT_TOOL_NAME, DEFAULT_DOUBT_MODEL } from "./categorizer/clearing-doubt.js";
+export {
+  extractMentionTokens,
+  resolveMentions,
+  renderMentionNote,
+  type MentionResolution,
+} from "./categorizer/mentions.js";
+export { PermissionGate } from "./orchestrator/permission.js";
 export {
   ClarifyGate,
   type ClarifyDecision,
@@ -93,32 +101,11 @@ export {
   type MobileStack,
 } from "./exec/run-commands.js";
 export {
-  QaGate,
-  callSurface,
-  deployKind,
-  isCaptureTool,
-  isDriveTool,
-  isInspectTool,
-  type QaBlockReason,
-  type QaDecision,
-  type QaGateOptions,
-  type QaSurface,
-} from "./orchestrator/qa-gate.js";
-export {
   scopeImagesForTarget,
   ambiguityNote,
   type ImageScope,
   type ImageScopeReason,
 } from "./multimodal/attachment-routing.js";
-export {
-  coordinateRunHandoff,
-  detectSurfaces,
-  needsRunningApp,
-  type RunHandoffResult,
-  type HandoffMode,
-  type Surfaces,
-  type CoordinateRunHandoffInput,
-} from "./orchestrator/run-handoff.js";
 export {
   newRunId,
   runArtifactDir,
@@ -126,7 +113,6 @@ export {
   listEvidence,
   writeEvidence,
 } from "./orchestrator/verify-artifacts.js";
-export { runPhase, type PhaseRunInput } from "./orchestrator/phase-runner.js";
 export { runToolLoop, type ToolLoopInput, type ToolLoopResult } from "./orchestrator/loop.js";
 export { suggestToolName, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage, levenshtein } from "./orchestrator/tool-suggest.js";
 export {
@@ -136,7 +122,6 @@ export {
   type CoercedArg,
   type CoercionResult,
 } from "./orchestrator/tool-arg-coercion.js";
-export { assessStraightforward, scanForConcurrencyRisk, isSourceFile } from "./orchestrator/straightforward-assessor.js";
 export {
   ToolFallbackAdvisor,
   type FallbackAdvice,
@@ -172,16 +157,9 @@ export {
   resolveCompactionThreshold,
   COMPACTION_ENV_VAR,
 } from "./orchestrator/compaction.js";
+// ---- Guidance blocks + categorizer prompts (moved from the retired 4P prompts) ----
 export {
-  PHASE_PROMPTS,
-  buildPhaseSystemPrompt,
-  buildLoopSystemPrompt,
   COMPLEXITY_CONTRACT,
-  PHASE_DEFAULT_TOOLS,
-  INTENT_ROUTER_PROMPT,
-  CONVERSATIONAL_PROMPT,
-  CONVERSATIONAL_LOOKUP,
-  LOOP_SYSTEM_PROMPT,
   FILE_SEARCH_LADDER,
   WEB_AND_SCRAPING,
   CODE_CHANGE_ATTENTION,
@@ -195,7 +173,18 @@ export {
   INSPIRATION_REUSE,
   VERIFY_WHAT_YOU_WROTE,
   BUILD_TYPECHECK_COMMANDS,
-} from "./phases/prompts.js";
+  DRIVING_AUTOMATION,
+  QA_SEQUENCE,
+  CONVERSATIONAL_PROMPT,
+  CONVERSATIONAL_LOOKUP,
+} from "./categorizer/guidance.js";
+export {
+  buildCategorizerSystemPrompt,
+  DEFAULT_CATEGORIZER_PROMPTS,
+  DEFAULT_ROUTER_PROMPT,
+  DEFAULT_DELIVER_SCHEMAS,
+  type CategorizerPromptOptions,
+} from "./categorizer/prompts.js";
 export {
   CODE_RISK_SITES,
   CODE_RISK_FOR_RATING,
@@ -213,10 +202,35 @@ export {
   type ProviderSource,
   type RegistryEvent,
   type ToolCategorizer,
-  type PhaseToolSpec,
-  type PhaseToolFilter,
-  type PhaseToolResolver,
+  type CategorizerToolSpec,
+  type CategorizerToolFilter,
+  type CategorizerToolResolver,
 } from "./registry/registry.js";
+export {
+  defineCategorizer,
+  createCategorizerSetup,
+  createDefaultCategorizers,
+  getCategory,
+  entryCategories,
+  DEFAULT_CATEGORIZER_SETUP,
+  DEFAULT_GLOBAL_TOOLS,
+  type CategorizerSetup,
+} from "./categorizer/setup.js";
+export type {
+  CategorizerDefinition,
+  CategorizerId,
+  CategorizerAcceptSpec,
+  CategorizerReturnSpec,
+  CategorizerHop,
+  CategorizerToolRecord,
+  CategorizerDeliverable,
+  ReadDeliverable,
+  ReadDeliverableFile,
+  WriteDeliverable,
+  WriteRecord,
+  InspectDeliverable,
+  SummaryDeliverable,
+} from "./categorizer/types.js";
 export { categorizeTool, categorizeProvider } from "./registry/categorize.js";
 export { defineSkill, type SkillDefinition } from "./registry/skill.js";
 

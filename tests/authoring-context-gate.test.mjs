@@ -533,23 +533,50 @@ test("a planless run still hands the authoring model the task", async () => {
   };
 
   const llm = new OpenRouterBridge();
-  llm.complete = async (model) => ({
-    role: "assistant", content: [{ type: "text", text: "ok" }],
-    model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
-    usage: zeroUsage(), stopReason: "stop", timestamp: 0,
-  });
+  let routerCalls = 0;
+  llm.complete = async (model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return {
+        role: "assistant", content: [{ type: "text", text: `CATEGORY: ${routerCalls <= 1 ? "write_edit" : "summarise"}` }],
+        model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+        usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+      };
+    }
+    if (/breaking a task into an ordered implementation plan/.test(sys)) {
+      const plan = {
+        plans: [{ id: "p1", title: "Rename", summary: "x", tasks: [{ id: "t1", order: 1, title: "Rename", summary: "x", files: [target], fileMutations: { [target]: "edit" }, complexity: "low" }] }],
+        executionOrder: ["p1"],
+      };
+      return {
+        role: "assistant", content: [{ type: "text", text: `PLANS_JSON:\n${JSON.stringify(plan)}` }],
+        model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+        usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+      };
+    }
+    return {
+      role: "assistant", content: [{ type: "text", text: "ok" }],
+      model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+      usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+    };
+  };
   let turn = 0;
   llm.stream = async function* () {
     turn += 1;
     yield { type: "start", partial: msg([]) };
     if (turn === 1) {
+      yield { type: "done", message: msg([{ type: "toolCall", id: "p1", name: "create_plan", arguments: { task: "the change" } }], "tool_use") };
+      return;
+    }
+    if (turn === 2) {
       yield { type: "done", message: msg([{
         type: "toolCall", id: "e1", name: "edit",
         arguments: { path: target, oldString: "<title>Realistic Solar System Animation</title>" },
       }], "tool_use") };
       return;
     }
-    yield { type: "done", message: msg([{ type: "text", text: "done" }]) };
+    yield { type: "done", message: msg([{ type: "toolCall", id: "d1", name: "deliver", arguments: { writes: [], notes: "done" } }], "tool_use") };
   };
 
   const registry = new Registry();
@@ -563,10 +590,9 @@ test("a planless run still hands the authoring model the task", async () => {
     logStore: new LogStore(),
     models: { plan: "test/cheap", perform: "test/cheap" },
   });
-  // The work loop takes its tools from `registry.allTools()`, so swap the
-  // resolver rather than passing `tools` (which is a runPhase option, not a
-  // run-loop one) — otherwise the real edit tool runs and observes nothing.
-  orch.resolveLoopTools = () => [spyEdit];
+  // Pin the spy edit into the write_edit hop (extras override same-named
+  // defaults), so the real edit tool does not run and observe nothing.
+  orch.setCategorizerTools("write_edit", [spyEdit]);
 
   await orch.run("Change the page title to ToottyFruity", { skipPlan: true });
 

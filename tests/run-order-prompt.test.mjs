@@ -11,18 +11,16 @@ import assert from "node:assert/strict";
 
 import {
   RUN_ORDER,
-  LOOP_SYSTEM_PROMPT,
   GUIDELINE_CONTRACT,
   MEDIA_UNDERSTANDING,
-  buildLoopSystemPrompt,
-  buildPhaseSystemPrompt,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 
 test("the loop carries the run order verbatim, right after the contract", () => {
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(RUN_ORDER), "the loop carries it verbatim");
-  const contractAt = LOOP_SYSTEM_PROMPT.indexOf(GUIDELINE_CONTRACT);
-  const orderAt = LOOP_SYSTEM_PROMPT.indexOf(RUN_ORDER);
-  const mediaAt = LOOP_SYSTEM_PROMPT.indexOf(MEDIA_UNDERSTANDING);
+  assert.ok(WORK_PROMPT.includes(RUN_ORDER), "the loop carries it verbatim");
+  const contractAt = WORK_PROMPT.indexOf(GUIDELINE_CONTRACT);
+  const orderAt = WORK_PROMPT.indexOf(RUN_ORDER);
+  const mediaAt = WORK_PROMPT.indexOf(MEDIA_UNDERSTANDING);
   assert.ok(contractAt < orderAt, "the contract frames the guidance, so it comes first");
   assert.ok(orderAt < mediaAt, "the map precedes the blocks it is a map of");
 });
@@ -94,13 +92,13 @@ test("the run order names no visual tool, so a backend prompt stays clean", () =
   // deliberately excludes it — so the map points at the block instead.
   assert.doesNotMatch(RUN_ORDER, /inspiration_generator/);
   assert.doesNotMatch(RUN_ORDER, /assets_generator/);
-  const backend = buildLoopSystemPrompt(undefined, { projectCategory: "backend" });
+  const backend = buildWorkPrompt(undefined, { projectCategory: "backend" });
   assert.ok(backend.includes(RUN_ORDER), "the map is still carried on a backend run");
   assert.doesNotMatch(backend, /inspiration_generator/);
 });
 
 test("perform carries the map too — the phase that does the work", () => {
-  const perform = buildPhaseSystemPrompt("perform");
+  const perform = buildPhaseLikePrompt("perform");
   assert.ok(perform.includes(RUN_ORDER));
 });
 
@@ -117,7 +115,7 @@ test("QA_SEQUENCE states the eight steps in order, with the automation step", as
   // before any server existed, opened the trace AFTER inspecting, started the
   // server three times, and took its own raw screenshots beside activity_inspect.
   // The sequence is now numbered 1-8 and each step names its predecessor's gate.
-  const { QA_SEQUENCE } = await import("../dist/phases/prompts.js");
+  const { QA_SEQUENCE } = await import("../dist/categorizer/guidance.js");
   const steps = [
     /1\. LOG /,
     /2\. BUILD /,
@@ -138,7 +136,7 @@ test("QA_SEQUENCE states the eight steps in order, with the automation step", as
 });
 
 test("QA_SEQUENCE forbids the out-of-order moves real runs made", async () => {
-  const { QA_SEQUENCE } = await import("../dist/phases/prompts.js");
+  const { QA_SEQUENCE } = await import("../dist/categorizer/guidance.js");
   // Inspect only after the run is up and carrying the new build.
   assert.match(QA_SEQUENCE, /never before the run is up/);
   assert.match(QA_SEQUENCE, /photographs no screen or the OLD code/);

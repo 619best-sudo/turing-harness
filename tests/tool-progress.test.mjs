@@ -15,7 +15,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { Harness, resolveModel } from "../dist/index.js";
+import { runToolLoop, PermissionGate, LogStore, Registry, resolveModel } from "../dist/index.js";
 
 function zeroUsage() {
   return {
@@ -37,7 +37,7 @@ function reportingTool(onExecute) {
     name: "slow_thing",
     description: "Reports progress while it works.",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     parameters: { type: "object", properties: {}, required: [] },
     async execute(_id, _args, ctx) {
       onExecute?.(ctx);
@@ -66,21 +66,28 @@ function fakeLLM(toolName) {
   };
 }
 
-async function harnessWithTool(tool) {
+/** Drive the v2 tool loop directly with the given tool + fake LLM. */
+async function loopWithTool(tool, task) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "tool-progress-"));
-  const harness = new Harness({ llm: fakeLLM(tool.name), cwd, permissionMode: "bypass" });
-  harness.registry.add({
-    id: "test:slow", kind: "tool", source: "internal", name: tool.name, tools: [tool],
+  const llm = fakeLLM(tool.name);
+  const events = [];
+  await runToolLoop({
+    task,
+    systemPrompt: "test loop",
+    userMessage: task,
+    tools: [tool],
+    model: llm.resolveModel("fake/model"),
+    llm,
+    permission: new PermissionGate("bypass"),
+    logStore: new LogStore(),
+    emit: (e) => events.push(e),
+    cwd,
   });
-  return { harness, cwd };
+  return { events, cwd };
 }
 
 test("progress from inside a tool reaches the host as tool_execution_update", async () => {
-  const { harness, cwd } = await harnessWithTool(reportingTool());
-  const events = [];
-  harness.subscribe((e) => events.push(e));
-
-  await harness.runPhase("perform", "do the slow thing");
+  const { events, cwd } = await loopWithTool(reportingTool(), "do the slow thing");
 
   const updates = events.filter((e) => e.type === "tool_execution_update");
   assert.equal(updates.length, 2, "both reports are emitted");
@@ -106,7 +113,6 @@ test("progress from inside a tool reaches the host as tool_execution_update", as
     "tool_execution_end",
   ]);
 
-  await harness.dispose();
   await fs.rm(cwd, { recursive: true, force: true });
 });
 
@@ -119,7 +125,7 @@ test("progress reported after the call settles is dropped, not emitted out of or
     name: "leaky_thing",
     description: "Keeps a reference to progress after returning.",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     parameters: { type: "object", properties: {}, required: [] },
     async execute(_id, _args, ctx) {
       leaked = ctx.progress;
@@ -128,11 +134,7 @@ test("progress reported after the call settles is dropped, not emitted out of or
     },
   };
 
-  const { harness, cwd } = await harnessWithTool(leakyTool);
-  const events = [];
-  harness.subscribe((e) => events.push(e));
-
-  await harness.runPhase("perform", "do the leaky thing");
+  const { events, cwd } = await loopWithTool(leakyTool, "do the leaky thing");
   const before = events.filter((e) => e.type === "tool_execution_update").length;
   assert.equal(before, 1, "the in-call report is emitted");
 
@@ -140,7 +142,6 @@ test("progress reported after the call settles is dropped, not emitted out of or
   const after = events.filter((e) => e.type === "tool_execution_update").length;
   assert.equal(after, before, "a post-settle report is dropped");
 
-  await harness.dispose();
   await fs.rm(cwd, { recursive: true, force: true });
 });
 
@@ -149,25 +150,20 @@ test("a tool that never reports still runs — progress is optional", async () =
     name: "silent_thing",
     description: "Reports nothing.",
     mutates: false,
-    phases: ["prepare", "plan", "perform", "perfect"],
+    categorizers: ["conversation", "read", "write_edit", "activity_inspect"],
     parameters: { type: "object", properties: {}, required: [] },
     async execute() {
       return { output: "quiet success" };
     },
   };
 
-  const { harness, cwd } = await harnessWithTool(silentTool);
-  const events = [];
-  harness.subscribe((e) => events.push(e));
-
-  await harness.runPhase("perform", "do the silent thing");
+  const { events, cwd } = await loopWithTool(silentTool, "do the silent thing");
 
   assert.equal(events.filter((e) => e.type === "tool_execution_update").length, 0);
   const end = events.find((e) => e.type === "tool_execution_end");
   assert.ok(end, "the call still completes normally");
   assert.equal(end.isError, false);
 
-  await harness.dispose();
   await fs.rm(cwd, { recursive: true, force: true });
 });
 
@@ -176,15 +172,13 @@ test("ctx.progress is present for tools in the flat work loop too", async () => 
   // only gets `progress` on one of them would silently go quiet depending on the
   // run mode, so assert the context itself.
   let sawProgress;
-  const { harness, cwd } = await harnessWithTool(
+  const { cwd } = await loopWithTool(
     reportingTool((ctx) => {
       sawProgress = typeof ctx.progress === "function";
     }),
+    "do the slow thing",
   );
-
-  await harness.runChain("do the slow thing");
   assert.equal(sawProgress, true, "the work loop must supply ctx.progress");
 
-  await harness.dispose();
   await fs.rm(cwd, { recursive: true, force: true });
 });

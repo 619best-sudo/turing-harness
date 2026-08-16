@@ -19,14 +19,13 @@ import path from "node:path";
 
 import {
   DEBUGGING_LOOP,
-  LOOP_SYSTEM_PROMPT,
   LogStore,
-  PHASE_PROMPTS,
   Registry,
   createActivityMonitorTools,
   registerBuiltins,
   setLocalDeviceProbe,
 } from "../dist/index.js";
+import { WORK_PROMPT, READ_PROMPT, INSPECT_PROMPT, CATEGORIZER_PROMPTS, buildWorkPrompt, buildPhaseLikePrompt } from "./helpers/v2-prompts.mjs";
 import { setMobileCliOverride, setMobileCliAvailableOverride } from "../dist/devices/mobilecli.js";
 import { traceMarker } from "../dist/probe-marker.js";
 import { fakeMobileCli } from "./fake-mobilecli.mjs";
@@ -339,16 +338,16 @@ test("the work loop's system prompt teaches the trace workflow", () => {
     "activity_inspect",
     "activity_tail_file",
   ]) {
-    assert.ok(LOOP_SYSTEM_PROMPT.includes(name), `the loop prompt must name ${name}`);
+    assert.ok(WORK_PROMPT.includes(name), `the loop prompt must name ${name}`);
   }
   // The steps have to be ordered, and the instrumenting has to be owned by the model.
-  const startAt = LOOP_SYSTEM_PROMPT.indexOf("activity_trace_start");
-  const collectAt = LOOP_SYSTEM_PROMPT.indexOf("activity_collect");
-  const cleanupAt = LOOP_SYSTEM_PROMPT.indexOf("activity_cleanup");
+  const startAt = WORK_PROMPT.indexOf("activity_trace_start");
+  const collectAt = WORK_PROMPT.indexOf("activity_collect");
+  const cleanupAt = WORK_PROMPT.indexOf("activity_cleanup");
   assert.ok(startAt < collectAt && collectAt < cleanupAt, "the workflow must be given in order");
-  assert.match(LOOP_SYSTEM_PROMPT, /YOU place\s+the calls with `read`\/`edit`/);
+  assert.match(WORK_PROMPT, /YOU place\s+the calls with `read`\/`edit`/);
   // And the specific wrong turn we saw is called out.
-  assert.match(LOOP_SYSTEM_PROMPT, /Do NOT go hunting for trace files with bash/);
+  assert.match(WORK_PROMPT, /Do NOT go hunting for trace files with bash/);
 });
 
 test("every activity tool the prompt names is actually registered", () => {
@@ -357,7 +356,7 @@ test("every activity tool the prompt names is actually registered", () => {
   const reg = new Registry();
   registerBuiltins(reg, { logStore: new LogStore() });
   const registered = new Set(reg.allTools().map((t) => t.name));
-  const named = [...LOOP_SYSTEM_PROMPT.matchAll(/activity_[a-z_]+/g)].map((m) => m[0]);
+  const named = [...WORK_PROMPT.matchAll(/activity_[a-z_]+/g)].map((m) => m[0]);
   assert.ok(named.length >= 8);
   for (const name of new Set(named)) {
     assert.ok(registered.has(name), `${name} is named in the prompt but not registered`);
@@ -983,12 +982,10 @@ test("the debugging guidance encodes the whole loop, not just the tools", () => 
   assert.match(DEBUGGING_LOOP, /the same hypothesis twice is not/);
   assert.match(DEBUGGING_LOOP, /Never report a bug as fixed on the strength of the code looking right/);
 
-  assert.ok(LOOP_SYSTEM_PROMPT.includes(DEBUGGING_LOOP));
-  for (const phase of ["perform", "perfect"]) {
-    assert.ok(PHASE_PROMPTS[phase].includes(DEBUGGING_LOOP), `missing from ${phase}`);
-  }
+  assert.ok(WORK_PROMPT.includes(DEBUGGING_LOOP));
+  assert.ok(CATEGORIZER_PROMPTS.activity_inspect.includes(DEBUGGING_LOOP), "missing from activity_inspect");
   // The old, thinner RUNTIME DEBUGGING section is retired, not left to drift.
-  assert.doesNotMatch(LOOP_SYSTEM_PROMPT, /RUNTIME DEBUGGING \(when reading/);
+  assert.doesNotMatch(WORK_PROMPT, /RUNTIME DEBUGGING \(when reading/);
 });
 
 // ---------------------------------------------------------------------------
