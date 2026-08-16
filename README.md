@@ -51,7 +51,6 @@ const harness = new Harness({
   cwd: "/path/to/project",
   permissionMode: "ask-mutations",
   permissionCallback: async (req) => ({ allowed: true }),
-  models: { prepare: "xiaomi/mimo-v2.5", perform: "xiaomi/mimo-v2.5", perfect: "xiaomi/mimo-v2.5" },
 });
 
 const unsub = harness.subscribe((event) => { /* see events below */ });
@@ -108,11 +107,13 @@ const deploy = defineCategorizer({
   children: [],
   accepts: { from: ["activity_inspect"] },
   returns: { kind: "summary", description: "The deploy result" },
-  model: "qwen/qwen3-coder",       // this categorizer's own orchestrator model
+  model: "qwen/qwen3-coder",       // this categorizer's own orchestrator (driver) model
 });
 
 export const setup = createCategorizerSetup({
   categories: [...DEFAULT_CATEGORIZER_SETUP.categories, deploy],
+  routerModel: "xiaomi/mimo-v2.5",  // the router turn
+  summaryModel: "xiaomi/mimo-v2.5", // the closing summary turn
   doubtModel: "tencent/hy3",        // the big model clearing_doubt consults
   maxHops: 8,
 });
@@ -156,9 +157,10 @@ otherwise the plan auto-approves silently.
   (`routeModel({kind:"read"})`); measured ratings ratchet per-path floors.
 - **Plan-task floors**: a plan task's `complexity` becomes the floor for
   write/edit on its files; plan JSON reaches Model B's authoring context.
-- Role-slot config (`models`) is kept for compatibility: `prepare` = router +
-  conversation, `perform` = work categorizers, `perfect` = summary turn,
-  `orchestrator` = doubt-model fallback.
+- **Where models are configured (v2)**: entirely in the categorizer setup —
+  each category's `model` (its driver), plus `routerModel` / `summaryModel` /
+  `doubtModel` chain-wide. A category without a `model` drives on the work-tier
+  default (conversation on the cheap tier).
 
 ## clearing_doubt
 
@@ -210,6 +212,11 @@ presets re-apply when the category changed.
 - `Phase`/`PHASES`/`PhaseResult`/`PhaseHandoff` types; `AgentTool.phases` →
   `AgentTool.categorizers`; `PermissionRequest.phase`/`AskUserQuestionRequest.phase`
   are now optional strings carrying the categorizer id.
+- The `models: { prepare, plan, perform, perfect }` role-slot CONFIG — model
+  selection is configured in the categorizer setup now (see above). The old
+  keys and `setModel("<slot>", …)` still work as hidden compat aliases
+  (`prepare`→router/conversation tier, `perform`→work tier, `perfect`→summary
+  turn, `orchestrator`→doubt fallback), but new code should not use them.
 - The reproduce/verify/QA gates: reproduction and verification are the
   `activity_inspect` categorizer's job (a bug report routes read → inspect →
   write_edit; `RunLoopResult.verified` comes from the inspect verdict;

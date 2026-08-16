@@ -60,16 +60,9 @@ async function main() {
   const harness = new Harness({
     apiKey: process.env.OPENROUTER_API_KEY,
     permissionMode: "bypass",
-    models: { orchestrator: MODEL, prepare: MODEL, plan: MODEL, perform: MODEL, perfect: MODEL },
-    toolModelCandidates: [MODEL],
+        toolModelCandidates: [MODEL],
     studyModel: MODEL,
-    maxSteps: {
-      prepare: Number(process.env.PREPARE_STEPS ?? 5),
-      plan:    Number(process.env.PLAN_STEPS ?? 5),
-      perform: Number(process.env.PERFORM_STEPS ?? 24),
-      perfect: Number(process.env.PERFECT_STEPS ?? 14),
-    },
-    maxChainIterations: Number(process.env.MAX_ITER ?? 2),
+        maxChainIterations: Number(process.env.MAX_ITER ?? 2),
   });
 
   // Mobile preset → Mobile MCP for Perfect (drives iOS / Android simulator).
@@ -80,8 +73,8 @@ async function main() {
   });
 
   console.log("preset MCP → connected:", report.connected, "| skipped:", report.skipped.map((s) => s.id), "| failed:", report.failed.map((f) => f.id));
-  const perfectTools = session.toolsForPhase("perfect").map((t) => t.name);
-  console.log("perfect has mobile tools:", perfectTools.filter((n) => /^(mobile_|simulator_)/.test(n) || /ios|android|simulator/i.test(n)).join(", ") || "(none yet)");
+  const inspectTools = session.toolsForCategorizer("activity_inspect").map((t) => t.name);
+  console.log("perfect has mobile tools:", inspectTools.filter((n) => /^(mobile_|simulator_)/.test(n) || /ios|android|simulator/i.test(n)).join(", ") || "(none yet)");
   console.log("");
 
   // Metro is owned by the MODEL, not the harness. An earlier version of this

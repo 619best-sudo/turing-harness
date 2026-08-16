@@ -83,16 +83,9 @@ async function main() {
   const harness = new Harness({
     apiKey: process.env.OPENROUTER_API_KEY,
     permissionMode: "bypass",
-    models: { orchestrator: MODEL, prepare: MODEL, plan: MODEL, perform: MODEL, perfect: MODEL },
-    toolModelCandidates: [MODEL],
+        toolModelCandidates: [MODEL],
     studyModel: MODEL,
-    maxSteps: {
-      prepare: Number(process.env.PREPARE_STEPS ?? 5),
-      plan: Number(process.env.PLAN_STEPS ?? 5),
-      perform: Number(process.env.PERFORM_STEPS ?? 16),
-      perfect: Number(process.env.PERFECT_STEPS ?? 10),
-    },
-    maxChainIterations: Number(process.env.MAX_ITER ?? 2),
+        maxChainIterations: Number(process.env.MAX_ITER ?? 2),
   });
 
   const { session, report } = await harness.createProjectSession("frontend", {

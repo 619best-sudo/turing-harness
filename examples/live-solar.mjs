@@ -23,11 +23,9 @@ async function main() {
     apiKey: process.env.OPENROUTER_API_KEY,
     cwd: OUT,
     permissionMode: "bypass",
-    models: { orchestrator: MODEL, prepare: MODEL, plan: MODEL, perform: MODEL, perfect: MODEL },
-    toolModelCandidates: [MODEL],
+        toolModelCandidates: [MODEL],
     studyModel: MODEL,
-    maxSteps: { prepare: 4, plan: 4, perform: Number(process.env.PERFORM_STEPS ?? 16), perfect: Number(process.env.PERFECT_STEPS ?? 10) },
-    maxChainIterations: Number(process.env.MAX_ITER ?? 4),
+        maxChainIterations: Number(process.env.MAX_ITER ?? 4),
   });
 
   const t0 = Date.now();

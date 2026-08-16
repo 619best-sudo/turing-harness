@@ -130,11 +130,9 @@ async function main() {
   const harness = new Harness({
     apiKey: process.env.OPENROUTER_API_KEY,
     permissionMode: "bypass",
-    models: { orchestrator: MODEL, prepare: MODEL, plan: MODEL, perform: MODEL, perfect: MODEL },
-    toolModelCandidates: [MODEL],
+        toolModelCandidates: [MODEL],
     studyModel: MODEL,
-    maxSteps: { prepare: 5, plan: 5, perform: 30, perfect: 18 },
-    maxChainIterations: 3,
+        maxChainIterations: 3,
   });
 
   // Frontend preset + connect ONLY Playwright (Perfect gets browser tools).
@@ -142,7 +140,7 @@ async function main() {
     cwd: OUT, connectMcp: true, include: ["playwright"],
   });
   console.log("preset MCP → connected:", report.connected, "| skipped:", report.skipped.map((s) => s.id), "| failed:", report.failed.map((f) => f.id));
-  console.log("perfect has browser tools:", session.toolsForPhase("perfect").some((t) => t.name === "browser_snapshot"), "\n");
+  console.log("activity_inspect has browser tools:", session.toolsForCategorizer("activity_inspect").some((t) => t.name === "browser_snapshot"), "\n");
 
   const appendTranscript = createTranscriptLogger(TRANSCRIPT);
   // Project sessions have their own event stream; subscribe on the session

@@ -31,11 +31,9 @@ async function main() {
     apiKey: process.env.OPENROUTER_API_KEY,
     cwd,
     permissionMode: "bypass",
-    models: { orchestrator: MODEL, prepare: MODEL, plan: MODEL, perform: MODEL, perfect: MODEL },
-    toolModelCandidates: [MODEL],
+        toolModelCandidates: [MODEL],
     studyModel: MODEL,
-    maxSteps: { prepare: 6, plan: 6, perform: 12, perfect: 6 },
-    maxChainIterations: 2,
+        maxChainIterations: 2,
   });
 
   const t0 = Date.now();
@@ -57,8 +55,8 @@ async function main() {
 
   console.log(`\n===== RESULT (${((Date.now() - t0) / 1000).toFixed(0)}s) =====`);
   console.log("success:", result.success, "| iterations:", result.iterations, "| cost $", result.usage.cost.total.toFixed(4));
-  console.log("\nPERFORM:\n", (result.phases.perform?.summary ?? "-").slice(0, 500));
-  console.log("\nPERFECT:\n", (result.phases.perfect?.summary ?? "-").slice(0, 500));
+  console.log("\nSTEPS:\n", result.steps.map((s) => `${s.isCompleted ? "✔" : "✗"} ${s.title}`));
+  console.log("\nVERIFIED:", result.verified);
 
   console.log("\n----- files on disk -----");
   for (const f of ["src/math.js", "test.js"]) {

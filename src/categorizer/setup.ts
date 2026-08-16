@@ -68,6 +68,7 @@ export function createCategorizerSetup(input: {
   categories: CategorizerDefinition[];
   globalTools?: string[];
   routerModel?: string;
+  summaryModel?: string;
   doubtModel?: string;
   maxHops?: number;
   routerPrompt?: string;
@@ -101,6 +102,7 @@ export function createCategorizerSetup(input: {
     categories,
     globalTools: input.globalTools ?? [...DEFAULT_GLOBAL_TOOLS],
     ...(input.routerModel ? { routerModel: input.routerModel } : {}),
+    ...(input.summaryModel ? { summaryModel: input.summaryModel } : {}),
     ...(input.doubtModel ? { doubtModel: input.doubtModel } : {}),
     ...(input.maxHops != null ? { maxHops: input.maxHops } : {}),
     ...(input.routerPrompt ? { routerPrompt: input.routerPrompt } : {}),

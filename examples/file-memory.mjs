@@ -52,7 +52,7 @@ async function main() {
   assert(first.fileMemory.stats().totalFiles >= 100, "project should be indexed");
   assert(await fs.readFile(path.join(cwd, ".turing", "FILES_MEMORY.md"), "utf8"), "FILES_MEMORY.md should exist");
 
-  const tool = first.session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const tool = first.session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert(tool, "file_memory tool should be available");
   const ctx = { cwd, log: () => {}, llm: harness.llm };
   const found = await tool.execute("id", { action: "search", query: "search files in one go", limit: 3 }, ctx);
@@ -72,7 +72,7 @@ async function main() {
   );
   const reopened = await harness.createProjectSession({ cwd, connectMcp: false });
   assert(reopened.fileMemory.get(target)?.stale, "reopen should mark externally changed files as stale");
-  const reopenedTool = reopened.session.toolsForPhase("prepare").find((entry) => entry.name === "file_memory");
+  const reopenedTool = reopened.session.toolsForCategorizer("read").find((entry) => entry.name === "file_memory");
   assert(reopenedTool, "file_memory tool should still be available after reopen");
   await reopenedTool.execute("id", { action: "refresh", path: target }, ctx);
   assert(!reopened.fileMemory.get(target)?.stale, "refresh should clear staleness");

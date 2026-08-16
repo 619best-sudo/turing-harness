@@ -56,7 +56,7 @@ async function main() {
   assert(first.graphMemory.stats().totalFiles >= 3, "graph should index the project");
   assert(await fs.readFile(path.join(cwd, ".turing", "GRAPH_MEMORY.md"), "utf8"), "GRAPH_MEMORY.md should exist");
 
-  const tool = first.session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
+  const tool = first.session.toolsForCategorizer("read").find((entry) => entry.name === "graph_memory");
   assert(tool, "graph_memory tool should be available");
   const ctx = { cwd, log: () => {}, llm: harness.llm };
 
@@ -73,7 +73,7 @@ async function main() {
   await fs.writeFile(target, "export function bar() { return 2; }\nexport function baz() { return bar(); }\n");
   const reopened = await harness.createProjectSession({ cwd, connectMcp: false });
   assert(reopened.graphMemory.getFileNode(target)?.stale, "changed file should reopen as stale");
-  const reopenedTool = reopened.session.toolsForPhase("prepare").find((entry) => entry.name === "graph_memory");
+  const reopenedTool = reopened.session.toolsForCategorizer("read").find((entry) => entry.name === "graph_memory");
   assert(reopenedTool, "graph_memory tool should still be available");
   await reopenedTool.execute("id", { action: "refresh", path: target }, ctx);
   assert(!reopened.graphMemory.getFileNode(target)?.stale, "refresh should clear staleness");

@@ -117,6 +117,8 @@ export interface CategorizerSetup {
   globalTools: string[];
   /** Router model slug. Omitted ⇒ the router role-slot default. */
   routerModel?: string;
+  /** Summary-turn model slug. Omitted ⇒ the summary role-slot default. */
+  summaryModel?: string;
   /**
    * The "big model" `clearing_doubt` consults when a small-model categorizer is
    * stuck or beyond its capability. Omitted ⇒ orchestrator slot, then the plan

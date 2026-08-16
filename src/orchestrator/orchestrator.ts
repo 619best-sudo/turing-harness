@@ -367,7 +367,7 @@ export class Orchestrator {
         ? { afterCategorizer: (hop, def) => this.afterCategorizerHook!(hop, signal) }
         : {}),
       routerModel: this.llm.resolveModel(this.setup.routerModel ?? this.roleModelSlug("prepare")),
-      summaryModel: this.llm.resolveModel(this.roleModelSlug("perfect")),
+      summaryModel: this.llm.resolveModel(this.setup.summaryModel ?? this.roleModelSlug("perfect")),
       doubtModel: this.llm.resolveModel(
         this.setup.doubtModel ?? this.roleModelSlug("orchestrator") ?? DEFAULT_DOUBT_MODEL,
       ),
