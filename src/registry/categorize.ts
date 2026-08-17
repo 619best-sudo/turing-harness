@@ -100,7 +100,14 @@ export function categorizeTool(tool: AgentTool): string[] {
   const hay = haystack(tool);
   const ids = new Set<string>();
 
-  if (anyHit(hay, INSPECT_HINTS)) ids.add("activity_inspect");
+  // QA-surface tools are inspect-EXCLUSIVE. A browser/screenshot/device/test
+  // tool must never ride into read or write_edit on the strength of incidental
+  // description words: a real chrome-devtools `browser_navigate` says it will
+  // "create a new tab" and "list console errors", and those hits scoped it
+  // into write_edit — whose hop then burned turns driving a dead file://
+  // screen while the real QA pass re-did the work. Explicit
+  // `tool.categorizers` still wins for hosts that genuinely want dual scope.
+  if (anyHit(hay, INSPECT_HINTS)) return ["activity_inspect"];
 
   // Mutations are the hallmark of write_edit.
   if (tool.mutates || anyHit(hay, WRITE_MUTATION_HINTS)) ids.add("write_edit");

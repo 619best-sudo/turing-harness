@@ -950,7 +950,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "`activity_tags` to see which tags exist, then filter on them (e.g. anyTags:[\"mutation\"] for writes, " +
       "[\"verify:fail\"] for failed checks).",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: { type: "object", properties: { ...LOG_FILTER_PROPS }, required: [] },
     async execute(_id, args) {
       const entries = searchLog(logStore, args);
@@ -967,7 +967,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "List every tag in the activity log with its entry count. Call this first to learn what can be " +
       "filtered on, then pass the interesting tags to `activity_search` or `activity_study`.",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: { type: "object", properties: {}, required: [] },
     async execute() {
       const hist = logStore.tagHistogram();
@@ -982,7 +982,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "Read the tail of a log file OUTSIDE the harness (an app log, a server log), optionally filtered by " +
       "text. Use this for logs the harness never wrote; use `activity_search` for the harness's own log.",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1023,7 +1023,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "trace session's collected output, or log filters (tags/text/level) to study the harness log. " +
       "Returns prose analysis, not raw lines — use `activity_search`/`activity_collect` for those.",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1078,7 +1078,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "lines are collected from there, so trace the code through a `startCommand` run).",
     // Mutating: with `startCommand` it kills a port and spawns a server.
     mutates: true,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1125,7 +1125,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
     // tools, so a log never owes verification evidence and never routes an
     // authoring model — see `add_log`'s doc comment.
     mutates: true,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1157,7 +1157,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "the exact `TURING_TRACE …` lines that were written, so the file returns to what it was; a log you wrote by " +
       "hand is reported, never guessed at. The trace session stays open — use `activity_cleanup` to end it as well.",
     mutates: true,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1179,7 +1179,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "`waitMs` to wait for output to appear instead of returning empty. Lines with other markers (an earlier " +
       "session's leftover probes) are reported, not collected. Follow with `activity_study` to reason over the result.",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {
@@ -1202,7 +1202,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "End a trace session: delete its trace file, kill any server `activity_trace_start` started, and list " +
       "the files you instrumented so the `TURING_TRACE …` lines can be removed. Call it once the bug is understood.",
     mutates: true,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: { traceId: { type: "string", description: "Trace session id to tear down." } },
@@ -1226,7 +1226,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "mobile app: nothing answers it and the call fails. An http `url` is for a genuine web app whose dev " +
       "server is actually running. Pass `expected` — the verdict is judged against it.",
     mutates: false,
-    categorizers: ["activity_inspect", "write_edit"],
+    categorizers: ["activity_inspect"],
     parameters: {
       type: "object",
       properties: {

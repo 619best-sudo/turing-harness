@@ -146,7 +146,10 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       // toolkit across phases (install/launch read as Perform mutations,
       // screenshot as Perfect), and the toolkit is only coherent as a unit —
       // you cannot tap in a phase that cannot screenshot the result.
-      categorizers: ["write_edit", "activity_inspect"],
+      // Inspect-ONLY in v2: device automation is the QA pass's surface; the
+      // work pass that "just checks on a device" is doing the next hop's job
+      // with none of its instrumentation.
+      categorizers: ["activity_inspect"],
       description:
         "Drive an iOS/Android device or simulator: `mobile { action }` — look (screenshot + every " +
         "on-screen element), tap/longpress/swipe/type/press/open, launch/terminate/install/apps, devices. " +

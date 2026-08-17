@@ -223,7 +223,10 @@ export function createMobileTool(): AgentTool {
       "the visual estimate with the UI tree — so it works on labelled controls, on icon-only ones with no " +
       "label, and on custom-drawn UI with no tree at all. All coordinates are LOGICAL POINTS.",
     mutates: true,
-    categorizers: ["write_edit", "activity_inspect"],
+    // Inspect-ONLY in v2: device automation is the QA pass's surface. The work
+    // pass "just checking on a device" is doing the next hop's job with none of
+    // its instrumentation (see the category-leaks test).
+    categorizers: ["activity_inspect"],
     parameters: { type: "object", properties: PARAMS, required: ["action"] },
     async execute(id, args, ctx) {
       const action = String(args?.action ?? "").trim() as MobileAction;

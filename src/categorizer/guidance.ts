@@ -102,7 +102,7 @@ export const RUN_ORDER = [
   "   instrumenting, running and judging the screen. Raw screenshots, taps, CLI captures HERE",
   "   are the same QA done twice and worse; the harness refuses them — routing around a refusal",
   "   (`npx playwright screenshot` + `media_analysis`) is the same violation via bash. Need to look?",
-  "   ONE `activity_inspect` with `expected`. Pre-fix REPRODUCTION is unaffected.",
+  "   Don't — no QA tools here. Finish, build, deliver; the inspect pass judges.",
   "   Never capture a build you did not make — build and install FIRST; the",
   "   harness refuses a stale capture too.",
   "",
