@@ -199,6 +199,18 @@ function diffNames(before: SnapElement[], after: SnapElement[]): { added: string
 export function createDriveTool(): AgentTool {
   return {
     name: "drive",
+    title: "Drive the browser",
+    actionParam: "action",
+    actionTitles: {
+      open: "Open the page",
+      look: "Look at the page",
+      click: "Click on the page",
+      fill: "Type into a field",
+      select: "Pick from a dropdown",
+      press: "Press a key",
+      shot: "Capture the page",
+      close: "Close the browser",
+    },
     description:
       "Drive a web page in ONE call per step. `look` returns the screenshot AND every element " +
       "(refs + names); `click`/`fill`/`select` take a plain DESCRIPTION, resolve it against the live " +

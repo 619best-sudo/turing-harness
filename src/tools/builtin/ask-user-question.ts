@@ -235,6 +235,7 @@ export function normalizeAnswer(result: AskUserQuestionResult, cwd?: string): As
 
 export const askUserQuestionTool: AgentTool = {
   name: "ask_user_question",
+  title: "Ask the user a question",
   description:
     "Ask the user a question and wait for their answer. For the decisions that are genuinely THEIRS, not yours: " +
     "which architecture or library to commit to, which reading of an ambiguous requirement to build, a product " +

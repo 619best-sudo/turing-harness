@@ -976,6 +976,11 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     if (s?.usage) totalUsage = addUsage(totalUsage, s.usage);
     summary = s?.text ?? undefined;
   }
+  // The run's ONE closing statement. Without this the last thing a host has to
+  // render is the final `deliver` card — that hop's own note, which describes
+  // only the step that happened to run last while reading as the verdict on the
+  // whole run.
+  if (summary) input.emit({ type: "run_summary", summary });
 
   // --- run steps (write_edit plan tasks) ---
   const steps: RunStep[] = [];

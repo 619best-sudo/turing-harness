@@ -217,6 +217,22 @@ function swipeTo(
 export function createMobileTool(): AgentTool {
   return {
     name: "mobile",
+    title: "Drive the phone or simulator",
+    actionParam: "action",
+    actionTitles: {
+      look: "Look at the screen",
+      tap: "Tap on the screen",
+      longpress: "Press and hold",
+      swipe: "Swipe the screen",
+      type: "Type on the device",
+      press: "Press a hardware button",
+      open: "Open a link on the device",
+      launch: "Launch the app",
+      terminate: "Close the app",
+      install: "Install the app",
+      apps: "List installed apps",
+      devices: "List available devices",
+    },
     description:
       "Drive an iOS/Android device or simulator. `look` returns a screenshot AND every on-screen element " +
       "with exact coordinates. `tap` takes a DESCRIPTION and resolves it against the live screen by fusing " +

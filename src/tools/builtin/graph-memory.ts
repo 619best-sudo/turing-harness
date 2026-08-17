@@ -28,6 +28,19 @@ export function resolveGraphMemoryAction(args: Record<string, unknown>): string 
 export function createGraphMemoryTool(memory: GraphMemory, fileMemory?: FileMemory): AgentTool {
   return {
     name: "graph_memory",
+    title: "Recall linked project knowledge",
+    actionParam: "action",
+    resolveAction: resolveGraphMemoryAction,
+    actionTitles: {
+      stats: "Summarize the code graph",
+      refresh: "Re-index files in the graph",
+      file_deps: "Trace what this file depends on",
+      symbol_deps: "Trace what this symbol depends on",
+      blast_radius: "Find everything this change touches",
+      get_file_node: "Look up a file in the graph",
+      get_symbol_node: "Look up a symbol in the graph",
+      find_symbol: "Find where a symbol is defined",
+    },
     description:
       "Query durable dependency and symbol graphs. Actions: stats, refresh, file_deps, symbol_deps, blast_radius, get_file_node, get_symbol_node, find_symbol (default: inferred — paths→refresh, symbol/qualifiedName→find_symbol, path→file_deps, otherwise stats).",
     mutates: false,

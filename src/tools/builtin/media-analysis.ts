@@ -641,6 +641,16 @@ export function createMediaAnalysisTool(
 ): AgentTool<any, MediaAnalysisResult> {
   return {
     name: "media_analysis",
+    title: "Analyze an image or video",
+    actionParam: "lens",
+    actionTitles: {
+      describe: "Describe what is in this",
+      ocr: "Read the text in this",
+      ui: "Read this design's layout",
+      component: "Break this UI into components",
+      qa: "Check this against what was asked",
+      compare: "Compare this against the reference",
+    },
     description:
       "Analyze attachment(s) with a multimodal model and return what they contain. Works on images, " +
       "video, audio and documents (PDF/DOCX/…). Use it to read a screenshot, understand a design mockup " +

@@ -17,6 +17,7 @@
 
 // ---- Types (pi-compatible surface) ----
 export * from "./types.js";
+export * from "./tool-titles.js";
 
 // ---- Top-level entry ----
 export {
@@ -197,6 +198,8 @@ export {
 // ---- Registry ----
 export {
   Registry,
+  titleField,
+  callTitle,
   type RegistryOptions,
   type ProviderInput,
   type ProviderListItem,

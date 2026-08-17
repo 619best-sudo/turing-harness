@@ -375,6 +375,7 @@ export function createInspirationGeneratorTool(
 
   return {
     name: "inspiration_generator",
+    title: "Look up a design blueprint",
     // Kept to what a description is for: when to call it, what comes back, and the
     // one constraint that must travel WITH the result. The full reuse policy (how to
     // re-skin content, colors, imagery, icons, type, motion) lives in the

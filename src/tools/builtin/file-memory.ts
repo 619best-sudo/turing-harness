@@ -27,6 +27,15 @@ export function resolveFileMemoryAction(args: Record<string, unknown>): string {
 export function createFileMemoryTool(memory: FileMemory): AgentTool {
   return {
     name: "file_memory",
+    title: "Recall what a file is for",
+    actionParam: "action",
+    resolveAction: resolveFileMemoryAction,
+    actionTitles: {
+      search: "Find the files that matter here",
+      get: "Look up what this file does",
+      refresh: "Re-index these files",
+      stats: "Summarize what is indexed",
+    },
         description:
           "Search or inspect the durable file-memory index. Actions: search, get, refresh, stats (default: inferred from the other arguments — `query`→search, `path`→get, `paths`→refresh, otherwise stats). Search uses path, summary, tags, keywords, symbols, dependencies, routes, and semantic metadata.",
     mutates: false,

@@ -77,6 +77,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "mcp",
       source: "internal",
       name: "coding",
+      title: "Files & shell",
       description: "Core coding tools: bash, bash_readonly, read, write, edit, ls, grep, mark_concern_lines.",
       tools: codingTools,
     },
@@ -85,6 +86,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "create_plan",
+      title: "Write the implementation plan",
       tools: [createPlanTool(config.plan)],
     },
     {
@@ -92,6 +94,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "ask_user_question",
+      title: "Ask the user a question",
       tools: [askUserQuestionTool],
     },
     {
@@ -99,6 +102,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "assets_generator",
+      title: "Generate images, video or icons",
       tools: [assetsGenerator],
     },
     {
@@ -106,6 +110,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "media_analysis",
+      title: "Analyze an image or video",
       tools: [mediaAnalysis],
     },
     {
@@ -116,6 +121,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "inspiration_generator",
+      title: "Look up a design blueprint",
       tools: [inspirationGenerator],
     },
     {
@@ -125,6 +131,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "mcp",
       source: "internal",
       name: "web",
+      title: "Internet lookup",
       description: "Internet lookup: web_search (find current docs/changelogs/issues) and web_fetch (read a page).",
       tools: createWebTools(config.web),
     },
@@ -142,6 +149,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "mobile",
+      title: "Phone & simulator control",
       // Explicit rather than inferred: name-based inference would scatter the
       // toolkit across phases (install/launch read as Perform mutations,
       // screenshot as Perfect), and the toolkit is only coherent as a unit —
@@ -161,6 +169,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "tool",
       source: "internal",
       name: "drive",
+      title: "Browser control",
       description:
         "Fused web automation (the mobile tool's twin): `drive { action }` — look (screenshot + " +
         "elements in one), click/fill/select by DESCRIPTION (resolve → act → post-shot + what changed, " +
@@ -175,6 +184,7 @@ export function builtinProviders(config: BuiltinToolsConfig): ProviderInput[] {
       kind: "mcp",
       source: "internal",
       name: "activity_monitor",
+      title: "Logs & runtime debugging",
       description:
         "Activity log search/study plus the trace workflow: activity_search, activity_tags, " +
         "activity_tail_file, activity_study, activity_trace_start, activity_collect, activity_cleanup, " +

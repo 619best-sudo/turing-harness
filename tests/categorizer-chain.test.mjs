@@ -315,6 +315,36 @@ test("hop deliverables are internal: categorizer_end carries no summary/delivera
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("the run ends with ONE combined summary event, not the last hop's own note", async () => {
+  const { dir, orch } = await graphSetup();
+  const events = [];
+  orch.subscribe((e) => {
+    if (e.type === "run_summary" || e.type === "categorizer_end") events.push(e);
+  });
+  const result = await orch.run("fix the service");
+
+  const runSummaries = events.filter((e) => e.type === "run_summary");
+  assert.equal(runSummaries.length, 1, "exactly one closing summary for the whole run");
+  assert.equal(runSummaries[0].summary, result.summary, "it is the composed summary, not a hop's");
+
+  // And it lands AFTER every hop — a host rendering events in order ends on it,
+  // not on the final `deliver` card (whose body is only that hop's note).
+  assert.equal(events.at(-1).type, "run_summary", "the run ends on the combined summary");
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("a deliver result is marked hop-scoped so a host never reads it as the run's verdict", async () => {
+  const { createDeliverTool } = await import("../dist/index.js");
+  const box = { delivered: false };
+  const tool = createDeliverTool(
+    { id: "activity_inspect", name: "activity_inspect", returns: { description: "verdict" } },
+    box,
+  );
+  const res = await tool.execute("call-1", { summary: "the sun is blood purple", verdict: "pass" });
+  assert.equal(res.details.scope, "hop");
+  assert.equal(res.details.categorizer, "activity_inspect");
+});
+
 test("clearing_doubt consults the big model and returns executable steps", async () => {
   const llm = new OpenRouterBridge();
   llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text"] });

@@ -28,6 +28,14 @@ export interface ProviderInput {
   source: ProviderSource;
   /** Display name (e.g. mcp server name, skill name). */
   name: string;
+  /**
+   * Human-readable label for the provider group in UI surfaces. Same rule as
+   * {@link Tool.title}: presentational only, and it should say what the group
+   * is for rather than restate `name` ("Activity monitor" → "Logs & runtime
+   * debugging"). One that restates the name is dropped; absent means render
+   * nothing, not the raw name.
+   */
+  title?: string;
   /** Optional human description; if omitted it is synthesized from the tools. */
   description?: string;
   /** The full tool definitions this provider exposes. */
@@ -89,6 +97,8 @@ export interface ProviderListItem {
   kind: ProviderKind;
   source: ProviderSource;
   name: string;
+  /** Human-readable group label; absent means render nothing (never the raw name). */
+  title?: string;
   /** Aggregated description derived from all the tools it holds. */
   description: string;
   /** Which categorizer(s) this provider serves. */
@@ -334,10 +344,12 @@ export class Registry {
       kind: p.kind,
       source: p.source,
       name: p.name,
+      ...titleField(p.name, p.title),
       description: p.description,
       categorizers: p.categorizers,
       tools: p.tools.map((t) => ({
         name: t.name,
+        ...titleField(t.name, t.title),
         description: t.description,
         parameters: t.parameters,
         mutates: t.mutates ?? false,
@@ -370,4 +382,36 @@ function synthesizeDescription(input: ProviderInput): string {
     .map((t) => `• ${t.name}: ${t.description}`)
     .join("\n");
   return details ? `${head}\n${details}` : head;
+}
+
+/**
+ * A title is only worth emitting when it TELLS the reader something the name
+ * doesn't. "media_analysis" titled "Media Analysis" is the duplicate header
+ * this field exists to remove, so it is dropped here rather than pushed onto
+ * every host to detect: absent `title` means render nothing — NOT fall back to
+ * the raw tool name.
+ */
+/**
+ * The label to show for ONE call: the per-action title when the tool dispatches
+ * on a verb, otherwise the tool's own title. Returns undefined when there is
+ * nothing meaningful to show — render nothing then, never the raw name or the
+ * raw enum token ("stats", "search"), which is what the user sees today.
+ */
+export function callTitle(tool: AgentTool, args: Record<string, unknown> = {}): string | undefined {
+  const { actionParam, actionTitles } = tool;
+  if (actionParam && actionTitles) {
+    const raw = String(args[actionParam] ?? "").trim();
+    // `action` is optional on these tools — they infer it from the other args,
+    // and an inferred call is the common one, so label it the same way.
+    const action = raw || (tool.resolveAction ? tool.resolveAction(args) : "");
+    const label = action ? actionTitles[action] : undefined;
+    if (label) return label;
+  }
+  return titleField(tool.name, tool.title).title;
+}
+
+export function titleField(name: string, title?: string): { title?: string } {
+  if (!title) return {};
+  const norm = (s: string) => s.toLowerCase().replace(/[\s_-]+/g, "");
+  return norm(title) === norm(name) ? {} : { title };
 }

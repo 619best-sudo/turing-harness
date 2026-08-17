@@ -217,6 +217,19 @@ export interface Tool<TParameters extends JSONSchema = JSONSchema> {
   name: string;
   description: string;
   parameters: TParameters;
+  /**
+   * Human-readable label for UI surfaces — what a person watching the run sees
+   * instead of the raw `name`. Purely presentational: it is NOT part of the
+   * tool payload sent to the model (see `toLLMTools` in the loop), so changing
+   * it never changes model behaviour. Hosts that render a header from the tool
+   * name would otherwise show "MEDIA ANALYSIS / media_analysis" — a title that
+   * repeats the name and says nothing. Say what the call DOES, in the user's
+   * terms ("Analyze an image or video"). A title that merely restates the name
+   * ("Media Analysis" for `media_analysis`) is dropped by the registry: when
+   * this is absent the host must render NOTHING, not the raw name — a header
+   * that repeats the identifier below it is noise.
+   */
+  title?: string;
 }
 
 /** What a tool's `execute` returns. Mirrors pi's `{ output?, details?, content? }`. */
@@ -634,6 +647,23 @@ export interface AgentTool<
    * call runs. The tool may also return a measured complexity in its result.
    */
   complexityHint?: number;
+  /**
+   * For action-dispatch tools (one tool, many verbs): which argument carries the
+   * verb, and a human label per verb. A host showing the raw value renders
+   * "Graph Memory / stats" — the enum token leaks to the user. With these it can
+   * show "Summarize the code graph" instead. Presentational only; the model
+   * never sees them. Titles are per-CALL, so {@link Tool.title} stays the
+   * tool-level label and this refines it once the args are known.
+   */
+  actionParam?: string;
+  actionTitles?: Record<string, string>;
+  /**
+   * How the tool itself resolves the verb when the model omits `action` (these
+   * tools infer it from the other arguments). Without this a host would label
+   * every inferred call with the generic tool title, which is exactly the case
+   * the enum default exists for. Same resolver the tool uses internally.
+   */
+  resolveAction?: (args: Record<string, unknown>) => string;
   execute(
     toolCallId: string,
     args: Record<string, unknown>,
@@ -745,6 +775,18 @@ export type AgentEvent =
       writtenPaths?: string[];
       readPaths?: string[];
     }
+  /**
+   * The run's ONE user-facing closing summary, composed from every hop's
+   * deliverable (see `summarizeChain`) and emitted once, after the last hop.
+   *
+   * This exists because the last thing a host renders is otherwise the final
+   * `deliver` call, whose body is that HOP's note — "the sun is properly blood
+   * purple, the corona ring is subtle at 30% opacity" — which reads as the
+   * closing word on the run while describing only the check that happened to
+   * run last. Render THIS as the run's ending; render a `deliver` card as the
+   * step it is (its result carries `scope: "hop"`), or not at all.
+   */
+  | { type: "run_summary"; summary: string }
   | { type: "permission_request"; request: PermissionRequest }
   | { type: "permission_decision"; request: PermissionRequest; decision: PermissionDecision };
 

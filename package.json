@@ -10,6 +10,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./tool-titles": {
+      "import": "./dist/tool-titles.js",
+      "types": "./dist/tool-titles.d.ts"
+    },
     "./categorizer-setup": {
       "import": "./dist/categorizer-setup.js",
       "types": "./dist/categorizer-setup.d.ts"

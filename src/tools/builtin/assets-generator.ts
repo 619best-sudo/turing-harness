@@ -477,6 +477,14 @@ export function createAssetsGeneratorTool(config: AssetsGeneratorConfig = {}): A
 
   return {
     name: "assets_generator",
+    title: "Generate images, video or icons",
+    actionParam: "kind",
+    actionTitles: {
+      image: "Generate an image",
+      video: "Generate a video",
+      audio: "Generate audio",
+      "3d": "Generate a 3D asset",
+    },
     description:
       "Generate an image, video, audio, or 3d asset from a text prompt — the visual/media material a site or " +
       "component needs: hero and section imagery, photographic or illustrative content, textures and background " +

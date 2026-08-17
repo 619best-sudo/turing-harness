@@ -43,6 +43,7 @@ export function deliverSchemaFor(def: CategorizerDefinition) {
 export function createDeliverTool(def: CategorizerDefinition, box: DeliverBox): AgentTool {
   return {
     name: DELIVER_TOOL_NAME,
+    title: "Finish and hand off the result",
     description:
       `Deliver the ${def.name} categorizer's result and END it. This is the ONLY way to finish: ` +
       `call it once, with the result, when (and only when) the expectation is met. ` +
@@ -59,6 +60,11 @@ export function createDeliverTool(def: CategorizerDefinition, box: DeliverBox): 
         output:
           `Delivered. The ${def.name} categorizer is complete — stop calling tools; ` +
           `the chain takes it from here.`,
+        // Scope marker for hosts: this card is ONE STEP's handoff, never the
+        // run's closing word. Even when it is the last call of the run, its
+        // body describes only this categorizer — the run's summary arrives as
+        // the `run_summary` event, composed from every hop.
+        details: { scope: "hop", categorizer: def.id },
       };
     },
   };

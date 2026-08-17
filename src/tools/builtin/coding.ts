@@ -671,6 +671,7 @@ function capGrepOutput(raw: string, pattern: string): string {
 
 export const bashTool: AgentTool = {
   name: "bash",
+  title: "Run a shell command",
   description:
     "Run a shell command to understand the project, inspect files/folders, or execute build/test/lint commands. Returns stdout+stderr. " +
     "Long startups (builds, dev servers, device launches) take `background: true` + `waitMs`: the call then LISTENS to the " +
@@ -749,6 +750,7 @@ export const bashTool: AgentTool = {
 
 export const bashReadonlyTool: AgentTool = {
   name: "bash_readonly",
+  title: "Run a read-only shell command",
   description:
     "Run a read-only shell inspection command in Prepare/Plan. Blocks file writes, package install/start commands, and background processes.",
   mutates: false,
@@ -1454,6 +1456,7 @@ const READ_PROPERTIES = {
 
 export const readTool: AgentTool = {
   name: "read",
+  title: "Read a file",
   description: "Read a UTF-8 text file. Supports optional line offset/limit for large files.",
   mutates: false,
   categorizers: ["read", "write_edit", "activity_inspect"],
@@ -2275,6 +2278,7 @@ async function executeWrite(
 export function createWriteTool(authorOnly = false): AgentTool {
   return {
     name: "write",
+    title: "Write a file",
     description: authorOnly
       ? "Create or overwrite a file. An authoring model writes the file contents from the task — do NOT pass content; supply the path and self-assessment only."
       : "Create or overwrite a file with the given contents.",
@@ -2638,6 +2642,7 @@ async function executeEdit(
 export function createEditTool(authorOnly = false): AgentTool {
   return {
     name: "edit",
+    title: "Edit a file",
     description: authorOnly
       ? "Replace an exact string in a file. An authoring model writes the replacement — supply path and oldString (the anchor), NOT newString. To add logging, use `add_log` instead: it writes your lines verbatim and is not a code change."
       : "Replace an exact string in a file with a new string. `oldString` must appear exactly once unless `replaceAll` is set.",
@@ -2655,6 +2660,7 @@ export const editTool: AgentTool = createEditTool(false);
 
 export const lsTool: AgentTool = {
   name: "ls",
+  title: "List a directory",
   description: "List directory entries (non-recursive) to understand project structure.",
   mutates: false,
   categorizers: ["read"],
@@ -2699,6 +2705,7 @@ const GREP_EXCLUDED_DIRS = [...IGNORED_PROJECT_DIRS, ...GREP_ONLY_EXCLUDED_DIRS]
 
 export const grepTool: AgentTool = {
   name: "grep",
+  title: "Search the codebase",
   description:
     "Search files for an EXTENDED regex pattern (alternation `a|b`, groups `(a|b)`, `+`, `?` all work; " +
     "uses ripgrep when available, else `grep -rE`). Skips dependency, build and generated-index directories.",
@@ -2811,6 +2818,7 @@ export function parseConcernLines(input: string): number[] {
 
 export const markConcernLinesTool: AgentTool = {
   name: "mark_concern_lines",
+  title: "Flag the lines that matter",
   description:
     "Flag the specific lines of a file you just read that matter for the task (the lines a change targets, or the evidence for a finding). Call it right after `read` when specific lines stand out; skip it when the whole file is relevant or nothing does. Lines may be a range like \"42-44\" or a list like \"42,43,44\".",
   mutates: false,

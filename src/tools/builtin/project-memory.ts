@@ -31,6 +31,15 @@ export function resolveProjectMemoryAction(args: Record<string, unknown>): strin
 export function createProjectMemoryTool(memory: ProjectMemory): AgentTool {
   return {
     name: "project_memory",
+    title: "Recall project conventions",
+    actionParam: "action",
+    resolveAction: resolveProjectMemoryAction,
+    actionTitles: {
+      get: "Read what we know about this project",
+      remember: "Remember this for future runs",
+      recall: "Recall a past decision",
+      set_category: "Correct the project type",
+    },
     description:
       "Read or update durable project memory — the ONLY thing that outlives this conversation: the project's " +
       "category (frontend/mobile/games/backend) + tech stack, and the rules learned across runs. " +

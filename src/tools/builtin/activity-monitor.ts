@@ -945,6 +945,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const search: AgentTool = {
     name: "activity_search",
+    title: "Search the activity log",
     description:
       "Filter the harness activity log by tag, text or level. Use it to cut noise — start from " +
       "`activity_tags` to see which tags exist, then filter on them (e.g. anyTags:[\"mutation\"] for writes, " +
@@ -963,6 +964,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const tags: AgentTool = {
     name: "activity_tags",
+    title: "List activity log tags",
     description:
       "List every tag in the activity log with its entry count. Call this first to learn what can be " +
       "filtered on, then pass the interesting tags to `activity_search` or `activity_study`.",
@@ -978,6 +980,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const tailFile: AgentTool = {
     name: "activity_tail_file",
+    title: "Tail a log file",
     description:
       "Read the tail of a log file OUTSIDE the harness (an app log, a server log), optionally filtered by " +
       "text. Use this for logs the harness never wrote; use `activity_search` for the harness's own log.",
@@ -1018,6 +1021,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const study: AgentTool = {
     name: "activity_study",
+    title: "Study the logs for a cause",
     description:
       "Ask a model to summarize and find the root cause in a slice of activity. Pass `traceId` to study a " +
       "trace session's collected output, or log filters (tags/text/level) to study the harness log. " +
@@ -1065,6 +1069,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const traceStart: AgentTool = {
     name: "activity_trace_start",
+    title: "Start a debug trace",
     description:
       "Open a trace session for debugging data/control flow: returns a traceId and the logging convention for " +
       "the project's language — a normal `print`/`console.log` line that STARTS with THIS session's marker " +
@@ -1106,6 +1111,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const addLog: AgentTool = {
     name: "add_log",
+    title: "Insert a trace log line",
     description:
       "Add logging to a file. Same shape as `edit` — `oldString` is the exact text to anchor on, `newString` is " +
       "that text with a log line added (the file's OWN `print`/`console.log`, starting with THIS session's " +
@@ -1150,6 +1156,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const removeLog: AgentTool = {
     name: "remove_log",
+    title: "Remove a trace log line",
     description:
       "Remove logging that `add_log` added. Pass `logId` (the id `add_log` returned, e.g. \"log-2\") to take out " +
       "just that one — useful the moment a log turns out to be at the wrong point and is only noise in every later " +
@@ -1173,6 +1180,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const collect: AgentTool = {
     name: "activity_collect",
+    title: "Collect the trace output",
     description:
       "Read back what a trace session captured: the log lines carrying THIS session's marker " +
       "`TURING_TRACE_<suffix>` written since `activity_trace_start`. Call it after the flow has run. Pass " +
@@ -1198,6 +1206,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const cleanup: AgentTool = {
     name: "activity_cleanup",
+    title: "Remove the trace probes",
     description:
       "End a trace session: delete its trace file, kill any server `activity_trace_start` started, and list " +
       "the files you instrumented so the `TURING_TRACE …` lines can be removed. Call it once the bug is understood.",
@@ -1213,6 +1222,7 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
 
   const inspect: AgentTool = {
     name: "activity_inspect",
+    title: "Check the change on screen",
     description:
       "Verify a visual change on the RUNNING app — by SCREENSHOT. One call reaches the screen, captures a " +
       "screenshot AND judges it (VERDICT: PASS/FAIL) — do NOT also run `media_analysis` on the result. " +

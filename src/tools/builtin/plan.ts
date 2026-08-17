@@ -158,6 +158,7 @@ export function createPlanTool(config: PlanToolConfig = {}): AgentTool<any, Crea
 
   return {
     name: "create_plan",
+    title: "Write the implementation plan",
     description:
       "Break the task into an ordered, multi-file implementation plan and submit it to the user for review. " +
       "Returns the approved plan. Call this ONCE, before doing any implementation work, for any task that " +

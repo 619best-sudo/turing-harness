@@ -216,6 +216,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
 
   const search: AgentTool<any, WebSearchResult> = {
     name: "web_search",
+    title: "Search the web",
     description:
       "Search the internet in a real browser and return the result links. Use it whenever the answer " +
       "depends on something current rather than remembered: how a library's API works in the version " +
@@ -328,6 +329,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
 
   const fetchTool: AgentTool<any, WebFetchResult> = {
     name: "web_fetch",
+    title: "Read a web page",
     description:
       "Open one URL in the browser and return its rendered text. Use it to actually READ a page a search " +
       "turned up — a changelog, a migration guide, an API reference, a GitHub issue — or to pull content " +
@@ -454,6 +456,7 @@ export function createWebTools(config: WebConfig = {}): AgentTool[] {
   // keep in sync. Kept as a thin delegate rather than a second implementation.
   const scrapeTool: AgentTool<any, WebFetchResult> = {
     name: "web_scrape",
+    title: "Extract data from a page",
     description:
       "Open one URL in the browser and return its rendered text — an alias of `web_fetch` for the scraping/" +
       "content-extraction case (recreating a UI, pulling a table, reading a docs page). Same engine and result " +
