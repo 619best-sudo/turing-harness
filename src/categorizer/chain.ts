@@ -964,17 +964,22 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
   }
 
   // --- summary ---
-  const onlyConversation = hops.length === 1 && hops[0].id === "conversation";
+  // The summary turn always owns the closing statement, including for a lone
+  // `conversation` hop. `deliver` is hop-scoped by design: its note is a handoff
+  // to the next categorizer, not an answer addressed to the user. Promoting it
+  // verbatim used to leave a read-only run with no closing turn of its own.
   let summary: string | undefined;
-  if (onlyConversation) {
-    summary = String(
-      (hops[0].deliverable as { summary?: string })?.summary ?? hops[0].summary ?? "",
-    ).trim() || undefined;
-  }
-  if (!summary && hops.length) {
+  if (hops.length) {
     const s = await summarizeChain(input, hops, writtenPaths, readPaths, refs);
     if (s?.usage) totalUsage = addUsage(totalUsage, s.usage);
     summary = s?.text ?? undefined;
+  }
+  // Only if the summary turn itself failed (network, empty completion) do we
+  // fall back to a hop's own note — better a step-scoped answer than silence.
+  for (let i = hops.length - 1; i >= 0 && !summary; i -= 1) {
+    summary =
+      String((hops[i].deliverable as { summary?: string })?.summary ?? hops[i].summary ?? "").trim() ||
+      undefined;
   }
   // The run's ONE closing statement. Without this the last thing a host has to
   // render is the final `deliver` card — that hop's own note, which describes
@@ -1018,6 +1023,7 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     break;
   }
 
+  const onlyConversation = hops.length === 1 && hops[0].id === "conversation";
   const route: "conversational" | "task" = onlyConversation && writtenPaths.length === 0 ? "conversational" : "task";
   const success = !error && Boolean(summary);
 
@@ -1051,8 +1057,16 @@ async function summarizeChain(
   refs: MediaRef[],
 ): Promise<{ text?: string; usage?: Usage } | undefined> {
   try {
+    // A run that changed nothing was asked a question, not given a job: the
+    // closing turn has to ANSWER it. Summarizing "the work just done" on a
+    // read-only run throws away the very thing the user asked for.
+    const answering = writtenPaths.length === 0 && !hops.some((h) => h.id === "write_edit");
     const lines: string[] = [];
-    lines.push(`Summarize the work just done for this task, in 2-6 sentences.`);
+    lines.push(
+      answering
+        ? `Answer the user's request below, using the record as your only source.`
+        : `Summarize the work just done for this task, in 2-6 sentences.`,
+    );
     lines.push(`TASK: ${input.task}`);
     lines.push(
       `WHAT EACH STEP DELIVERED (structured deliverables — your evidence):\n` +
@@ -1068,20 +1082,40 @@ async function summarizeChain(
       );
     }
     lines.push(
-      `Reply with ONLY the summary prose. Ground every claim in the record above — never add detail it` +
-        ` does not contain, and never imply a check ran that the record does not show. If a step was` +
-        ` cut short or left work undone, say so and what remains.`,
+      answering
+        ? `Reply with ONLY the answer. Ground every claim in the record above — never add detail it does` +
+          ` not contain, and never imply a check ran that the record does not show. Keep the specifics the` +
+          ` record gives you: file paths, symbol and identifier names, line numbers, exact values. If the` +
+          ` record does not settle part of the request, say which part and what is still unknown.`
+        : `Reply with ONLY the summary prose. Ground every claim in the record above — never add detail it` +
+          ` does not contain, and never imply a check ran that the record does not show. If a step was` +
+          ` cut short or left work undone, say so and what remains.`,
     );
     const msg = await input.llm.complete(
       input.summaryModel,
       {
+        // Both modes open on the same sentence: it is the stable marker a host
+        // (or a test stub) uses to recognise the closing summary turn.
         systemPrompt: [
-          "You write the closing summary of a coding run, for the user who asked for it.",
-          "You did NOT do this work: everything you know is in the record below. Write from it, and never",
-          "add detail it does not contain — no invented file contents, no reasoning you did not see, and",
-          "above all no test, build, or visual check that the record does not say was actually run.",
-          "Lead with what the user got. Name the files that changed by path, say plainly what is still",
-          "incomplete or unverified, and stop. Plain prose, 2-6 sentences, no headings, no bullets.",
+          "You write the closing summary of a run, for the user who asked for it — the last thing they",
+          "read, and the only part of the run addressed to them.",
+          ...(answering
+            ? [
+                "This run changed nothing: the user asked a question, so this turn has to ANSWER it, not",
+                "narrate the looking. You did NOT do the investigation — everything you know is in the record",
+                "below. Write from it, and never add detail it does not contain: no invented file contents, no",
+                "reasoning you did not see, and above all no test, build, or visual check the record does not",
+                "say was actually run. Answer directly, in the first sentence. Carry the record's concrete",
+                "specifics through instead of generalizing them away, and say plainly where it came up short.",
+                "Run as long as the question needs and no longer. Markdown is fine.",
+              ]
+            : [
+                "You did NOT do this work: everything you know is in the record below. Write from it, and never",
+                "add detail it does not contain — no invented file contents, no reasoning you did not see, and",
+                "above all no test, build, or visual check that the record does not say was actually run.",
+                "Lead with what the user got. Name the files that changed by path, say plainly what is still",
+                "incomplete or unverified, and stop. Plain prose, 2-6 sentences, no headings, no bullets.",
+              ]),
         ].join(" "),
         messages: [{ role: "user", content: lines.join("\n\n"), timestamp: Date.now() }],
       },
