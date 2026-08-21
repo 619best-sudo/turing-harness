@@ -69,7 +69,7 @@ test("a probe entangled with code is reported, never guessed at", () => {
 test("a file with no probes is untouched", () => {
   const clean = "void main() {\n  print('hello');\n}\n";
   const result = stripProbeLines(clean);
-  assert.deepEqual(result, { removed: 0, mixed: [] });
+  assert.deepEqual(result, { removed: 0, mixed: [], emptiedBlocks: [] });
   assert.equal(result.content, undefined);
 });
 
@@ -100,4 +100,36 @@ test("the real file's shape: seven standalone probes, all of them go", () => {
   // The code around them survives exactly, including the early return the probe
   // was sitting inside of.
   assert.match(result.content, /if \(!setCurrent && statusUnchanged\) \{\n {6}return lead;\n {4}\}/);
+});
+
+test("a block the removal emptied is reported, not rewritten", () => {
+  // Found by doing it for real: stripping 24 probes from a live project left two
+  // `} else { }` husks, because the instrumenting run had added those branches for
+  // no purpose but to host a probe.
+  const source = [
+    "if (timer == null) {",
+    "  start();",
+    `} else {`,
+    `  print("${MARK} timerAlreadyRunning");`,
+    "}",
+  ].join("\n");
+  const result = stripProbeLines(source);
+  assert.equal(result.removed, 1);
+  assert.deepEqual(result.emptiedBlocks, [3], "the `} else {` line is named");
+  // The husk is left in place: whether it should collapse depends on the code
+  // around it, which is a judgement, not a rule.
+  assert.match(result.content, /\} else \{\n\}/);
+});
+
+test("a block that still has code in it is not reported as emptied", () => {
+  const source = [
+    "if (a) {",
+    `  print("${MARK} one");`,
+    "  doWork();",
+    "}",
+  ].join("\n");
+  const result = stripProbeLines(source);
+  assert.equal(result.removed, 1);
+  assert.deepEqual(result.emptiedBlocks, []);
+  assert.match(result.content, /if \(a\) \{\n {2}doWork\(\);\n\}/);
 });

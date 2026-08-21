@@ -90,6 +90,18 @@ export interface ProbeStripResult {
   removed: number;
   /** 1-based line numbers that carry a marker MIXED with code, left in place. */
   mixed: number[];
+  /**
+   * 1-based line numbers of blocks the removal left EMPTY — `} else {` followed
+   * by `}`, an `if (…) {` with nothing in it.
+   *
+   * Found by observation, not anticipated: stripping 24 probes from a real
+   * project left two `} else { }` husks, because the instrumenting run had added
+   * those else-branches for no purpose but to host a probe. The result compiles
+   * and reads as sloppy code nobody wrote, so it is reported — deciding whether
+   * an emptied block should collapse is a judgement about the surrounding code,
+   * which is the model pass's job, not a regex's.
+   */
+  emptiedBlocks: number[];
   /** The file's new content, or undefined when nothing changed. */
   content?: string;
 }
@@ -105,7 +117,7 @@ export interface ProbeStripResult {
  * way, and the NEXT run read them as product code and authored a fix around them.
  */
 export function stripProbeLines(source: string): ProbeStripResult {
-  if (!PROBE_MARKER_RE.test(source)) return { removed: 0, mixed: [] };
+  if (!PROBE_MARKER_RE.test(source)) return { removed: 0, mixed: [], emptiedBlocks: [] };
   const lines = source.split("\n");
   const kept: string[] = [];
   const mixed: number[] = [];
@@ -122,6 +134,25 @@ export function stripProbeLines(source: string): ProbeStripResult {
     mixed.push(index + 1);
     kept.push(line);
   }
-  if (!removed) return { removed: 0, mixed };
-  return { removed, mixed, content: kept.join("\n") };
+  if (!removed) return { removed: 0, mixed, emptiedBlocks: [] };
+  return { removed, mixed, emptiedBlocks: findEmptiedBlocks(kept), content: kept.join("\n") };
+}
+
+/**
+ * Blocks with nothing left in them: an opening brace whose next non-blank line
+ * closes it.
+ *
+ * Line-based on purpose. A real parser per language is not on the table here, and
+ * the shape this catches is the one a removed probe leaves behind — a brace, then
+ * its match. Reported, never rewritten.
+ */
+function findEmptiedBlocks(lines: string[]): number[] {
+  const out: number[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (!/\{\s*$/.test(line)) continue;
+    let next = index + 1;
+    while (next < lines.length && lines[next]!.trim() === "") next += 1;
+    if (next < lines.length && /^\s*\}/.test(lines[next]!)) out.push(index + 1);
+  }
+  return out;
 }

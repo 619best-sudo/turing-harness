@@ -1208,10 +1208,12 @@ async function stripRemainingProbes(
     task: input.task,
     sharedReadCache: readCache,
     systemPrompt: [
-      "You are the cleanup pass of a coding run. Earlier categorizers instrumented these files with",
-      "activity-monitor probes (`__t(...)` / TURING_TRACE lines). Strip every probe marker from each",
-      "file, leaving all other content byte-identical. Use remove_log / activity_cleanup. When every",
-      "listed file is clean, stop.",
+      "You are the cleanup pass of a coding run. Whole-line probes have already been removed by rule;",
+      "what is left needs judgement. Two shapes: a TURING_TRACE probe ENTANGLED with code",
+      "(`if (x) { print(\"TURING_TRACE…\"); return; }`) — take the probe out and leave the statement",
+      "working; and a block the removal left EMPTY (`} else { }`) — an instrumenting pass added it to",
+      "host a probe, so collapse it back unless the surrounding code needs it. Leave everything else",
+      "byte-identical. Use remove_log / activity_cleanup / edit. When every listed file is clean, stop.",
     ].join(" "),
     userMessage: `Files still carrying probe markers:\n${paths.map((p) => `- ${p}`).join("\n")}`,
     tools,
@@ -1496,10 +1498,21 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
           data: { path: abs, removed: result.removed, mixed: result.mixed },
         });
       }
-      // A probe entangled with code cannot be removed by rule — taking it out
-      // means re-authoring the statement. Those are the only ones the model pass
-      // is needed for.
-      if (result.mixed.length) mixedProbeFiles.push(abs);
+      // Two things a rule must not decide: a probe entangled with code (removing
+      // it means re-authoring the statement) and a block the removal emptied
+      // (whether `} else { }` should collapse depends on the code around it).
+      // Both go to the model pass, which is what it is for.
+      if (result.mixed.length || result.emptiedBlocks.length) {
+        mixedProbeFiles.push(abs);
+        if (result.emptiedBlocks.length) {
+          input.logStore.append({
+            tags: ["categorizer", "categorizer:cleanup", "cleanup:probes"],
+            level: "warn",
+            message: `stripping probes left ${result.emptiedBlocks.length} empty block(s) in ${abs}`,
+            data: { path: abs, emptiedBlocks: result.emptiedBlocks },
+          });
+        }
+      }
     }
   } catch {
     // best-effort: a cleanup failure never fails the run
