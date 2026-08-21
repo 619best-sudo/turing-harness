@@ -34,7 +34,7 @@ test("guard catches a multiline quoted sed -i (the field run's exact shape)", ()
     `cd /x/cards_mobile_app && sed -i '' '218a\\
    // Initialize LaunchDarkly on reconnect
    initialiseLdClient();' lib/services/auth_service.dart`,
-    "sed -i",
+    "in-place edit",
   );
   assert.match(path, /auth_service\.dart$/);
 });

@@ -373,7 +373,7 @@ const BLOCKED = [
   ["heredoc", "cat > src/app.ts <<'EOF'\nconsole.log(1)\nEOF"],
   ["truncating redirect", "echo '<h1>hi</h1>' > index.html"],
   ["appending redirect", "echo 'body{}' >> styles/main.css"],
-  ["sed -i", "sed -i 's/a/b/' src/index.ts"],
+  ["in-place edit", "sed -i 's/a/b/' src/index.ts"],
   ["tee", "echo x | tee src/config.json"],
   ["python inline write", `python3 -c "open('src/gen.py','w').write('x')"`],
   ["python pathlib write_text", `python3 << 'EOF'\nfrom pathlib import Path\nPath("src/app.ts").write_text("x")\nEOF`],

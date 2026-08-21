@@ -431,12 +431,37 @@ function collectImageRefs(
 
 /**
  * File extensions that hold AUTHORED content — the bytes `authorOnlyWrites`
- * exists to route through Model B. Deliberately a source/asset list, not "any
- * path": `npm run build > build.log` must keep working, and a `.log`, `.txt` or
- * `.tmp` redirect is plumbing, not authorship.
+ * exists to route through Model B, and the source tree a QA pass may not rewrite.
+ * Deliberately a source/asset list, not "any path": `npm run build > build.log`
+ * must keep working, and a `.log`, `.txt` or `.tmp` redirect is plumbing, not
+ * authorship.
  */
 const AUTHORED_EXTENSIONS =
-  /\.(m?[jt]sx?|css|s[ac]ss|html?|json|ya?ml|md|dart|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|php|sql|svg|vue|svelte|astro|toml|sh|bash|zsh|lua|r|sc|scala|clj|ex|exs|erl|elm|fs|hs|ml|nim|pl|pm|tcl|vala|v)$/i;
+  /\.(m?[cjt]sx?|[cm]?jsx?|css|s[ac]ss|less|html?|json5?|ya?ml|md|mdx|dart|py|pyi|rb|rake|gemspec|podspec|go|rs|java|kt|kts|gradle|groovy|swift|m|mm|c|cc|cpp|cxx|h|hpp|cs|fs|fsx|php|sql|graphql|gql|proto|svg|vue|svelte|astro|toml|ini|cfg|conf|properties|plist|xml|sh|bash|zsh|fish|ps1|lua|r|jl|sc|scala|clj|cljs|ex|exs|erl|elm|hs|ml|nim|pl|pm|tcl|vala|v|zig|d|cr|pas|tf|tfvars|ipynb|env|editorconfig)$/i;
+
+/**
+ * Source files with NO extension. A shell form that writes one of these is
+ * writing the build itself, which is authorship by any reading — and the
+ * extension test alone would wave it through.
+ */
+const AUTHORED_BASENAMES =
+  /(^|\/)(Makefile|GNUmakefile|Dockerfile|Containerfile|Jenkinsfile|Vagrantfile|Gemfile|Rakefile|Podfile|Brewfile|Procfile|CMakeLists\.txt|BUILD|BUILD\.bazel|WORKSPACE|Justfile|justfile|\.env(\.\w+)?|\.gitignore|\.npmrc|\.nvmrc|\.fvmrc)$/;
+
+/**
+ * Scratch destinations. A write here is not authorship of the project, whatever
+ * the file is called: `cp lib/a.dart /tmp/backup.dart` is a BACKUP, and a
+ * throwaway script or harness under a temp dir is how a pass keeps its working
+ * files out of the tree. Both consumers of this detector agree on that — the QA
+ * hop filters the same paths, and `authorOnlyWrites` cares about the bytes that
+ * reach the repo.
+ */
+const TEMP_TARGETS = /^(?:\/private)?\/(?:tmp|var\/tmp|var\/folders)\/|^\$(?:TMPDIR|TMP)\b|^~?\/?\.cache\//;
+
+/** Does this path name a file whose CONTENTS a model would have authored? */
+function looksAuthored(target: string): boolean {
+  if (TEMP_TARGETS.test(target)) return false;
+  return AUTHORED_EXTENSIONS.test(target) || AUTHORED_BASENAMES.test(target);
+}
 
 /**
  * Shell fragments that write file CONTENTS, paired with the path they target.
@@ -454,25 +479,110 @@ const SHELL_AUTHORING_FORMS: Array<{
    *  and a `;`/`&` inside a quoted script must not masquerade as a shell
    *  separator to the regex (the multiline `sed -i '' '...;...'` form). */
   shieldQuote?: boolean;
+  /** Authorship regardless of what the captured token names (a diff, not a file). */
+  anyTarget?: boolean;
+  /** Which capture group holds the TARGET path. Defaults to 1. */
+  targetGroup?: number;
 }> = [
+  // ---- shell plumbing that writes ----
   { label: "heredoc redirect", re: /(?:>{1,2})\s*([^\s<>|;&]+)[\s\S]*?<<-?\s*['"]?\w+/g },
   { label: "output redirect", re: /(?:^|[^0-9<>])>{1,2}\s*([^\s<>|;&]+)/g, shieldQuote: true },
-  { label: "sed -i", re: /\bsed\b[^|;&]*\s-i(?:\.\w+)?\b[^|;&]*?\s([^\s|;&]+)\s*$/g, shieldQuote: true },
   { label: "tee", re: /\btee\b(?:\s+-a)?\s+([^\s|;&]+)/g, shieldQuote: true },
-  // `[\s\S]{0,6000}?` and NOT `[^|;&]*`: the gap between `python3` and its write
-  // is Python source, and Python source is full of `;`, `|` and `&` — most of all
-  // when the script embeds the code it is editing. Four heredocs that opened a
-  // `.dart` file for writing went undetected because the Dart snippet between the
-  // interpreter and the `open(..., 'w')` contained semicolons, which
-  // `[^|;&]*` cannot cross. Lazy and capped so a pathological command cannot
-  // backtrack: bridging at all is the point, bridging 6KB is already generous.
-  { label: "python inline write", re: /\bpython3?\b[\s\S]{0,6000}?\bopen\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g },
-  // `pathlib.Path("file").write_text(...)` / `write_bytes(...)` — the form a
-  // model reaches for when `open(...,'w')` is recognised but it still wants to
-  // author through the shell. `fullCommand: true` because a `python3 -c` one-
-  // liner or heredoc separates the import (`from pathlib import Path;`) from the
-  // write with a Python `;`, and the shell-segment split would break that apart.
-  { label: "python pathlib write", re: /\bPath\(\s*['"]([^'"]+)['"]\s*\)[\s\S]*?\bwrite_(?:text|bytes)\s*\(/g, fullCommand: true },
+  { label: "dd", re: /\bdd\b[^|;&]*\bof=([^\s|;&]+)/g, shieldQuote: true },
+
+  // ---- in-place editors, any of them ----
+  //
+  // `sed` was the only one listed, which made the guard a statement about one
+  // tool rather than about editing in place. Every language ships its own, a
+  // model reaches for whichever it knows, and they are all the same act:
+  //   sed -i / --in-place, gsed, ssed   perl -i / -pi -e   ruby -i   awk -i inplace
+  {
+    label: "in-place edit",
+    re: /\b(?:g?sed|ssed|perl|ruby|awk)\b[^|;&]*\s(?:-[a-zA-Z]*i[a-zA-Z]*(?:\.\w+)?|--in-?place(?:=\S+)?|-i\s+inplace)\b[^|;&]*?\s([^\s|;&]+)\s*$/g,
+    shieldQuote: true,
+  },
+
+  // ---- an interpreter writing a file ----
+  //
+  // Python was the only interpreter covered, so `node -e "fs.writeFileSync(…)"`
+  // walked straight through a guard whose whole subject is "a script wrote
+  // source". The bridge from interpreter to write is `[\s\S]{0,6000}?` — lazy and
+  // capped — and NOT `[^|;&]*`, because the gap is program text: four `python3`
+  // heredocs went undetected in one run because the code they embedded was full
+  // of semicolons, which `[^|;&]*` cannot cross. Capped so a pathological command
+  // cannot backtrack; 6KB is already far past any real one-liner.
+  {
+    label: "python inline write",
+    re: /\bpython[\d.]*\b[\s\S]{0,6000}?\bopen\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g,
+  },
+  {
+    label: "python pathlib write",
+    re: /\bPath\(\s*['"]([^'"]+)['"]\s*\)[\s\S]{0,6000}?\bwrite_(?:text|bytes)\s*\(/g,
+    fullCommand: true,
+  },
+  {
+    label: "python in-place fileinput",
+    re: /\bfileinput\.(?:input|FileInput)\(\s*\[?\s*['"]([^'"]+)['"][\s\S]{0,2000}?inplace\s*=\s*True/g,
+    fullCommand: true,
+  },
+  {
+    // node / deno / bun — `writeFileSync`, `appendFileSync`, `writeFile`, and the
+    // promises flavour. The path is the first argument either way.
+    label: "node fs write",
+    re: /\b(?:write|append)File(?:Sync)?\s*\(\s*['"`]([^'"`]+)['"`]/g,
+    fullCommand: true,
+  },
+  {
+    label: "ruby file write",
+    re: /\bFile\.(?:write|binwrite)\s*\(?\s*['"]([^'"]+)['"]/g,
+    fullCommand: true,
+  },
+  {
+    label: "ruby file open",
+    re: /\bFile\.open\s*\(?\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g,
+    fullCommand: true,
+  },
+  {
+    label: "php file write",
+    re: /\bfile_put_contents\s*\(\s*['"]([^'"]+)['"]/g,
+    fullCommand: true,
+  },
+  {
+    // Perl's three-argument open, the only shape that says which way it opens.
+    label: "perl file open",
+    re: /\bopen\s*\([^,]*,\s*['"]>{1,2}['"]\s*,\s*['"]([^'"]+)['"]/g,
+    fullCommand: true,
+  },
+
+  // ---- applying someone else's bytes ----
+  //
+  // `patch`/`git apply` rewrite whatever the diff names, and those paths are
+  // never on the command line — so the captured token is the DIFF, and the form
+  // is authorship whatever it is called (`anyTarget`).
+  {
+    label: "patch apply",
+    re: /\b(?:git\s+apply|patch)\b[^|;&]*?(?:<\s*|\s)([^\s|;&]+\.(?:patch|diff))\b/g,
+    shieldQuote: true,
+    anyTarget: true,
+  },
+  { label: "patch apply (stdin)", re: /\b(?:git\s+apply|patch\s+-p\d)\b(?![^|;&]*\.(?:patch|diff))([^|;&]*)$/g, shieldQuote: true, anyTarget: true },
+
+  // ---- putting bytes from OUTSIDE the tree into it ----
+  //
+  // A project-internal move or copy — `mv src/a.ts src/b.ts`, `cp a.ts b.ts` — is
+  // not authorship: those bytes were authored when the source file was written,
+  // and the documented contract for `authorOnlyWrites` says move/copy/delete are
+  // unaffected. What IS authorship is bytes arriving from somewhere the authoring
+  // model never touched: the model writes `/tmp/fixed.dart` (allowed, it is
+  // scratch) and copies it over the real file one command later, which is a
+  // heredoc with an extra step. So the SOURCE decides, and only a scratch source
+  // is refused.
+  {
+    label: "copy from scratch into source",
+    re: /\b(?:cp|mv|install|rsync)\b(?:\s+-\S+)*\s+((?:\/private)?\/(?:tmp|var\/tmp|var\/folders)\/\S+|\$(?:TMPDIR|TMP)\/\S+)\s+([^\s|;&]+)\s*$/g,
+    shieldQuote: true,
+    targetGroup: 2,
+  },
 ];
 
 /**
@@ -529,11 +639,15 @@ export function detectShellAuthoring(command: string): { path: string; form: str
 /** Apply every content-authoring form to one contiguous statement/heredoc unit. */
 function matchAuthoringForms(text: string, allowFullCommandForms: boolean): { path: string; form: string } | null {
   const shielded = shieldQuoted(text);
-  for (const { label, re, fullCommand, shieldQuote } of SHELL_AUTHORING_FORMS) {
+  for (const { label, re, fullCommand, shieldQuote, anyTarget, targetGroup } of SHELL_AUTHORING_FORMS) {
     if (fullCommand && !allowFullCommandForms) continue;
     for (const m of (shieldQuote ? shielded : text).matchAll(re)) {
-      const target = m[1]?.replace(/^['"]|['"]$/g, "");
-      if (target && AUTHORED_EXTENSIONS.test(target)) return { path: target, form: label };
+      const target = m[targetGroup ?? 1]?.replace(/^['"]|['"]$/g, "");
+      if (!target) continue;
+      // A form that declares `anyTarget` is authorship regardless of what it
+      // names: `git apply x.patch` rewrites whatever the diff touches, and the
+      // paths never appear on the command line.
+      if (anyTarget || looksAuthored(target)) return { path: target, form: label };
     }
   }
   return null;
