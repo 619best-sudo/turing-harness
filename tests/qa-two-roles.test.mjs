@@ -554,7 +554,7 @@ test("the prompt makes the visible/invisible call before the launch", () => {
   assert.match(p, /VISIBLE\s+— wrong text/);
   assert.match(p, /INVISIBLE\s+— a value that never arrives/);
   assert.match(p, /not hard, it is impossible/);
-  assert.match(p, /a probe has to be in the code that\s+gets built/);
+  assert.match(p, /a\s+probe has to be in the code that\s+gets built/);
   // Step 2 exists because instrumenting first and discovering you cannot run it
   // wasted a whole pass.
   assert.match(p, /Do not instrument code you cannot\s+execute/);
@@ -569,6 +569,30 @@ test("the prompt makes the visible/invisible call before the launch", () => {
       `the procedure must not name ${framework} — it is project-independent`,
     );
   }
+  // Every instrumentation tool is named, with what it is for and its key args —
+  // a run that never logged anything reasoned its way there without ever
+  // mentioning a probe tool.
+  assert.match(p, /THE INSTRUMENTATION TOOLS — what each one is for/);
+  for (const [name, shape] of [
+    ["activity_trace_start", /Opens the session/],
+    ["add_log", /\{path, oldString, newString\}/],
+    ["remove_log", /Takes a probe back out[\s\S]{0,40}\{all: true\}/],
+    ["activity_collect", /Reads back what the probes PRINTED/],
+    ["activity_study", /find the root cause/],
+    ["activity_search", /HARNESS's own activity log/],
+    ["activity_tags", /lists the tags that exist/],
+    ["activity_tail_file", /a log the harness never wrote/],
+    ["activity_cleanup", /strips the probes `add_log` placed, and names any it could not/],
+  ]) {
+    assert.match(p, new RegExp(`\`${name}\``), `${name} must be named`);
+    assert.match(p, shape, `${name}'s purpose must be stated`);
+  }
+  assert.match(p, /start → add → run → collect → study → cleanup/, "and the order they go in");
+  // Each is also named at the step that uses it.
+  assert.match(p, /`remove_log \{logId\}` takes that one back out/);
+  assert.match(p, /`activity_collect \{traceId\}`/);
+  assert.match(p, /`activity_cleanup \{traceId\}`/);
+
   // The invariants are stated once, as rules, not buried inside a step.
   assert.match(p, /RULES THAT HOLD AT EVERY STEP/);
   for (const rule of [
