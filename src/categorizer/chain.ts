@@ -524,17 +524,58 @@ export function isObservationTool(name: string): boolean {
  * refusal is one-shot — re-issue the call and it goes through, so the worst case
  * costs a turn and the honest report still lands.
  */
-export function enforceObserveFirst(tools: AgentTool[]): AgentTool[] {
+export function enforceObserveFirst(
+  tools: AgentTool[],
+  opts: { probesBeforeLaunch?: boolean } = {},
+): AgentTool[] {
   const canObserve = tools.some((t) => t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name));
   if (!canObserve) return tools;
+  // Only worth asking about probes when the hop can actually place them.
+  const canInstrument =
+    opts.probesBeforeLaunch === true &&
+    tools.some((t) => isNamed(t.name, ["activity_trace_start", "add_log"]));
   let observed = false;
   let instrumented = false;
-  const refused = { deliver: 0, cleanup: 0 };
+  const refused = { deliver: 0, cleanup: 0, launch: 0 };
   return tools.map((t) => {
     if (t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name)) {
       return {
         ...t,
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          // Interrupt the FIRST launch of an uninstrumented build, once.
+          //
+          // The moment this exists for, from a run that otherwise went well: the
+          // hop found a simulator, launched the app — and then reasoned "I'm
+          // realizing that reproducing this bug visually is quite complex: it
+          // requires having leads in enriching status, seeing that the status
+          // doesn't update…". That is the exact problem probes solve, arrived at
+          // one step too late, and it went back to reading source instead.
+          //
+          // Interrupting HERE and not at deliver is the whole point: a probe has
+          // to be in the source before the build, so once this command runs the
+          // choice is made for the next several minutes. So make it a choice. A
+          // visible defect needs no probes and the model says so by re-issuing;
+          // an invisible one — a value that never arrives, a status that does not
+          // repaint — leaves nothing on a screenshot, and this is the only moment
+          // it is cheap to say so.
+          if (canInstrument && !instrumented && !observed && refused.launch < 1 && isObservationCall(t.name, args)) {
+            refused.launch += 1;
+            return {
+              output:
+                `${t.name} refused ONCE — you are about to run the app with no probes in it.\n\n` +
+                "Decide which kind of defect this is, because after this command the answer is baked " +
+                "into a build:\n" +
+                "  - VISIBLE on screen (wrong text, wrong colour, a broken layout, a crash)? Then a " +
+                "capture is the evidence. Re-issue this exact call and grab the screen.\n" +
+                "  - A VALUE THAT NEVER ARRIVES (a status that does not repaint, a list that does not " +
+                "refresh, a callback that does not fire)? A screenshot of a screen that looks normal " +
+                "proves nothing. `activity_trace_start`, then `add_log` at the sites the code summary " +
+                "named — the branch that returns early, the notify that is not called — THEN run it, " +
+                "drive the flow, and `activity_collect`. Probes must be compiled in, which is why this " +
+                "is the last moment they are cheap.",
+              isError: true,
+            };
+          }
           const res = await t.execute(id, args, ctx);
           // The ARGS decide for bash, so this is checked per call, not per tool.
           if (!res.isError && isObservationCall(t.name, args)) observed = true;
@@ -831,7 +872,11 @@ async function runCategorizerHop(
   let tools = resolveCategorizerTools(input, def, box, shared.mentionTools, hops);
   if (def.id === "write_edit") tools = enforcePlanFirst(tools);
   if (def.id === "activity_reproduce" || def.id === "activity_inspect") {
-    tools = enforceObserveFirst(enforceNoShellAuthoring(tools, input.cwd));
+    tools = enforceObserveFirst(enforceNoShellAuthoring(tools, input.cwd), {
+      // Reproduction only. A verify pass legitimately builds and runs without
+      // probes — it is measuring a change, not hunting for an invisible value.
+      probesBeforeLaunch: def.id === "activity_reproduce",
+    });
   }
   const toolNames = tools.map((t) => t.name);
 

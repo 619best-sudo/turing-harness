@@ -434,3 +434,111 @@ test("everything a QA hop legitimately needs the shell for still works", async (
     assert.equal(res.isError ?? false, false, `${cmd} must be allowed`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Probes are a decision, and the launch is the deadline
+// ---------------------------------------------------------------------------
+
+/**
+ * From the run that finally launched the app. It found a simulator, ran
+ * `flutter run --flavor staging` — and then reasoned: "I'm realizing that
+ * reproducing this bug visually is quite complex: it requires having leads in
+ * enriching status, seeing that the status doesn't update…". That is exactly what
+ * probes are for, realised one step too late, and it went back to reading source
+ * and then to `flutter build ios`, where the run was stopped by hand.
+ *
+ * A probe has to be compiled in, so the launch is the last moment the choice is
+ * cheap. The guard interrupts there, once, and makes it a choice rather than an
+ * omission.
+ */
+const reproTools = (extra = []) =>
+  enforceObserveFirst(
+    [
+      t("read"), t("grep"), t("bash"), t("mobile"), t("drive"),
+      t("activity_trace_start"), t("add_log"), t("activity_collect"),
+      ...extra,
+    ],
+    { probesBeforeLaunch: true },
+  );
+
+test("launching with no probes is interrupted once, as a choice", async () => {
+  const box = { delivered: false };
+  const tools = reproTools([createDeliverTool(cat("activity_reproduce"), box)]);
+  const T = (n) => tools.find((x) => x.name === n);
+
+  // The exploration from the real run: neither of these is a launch.
+  await call(T("bash"), { command: "ls -la /app" });
+  await call(T("bash"), { command: "fvm flutter devices" });
+
+  const launch = await call(T("bash"), { command: "fvm flutter run --flavor staging -d 'iPhone 17 Pro'" });
+  assert.equal(launch.isError, true);
+  assert.match(launch.output, /no probes in it/);
+  assert.match(launch.output, /VISIBLE on screen/, "the visible branch is named");
+  assert.match(launch.output, /VALUE THAT NEVER ARRIVES/, "so is the invisible one");
+  assert.match(launch.output, /compiled in/, "and why the deadline is now");
+
+  // Visible defect: re-issue and go. Never a deadlock.
+  const again = await call(T("bash"), { command: "fvm flutter run --flavor staging -d 'iPhone 17 Pro'" });
+  assert.equal(again.isError ?? false, false);
+  const delivered = await call(T("deliver"), { reproduced: true, symptom: "the row never repaints" });
+  assert.equal(delivered.isError ?? false, false);
+  assert.equal(box.deliverable.reproduced, true, "the launch counted as observing");
+});
+
+test("instrumenting first means never being interrupted", async () => {
+  const box = { delivered: false };
+  const tools = reproTools([createDeliverTool(cat("activity_reproduce"), box)]);
+  const T = (n) => tools.find((x) => x.name === n);
+
+  await call(T("activity_trace_start"), { hint: "polling" });
+  await call(T("add_log"), { path: "/a.dart" });
+  assert.equal((await call(T("bash"), { command: "fvm flutter run -d sim" })).isError ?? false, false);
+  await call(T("activity_collect"), { traceId: "t1" });
+  const delivered = await call(T("deliver"), {
+    reproduced: true,
+    symptom: "status never repaints; the log shows notifyListeners skipped",
+  });
+  assert.equal(delivered.isError ?? false, false);
+  assert.equal(box.deliverable.reproduced, true);
+});
+
+test("a build is neither a launch nor an observation", async () => {
+  const box = { delivered: false };
+  const tools = reproTools([createDeliverTool(cat("activity_reproduce"), box)]);
+  const T = (n) => tools.find((x) => x.name === n);
+  // `flutter build` proves it compiles. It is not interrupted, and it does not
+  // satisfy the deliver guard either.
+  assert.equal((await call(T("bash"), { command: "fvm flutter build ios --debug" })).isError ?? false, false);
+  assert.equal((await call(T("deliver"), { reproduced: true, symptom: "x" })).isError, true);
+});
+
+test("the verify hop is never asked about probes", async () => {
+  const box = { delivered: false };
+  const tools = enforceObserveFirst(
+    [t("bash"), t("add_log"), t("activity_trace_start"), createDeliverTool(cat("activity_inspect"), box)],
+    { probesBeforeLaunch: false },
+  );
+  // Verification measures a change; it runs the suite without instrumenting.
+  const res = await call(tools.find((x) => x.name === "bash"), { command: "flutter test" });
+  assert.equal(res.isError ?? false, false);
+});
+
+test("a hop that cannot instrument is not asked to", async () => {
+  const box = { delivered: false };
+  const tools = enforceObserveFirst([t("bash"), createDeliverTool(cat("activity_reproduce"), box)], {
+    probesBeforeLaunch: true,
+  });
+  const res = await call(tools.find((x) => x.name === "bash"), { command: "curl -s localhost:3000" });
+  assert.equal(res.isError ?? false, false);
+});
+
+test("the prompt makes the visible/invisible call before the launch", () => {
+  const p = buildCategorizerSystemPrompt({
+    id: "activity_reproduce",
+    systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_reproduce,
+    children: ["write_edit"],
+  });
+  assert.match(p, /decide this BEFORE you launch, because a probe has to be compiled in/);
+  assert.match(p, /VALUE\s+THAT NEVER ARRIVES/);
+  assert.match(p, /not hard, it is impossible/);
+});
