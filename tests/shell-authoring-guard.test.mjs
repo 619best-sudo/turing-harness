@@ -99,3 +99,51 @@ test("guard leaves builds, git, reads, sed -n and log redirects alone", () => {
   allowed("mkdir/rm/cp/mv", "mkdir -p lib/x && cp a.ts b.ts && rm -f old.ts");
   allowed("grep", "grep -n 'LaunchDarkly' lib/services/auth_service.dart");
 });
+// ---------------------------------------------------------------------------
+// The gap: Python source is full of semicolons
+// ---------------------------------------------------------------------------
+
+/**
+ * Four heredocs in one run opened a `.dart` file for writing and not one was
+ * detected. The form's regex bridged `python3` to its `open(..., 'w')` with
+ * `[^|;&]*` — and the script in between embedded the Dart it was editing, which
+ * is full of `;`. Every minimal test shape matched; the real one never could.
+ */
+test("a python heredoc is caught even when the script embeds semicolons", () => {
+  const command = [
+    "cd /app && python3 << 'PYEOF'",
+    "import re",
+    "",
+    "with open('lib/providers/leads_provider.dart', 'r') as f:",
+    "    content = f.read()",
+    "",
+    "old = '''  Future<Lead> reload(String leadId, {bool setCurrent = true}) async {",
+    "    final lead = await _repository.getLeadDetail(leadId);",
+    "    Lead? existing;",
+    "    for (final l in _leads) {",
+    "      if (l.id == leadId) { existing = l; break; }",
+    "    }",
+    "'''",
+    "content = content.replace(old, old + '    print(\"TURING_TRACE_x reload\");')",
+    "",
+    "with open('lib/providers/leads_provider.dart', 'w') as f:",
+    "    f.write(content)",
+    "print('Successfully added logs to reload method')",
+    "PYEOF",
+  ].join("\n");
+  const hit = detectShellAuthoring(command);
+  assert.ok(hit, "the write must be detected across the embedded Dart");
+  assert.equal(hit.path, "lib/providers/leads_provider.dart");
+  assert.equal(hit.form, "python inline write");
+});
+
+test("a python script that only READS is still not authoring", () => {
+  const command = [
+    'cd /app && python3 -c "',
+    "with open('lib/a.dart', 'r') as f:",
+    "    lines = f.readlines()",
+    "    for i in range(138, 148):",
+    "        print(f'{i+1}: {repr(lines[i])}')\"",
+  ].join("\n");
+  assert.equal(detectShellAuthoring(command), null);
+});

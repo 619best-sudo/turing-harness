@@ -459,7 +459,14 @@ const SHELL_AUTHORING_FORMS: Array<{
   { label: "output redirect", re: /(?:^|[^0-9<>])>{1,2}\s*([^\s<>|;&]+)/g, shieldQuote: true },
   { label: "sed -i", re: /\bsed\b[^|;&]*\s-i(?:\.\w+)?\b[^|;&]*?\s([^\s|;&]+)\s*$/g, shieldQuote: true },
   { label: "tee", re: /\btee\b(?:\s+-a)?\s+([^\s|;&]+)/g, shieldQuote: true },
-  { label: "python inline write", re: /\bpython3?\b[^|;&]*\bopen\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g },
+  // `[\s\S]{0,6000}?` and NOT `[^|;&]*`: the gap between `python3` and its write
+  // is Python source, and Python source is full of `;`, `|` and `&` — most of all
+  // when the script embeds the code it is editing. Four heredocs that opened a
+  // `.dart` file for writing went undetected because the Dart snippet between the
+  // interpreter and the `open(..., 'w')` contained semicolons, which
+  // `[^|;&]*` cannot cross. Lazy and capped so a pathological command cannot
+  // backtrack: bridging at all is the point, bridging 6KB is already generous.
+  { label: "python inline write", re: /\bpython3?\b[\s\S]{0,6000}?\bopen\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g },
   // `pathlib.Path("file").write_text(...)` / `write_bytes(...)` — the form a
   // model reaches for when `open(...,'w')` is recognised but it still wants to
   // author through the shell. `fullCommand: true` because a `python3 -c` one-

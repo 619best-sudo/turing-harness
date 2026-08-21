@@ -140,7 +140,14 @@ export {
   writeEvidence,
 } from "./orchestrator/verify-artifacts.js";
 export { runToolLoop, type ToolLoopInput, type ToolLoopResult } from "./orchestrator/loop.js";
-export { suggestToolName, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage, levenshtein } from "./orchestrator/tool-suggest.js";
+export {
+  resolveToolAlias,
+  suggestToolName,
+  unknownToolMessage,
+  unknownArgumentKeys,
+  unknownArgumentMessage,
+  levenshtein,
+} from "./orchestrator/tool-suggest.js";
 export {
   coerceFromJsonString,
   coerceStringArgs,

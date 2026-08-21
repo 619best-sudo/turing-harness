@@ -33,6 +33,8 @@ import {
   registerBuiltins,
   renameNote,
   resolveArgAliases,
+  resolveToolAlias,
+  suggestToolName,
   unknownArgumentKeys,
 } from "../dist/index.js";
 
@@ -155,4 +157,65 @@ test("the reminder escalates when saying it once did not work", () => {
   );
   assert.match(many, /does not have those arguments/);
   assert.match(many, /'old' → 'oldString'; 'new' → 'newString'/);
+});
+
+// ---------------------------------------------------------------------------
+// The same problem one level up: the TOOL's name
+// ---------------------------------------------------------------------------
+
+/**
+ * A run called `shell {command: "…"}` twice. `bash` was in its toolset the whole
+ * time, and what came back was:
+ *
+ *     Unknown tool "shell". Did you mean "read"?
+ *
+ * — a suggestion from edit distance alone (four edits out of five characters),
+ * and nonsense. Two turns gone, and the model then abandoned tools and wrote its
+ * probes through `python3` heredocs instead.
+ */
+const KNOWN = ["bash", "read", "grep", "ls", "write", "edit", "add_log", "deliver"];
+
+test("a tool name from another agent's vocabulary resolves to ours", () => {
+  for (const [requested, expected] of [
+    ["shell", "bash"],
+    ["sh", "bash"],
+    ["terminal", "bash"],
+    ["exec", "bash"],
+    ["run_command", "bash"],
+    ["run-command", "bash"],
+    ["RunCommand", "bash"],
+    ["view", "read"],
+    ["read_file", "read"],
+    ["open_file", "read"],
+    ["search", "grep"],
+    ["ripgrep", "grep"],
+    ["rg", "grep"],
+    ["list_files", "ls"],
+    ["write_file", "write"],
+    ["create_file", "write"],
+    ["edit_file", "edit"],
+  ]) {
+    assert.equal(resolveToolAlias(requested, KNOWN), expected, `${requested} → ${expected}`);
+  }
+});
+
+test("only argument-compatible names are aliased", () => {
+  // `apply_patch` carries a patch blob, not edit's anchor and replacement, so
+  // renaming it would move the failure one step later instead of fixing it.
+  assert.equal(resolveToolAlias("apply_patch", KNOWN), undefined);
+  assert.equal(resolveToolAlias("wibble", KNOWN), undefined);
+  // An alias for a tool this categorizer was not given is not a resolution.
+  assert.equal(resolveToolAlias("shell", ["read", "grep"]), undefined);
+  // A namespaced MCP twin is still the tool.
+  assert.equal(resolveToolAlias("shell", ["chrome__bash", "read"]), "chrome__bash");
+});
+
+test("the suggester no longer offers a different word as a typo", () => {
+  // Four edits out of five characters is not a typo. Long names keep the
+  // generous budget; short ones do not.
+  assert.notEqual(suggestToolName("shell", KNOWN), "read");
+  // Real typos still resolve.
+  assert.equal(suggestToolName("reed", KNOWN), "read");
+  assert.equal(suggestToolName("grepp", KNOWN), "grep");
+  assert.equal(suggestToolName("add_logs", KNOWN), "add_log");
 });

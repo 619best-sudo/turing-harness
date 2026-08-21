@@ -1531,3 +1531,63 @@ test("all:true with one open session needs no traceId", async () => {
     for (const [k, v] of saved) sessions.set(k, v);
   }
 });
+
+// ---------------------------------------------------------------------------
+// The refusal that had no way out
+// ---------------------------------------------------------------------------
+
+/**
+ * From a real run: the reproduce hop wanted to log inside `if (setEquals(a, b))
+ * return;`. You cannot do that without adding braces, and adding them changes an
+ * existing line, so `add_log` refused — correctly, and with nothing to try next.
+ * The model then spent a dozen turns going around it: `sed -i`, a hallucinated
+ * `shell` tool, and finally four `python3` heredocs that rewrote the source.
+ *
+ * The way through is always available and purely additive: log the DECISION on a
+ * new line above, printing the values that decide which way it goes.
+ */
+test("add_log's log-only refusal names the additive way through", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "add-log-braces-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "screen.dart");
+  const source = [
+    "void recompute() {",
+    "  final ids = provider.enrichingIds;",
+    "  if (setEquals(ids, last)) return;",
+    "  last = ids;",
+    "}",
+    "",
+  ].join("\n");
+  await fs.writeFile(file, source);
+
+  const reg = new Registry();
+  registerBuiltins(reg, { logStore: new LogStore() });
+  const ctx = { cwd: dir, log: () => {} };
+  const started = await reg.getTool("activity_trace_start").execute("i", { language: "dart", hint: "polling" }, ctx);
+  const traceId = started.details?.traceId;
+  const marker = started.output.match(/TURING_TRACE_[a-z0-9]+/)?.[0];
+  assert.ok(traceId && marker, "a trace session and its marker");
+
+  // What the run actually tried: braces around the early return so a log fits.
+  const anchor = "  if (setEquals(ids, last)) return;";
+  const braced = await reg.getTool("add_log").execute(
+    "i",
+    { path: file, oldString: anchor, newString: `  if (setEquals(ids, last)) {\n    print("${marker} early");\n    return;\n  }`, traceId },
+    ctx,
+  );
+  assert.equal(braced.isError, true, "still refused — adding braces is a code change");
+  assert.match(braced.output, /IF THE LINE YOU WANT TO LOG INSIDE HAS NO BRACES/);
+  assert.match(braced.output, /on a new line directly ABOVE it/);
+  assert.equal(await fs.readFile(file, "utf8"), source, "and nothing was written");
+
+  // The alternative the refusal names, and it works.
+  const above = await reg.getTool("add_log").execute(
+    "i",
+    { path: file, oldString: anchor, newString: `  print("${marker} recompute ids=$ids last=$last");\n${anchor}`, traceId },
+    ctx,
+  );
+  assert.equal(above.isError ?? false, false, "logging the decision is accepted");
+  const written = await fs.readFile(file, "utf8");
+  assert.match(written, /print\("TURING_TRACE_[a-z0-9]+ recompute ids=\$ids last=\$last"\);/);
+  assert.match(written, /^ {2}if \(setEquals\(ids, last\)\) return;$/m, "the decision line is byte-identical");
+});

@@ -68,6 +68,75 @@ function plausiblyRelated(requested: string, candidate: string): boolean {
 }
 
 /**
+ * Tool names a model reaches for that ARE another tool, exactly.
+ *
+ * Not typos — a different agent's vocabulary for the same capability. A run
+ * called `shell {command: "…"}` twice; the shell it wanted was `bash`, sitting in
+ * the toolset, and what it got back was "Unknown tool \"shell\". Did you mean
+ * \"read\"?" — a suggestion produced by edit distance alone, and nonsense. It
+ * then spent the next several turns writing its probes through `python3`
+ * heredocs instead.
+ *
+ * Every entry here must be ARGUMENT-COMPATIBLE with its target, because renaming
+ * a call whose fields the target does not accept just moves the failure one step
+ * later: `apply_patch` is deliberately absent for that reason — it carries a
+ * patch blob, not `edit`'s anchor and replacement.
+ */
+const TOOL_NAME_ALIASES: Record<string, string> = {
+  // bash — `{command}` in every one of these vocabularies.
+  shell: "bash",
+  sh: "bash",
+  terminal: "bash",
+  exec: "bash",
+  execute: "bash",
+  run_command: "bash",
+  runcommand: "bash",
+  run_shell_command: "bash",
+  shell_command: "bash",
+  // read — `{path}`.
+  view: "read",
+  view_file: "read",
+  read_file: "read",
+  open_file: "read",
+  cat_file: "read",
+  // grep — `{pattern}`, and grep's own argAliases take `query`/`search`.
+  search: "grep",
+  search_files: "grep",
+  ripgrep: "grep",
+  rg: "grep",
+  code_search: "grep",
+  // ls — `{path}`.
+  list_files: "ls",
+  list_dir: "ls",
+  list_directory: "ls",
+  // write / edit — `{path, content}` and `{path, oldString, newString}`.
+  write_file: "write",
+  create_file: "write",
+  edit_file: "edit",
+  replace_in_file: "edit",
+};
+
+/**
+ * The registered tool a requested name IS, under another vocabulary.
+ *
+ * Case- and separator-insensitive, and only ever returns a name the run actually
+ * holds — an alias for a tool this categorizer was not given is not a resolution,
+ * it is a different missing tool.
+ */
+export function resolveToolAlias(requested: string, known: Iterable<string>): string | undefined {
+  const normalized = requested.toLowerCase().replace(/[\s_-]/g, "");
+  const names = [...known];
+  const direct = new Map(names.map((n) => [n.toLowerCase().replace(/[\s_-]/g, ""), n]));
+  // A namespaced MCP twin counts: `chrome__bash` is still bash.
+  const target = Object.entries(TOOL_NAME_ALIASES).find(
+    ([alias]) => alias.replace(/[\s_-]/g, "") === normalized,
+  )?.[1];
+  if (!target) return undefined;
+  const hit = direct.get(target) ?? names.find((n) => n.endsWith(`__${target}`));
+  return hit;
+}
+
+/**
  * The closest registered tool name to `requested`, or undefined when nothing is
  * close enough to be worth suggesting. Combines edit distance (typos) with the
  * `plausiblyRelated` category check (MCP name confusion).
@@ -81,7 +150,17 @@ export function suggestToolName(requested: string, known: Iterable<string>): str
     // Accept a close edit-distance match OR a plausible category relation, but
     // rank edit-distance wins above category relations (a typo of a real name
     // is a stronger signal than a shared token).
-    if (dist > 4 && !related) continue;
+    // A flat budget of 4 let "shell" match "read" — four edits out of five
+    // characters is not a typo, it is a different word, and offering it sent a
+    // run off to write its probes by hand instead of calling `bash`.
+    //
+    // Length ratio does not separate the two cases ("rdit"/"read" is three edits
+    // on four characters and IS a typo). What separates them is the first
+    // letter: a mistyped name almost always keeps it, and a name from another
+    // vocabulary usually does not. So spend the wide budget only when the first
+    // character agrees; otherwise two edits is the whole allowance.
+    const sameInitial = req[0] === candidate[0]?.toLowerCase();
+    if (dist > (sameInitial ? 4 : 2) && !related) continue;
     const score = related ? Math.min(dist, 3) + 0.5 : dist;
     if (!best || score < best.score) best = { name: candidate, score };
   }

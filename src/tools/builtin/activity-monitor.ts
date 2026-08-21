@@ -1734,7 +1734,18 @@ async function addLogAction(
         `add_log: this replacement is not log-only, so nothing was written to ${file}. It must ADD (or remove) ` +
         `\`TURING_TRACE ...\` lines and leave every other line exactly as it was — the anchor's own lines have to ` +
         `survive verbatim in \`newString\`. Rewriting, reformatting or deleting a line of code here is a FIX, ` +
-        `and a fix goes through \`edit\` (where it is authored, recorded, and gated on having observed the bug).`,
+        `and a fix goes through \`edit\` (where it is authored, recorded, and gated on having observed the bug).\n\n` +
+        // The case that sends a model off to write probes by hand, and the answer
+        // to it. A brace-less early return (`if (x) return;`) cannot be logged
+        // INSIDE without adding braces — which is a code change, so this refuses
+        // it, and a refusal with no way forward is how one run ended up editing
+        // the file through a `python3` heredoc instead.
+        `IF THE LINE YOU WANT TO LOG INSIDE HAS NO BRACES — \`if (x) return;\`, \`for (…) doThing();\` — do not ` +
+        `add them. Log the DECISION instead, on a new line directly ABOVE it, printing the values that decide ` +
+        `which way it goes:\n` +
+        `    print("TURING_TRACE… recompute enrichingIds=$a last=$b");   // <- the added line\n` +
+        `    if (setEquals(a, b)) return;                                // <- untouched\n` +
+        `That tells you whether the branch was taken AND why, costs no code change, and comes back out cleanly.`,
       isError: true,
       details: { path: file, rejected: "not-log-only" },
     };

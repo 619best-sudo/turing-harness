@@ -60,7 +60,13 @@ import { StallGuard, STEP_BUDGET_EXHAUSTED } from "./stall-guard.js";
 import { ClarifyGate, normalizeQuestion } from "./clarify-gate.js";
 import { ToolFallbackAdvisor, type FallbackAdvice } from "./tool-fallback.js";
 import { SearchLadderAdvisor, type SearchAdvice } from "./search-ladder.js";
-import { nameBeforeFraming, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage } from "./tool-suggest.js";
+import {
+  nameBeforeFraming,
+  resolveToolAlias,
+  unknownToolMessage,
+  unknownArgumentKeys,
+  unknownArgumentMessage,
+} from "./tool-suggest.js";
 import {
   coerceStringArgs,
   coercionNote,
@@ -702,6 +708,28 @@ function guessImageMime(p: string): string {
           }
         }
 
+        // A name that IS another tool, in another agent's vocabulary — resolve it
+        // and run it. The alternative, observed twice in one run: `shell
+        // {command}` answered with "Unknown tool. Did you mean read?" while
+        // `bash` sat unused in the same toolset, after which the model gave up on
+        // tools and wrote its probes through `python3` heredocs.
+        //
+        // Resolved HERE, before the lookup, so everything downstream — argument
+        // validation, the permission gate, `mutates` — sees the real tool.
+        let renamedTool: { from: string; to: string } | undefined;
+        if (!toolByName.has(call.name)) {
+          const aliased = resolveToolAlias(call.name, toolByName.keys());
+          if (aliased) {
+            renamedTool = { from: call.name, to: aliased };
+            logStore.append({
+              tags: ["loop", "tools", "tools:name-resolved"],
+              level: "info",
+              message: `${call.name} → ${aliased} (same tool, different name)`,
+              data: { requested: call.name, resolved: aliased, ...(input.label ? { label: input.label } : {}) },
+            });
+            call.name = aliased;
+          }
+        }
         const tool = toolByName.get(call.name);
         const mutates = tool?.mutates ?? true;
         const argPath = (call.arguments as { path?: unknown } | undefined)?.path;
@@ -1366,6 +1394,21 @@ function guessImageMime(p: string): string {
           if (coercedArgs.length) {
             resultMsg.content = boundResultContent(
               [{ type: "text", text: coercionNote(coercedArgs, call.name) }, ...(resultMsg.content ?? [])],
+              call.name,
+            );
+          }
+          if (renamedTool) {
+            resultMsg.content = boundResultContent(
+              [
+                {
+                  type: "text",
+                  text:
+                    `NOTE: there is no tool called \`${renamedTool.from}\` here — \`${renamedTool.to}\` is ` +
+                    `the same capability under this harness's name, and the call ran as that. Use ` +
+                    `\`${renamedTool.to}\` from now on.`,
+                },
+                ...(resultMsg.content ?? []),
+              ],
               call.name,
             );
           }
