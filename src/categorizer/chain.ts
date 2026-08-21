@@ -19,6 +19,7 @@
  * lives in `runToolLoop`, which this chain drives once per categorizer with the
  * categorizer's scoped toolset and driver model.
  */
+import * as os from "node:os";
 import * as path from "node:path";
 import type {
   AgentEvent,
@@ -26,6 +27,7 @@ import type {
   AskUserQuestionRequest,
   AskUserQuestionResult,
   LiveImage,
+  ResolvedClarification,
   LLMBridge,
   MediaRef,
   Model,
@@ -42,7 +44,7 @@ import { emptyUsage } from "../types.js";
 import type { Registry } from "../registry/registry.js";
 import type { LogStore } from "../logging/logger.js";
 import { PermissionGate } from "../orchestrator/permission.js";
-import { ClarifyGate } from "../orchestrator/clarify-gate.js";
+import { ClarifyGate, normalizeQuestion, shellAuthoringTarget } from "../orchestrator/clarify-gate.js";
 import { runToolLoop, type ToolLoopResult } from "../orchestrator/loop.js";
 import { PROBE_MARKER_RE } from "../probe-marker.js";
 import { triageImageAttachment, triageDocumentAttachment, isDocumentRef } from "../orchestrator/attachment-triage.js";
@@ -52,6 +54,7 @@ import {
   type CategorizerDefinition,
   type CategorizerDeliverable,
   type CategorizerHop,
+  type CategorizerId,
   type CategorizerSetup,
   type CategorizerToolRecord,
 } from "./types.js";
@@ -60,12 +63,15 @@ import { buildCategorizerSystemPrompt } from "./prompts.js";
 import {
   createDeliverTool,
   deriveFallbackDeliverable,
+  takeHandoff,
   DELIVER_TOOL_NAME,
   type DeliverBox,
 } from "./deliver.js";
 import { createClearingDoubtTool, CLEARING_DOUBT_TOOL_NAME } from "./clearing-doubt.js";
 import { extractMentionTokens, resolveMentions, renderMentionNote } from "./mentions.js";
 import { routeCategorizer, type RouterChoice } from "./router.js";
+import { applyPolicyToRouted, decideFromDriver } from "./route-policy.js";
+import { ComprehensionStore } from "../tools/builtin/comprehension.js";
 
 // ---------------------------------------------------------------------------
 // Input / output
@@ -203,7 +209,7 @@ function resolveCategorizerTools(
   // (a host's custom tool, an MCP server a preset scoped here). This is how a
   // registered capability reaches the categorizers its scope names.
   try {
-    for (const t of input.registry?.getToolsForCategorizer(def.id) ?? []) {
+    for (const t of input.registry?.getToolsForCategorizer(def.toolScope ?? def.id) ?? []) {
       if (!byName.has(t.name)) byName.set(t.name, t);
     }
   } catch {
@@ -248,9 +254,11 @@ function resolveCategorizerTools(
 }
 
 /**
- * Enforce "create_plan always" in write_edit: the first write/edit is refused
- * (twice, then allowed — a deadlock is worse than a soft nudge) until a
- * create_plan call has succeeded in this loop.
+ * Enforce "create_plan always" in write_edit: every write/edit is refused until
+ * a create_plan call has succeeded in this loop. STRICT — there is no
+ * with-nudges bypass: every file change matches a plan step, and a model that
+ * cannot call create_plan is stopped honestly by the stall guard rather than
+ * editing outside the plan.
  *
  * The rule is taught at the DESCRIPTION layer too, not only enforced at the
  * gate: a small model chooses its next call from the tool schemas, and the
@@ -263,7 +271,6 @@ function resolveCategorizerTools(
  */
 function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
   let planSeen = false;
-  let refusals = 0;
   return tools.map((t) => {
     if (t.name === "create_plan") {
       return {
@@ -290,8 +297,13 @@ function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
           t.description +
           " Plan-first: REFUSED until create_plan has succeeded in this categorizer — call create_plan first, then re-issue.",
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
-          if (!planSeen && refusals < 2) {
-            refusals++;
+          // STRICT: there is no bypass. Every write/edit runs only after a
+          // successful create_plan in this categorizer — the reward for the
+          // model that calls create_plan is that its edits stop being refused.
+          // The refusal names the single escape (create one step); a model that
+          // cannot do that is stopped honestly by the stall guard rather than
+          // editing outside the plan.
+          if (!planSeen) {
             return {
               output:
                 "create_plan comes FIRST in this categorizer — even a one-line change gets a plan " +
@@ -299,6 +311,317 @@ function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
                 "nothing is lost.",
               isError: true,
             };
+          }
+          return t.execute(id, args, ctx);
+        },
+      };
+    }
+    return t;
+  });
+}
+
+/**
+ * Shell commands that UNDO work rather than observe it.
+ *
+ * Not authoring, so `detectShellAuthoring` does not see them, and worse than
+ * authoring: `git checkout -- <file>` throws away changes with no record of what
+ * they were. A QA hop ran exactly this on two source files mid-pass.
+ */
+const DESTRUCTIVE_GIT = /\bgit\s+(checkout\s+(--\s+)?\S+\.\w|restore\b|reset\s+--hard\b|clean\s+-[a-z]*f|stash\b(?!\s+list))/;
+
+/**
+ * Keep a QA hop out of the source tree.
+ *
+ * Both QA categorizers are told, at length, that they do not author product
+ * code, and neither holds `write` or `edit`. Neither fact stops `bash`, which is
+ * a global tool and can do anything — and on the run this exists for, the
+ * reproduce hop never instrumented, never launched the app, and instead:
+ *
+ *     git checkout lib/providers/leads_provider.dart lib/services/…      (reverted work)
+ *     cat /tmp/fix.patch                                                 (built a patch)
+ *     python3 << 'PYTHON' … open('lib/providers/leads_provider.dart','w') (authored the fix)
+ *
+ * That is the fix hop's job, done blind, in the pass whose entire purpose is to
+ * SEE the defect first — and it is why the run was stopped by hand.
+ *
+ * A hard refusal, not the one-shot kind used elsewhere: there is no situation in
+ * which this hop should be rewriting project source, and refusing costs it
+ * nothing — the evidence it owes can always still be gathered and delivered.
+ * Scratch paths are exempt, so writing a throwaway script or a temp file to
+ * exercise the code is still available; `detectShellAuthoring` only reports
+ * source-shaped targets, and anything under a temp dir or outside the project is
+ * not the source tree.
+ */
+export function enforceNoShellAuthoring(tools: AgentTool[], cwd: string): AgentTool[] {
+  return tools.map((t) => {
+    if (bareName(t.name) !== "bash") return t;
+    return {
+      ...t,
+      description:
+        t.description +
+        " In this categorizer the shell RUNS things — it may not write or revert project files " +
+        "(no heredoc/sed/redirect into source, no `git checkout`/`restore`/`reset --hard`).",
+      execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+        const command = typeof args?.command === "string" ? args.command : "";
+        if (command) {
+          if (DESTRUCTIVE_GIT.test(command)) {
+            return {
+              output:
+                "bash refused — this categorizer does not undo work. `git checkout`/`restore`/" +
+                "`reset --hard`/`stash` discard changes that another pass made deliberately, and " +
+                "nothing here needs a clean tree: you are establishing what the software DOES, not " +
+                "changing what it is. Run it and observe instead.",
+              isError: true,
+            };
+          }
+          const authoring = shellAuthoringTarget("bash", args);
+          if (authoring && isProjectPath(cwd, authoring.path)) {
+            return {
+              output:
+                `bash refused — that command writes ${authoring.path} (${authoring.form}), and this ` +
+                "categorizer does not author product code. Two tools own the two legitimate reasons " +
+                "to touch a file here:\n" +
+                "  - a trace probe → `add_log` (log-only, and `activity_cleanup` takes it back out);\n" +
+                "  - the fix itself → not you. `write_edit` runs after you and works from your report; " +
+                "a fix written here is written blind, before anyone has seen the defect.\n\n" +
+                "What is missing from this pass is one observation. Launch it (`drive`/`mobile`), or " +
+                "run the project's own run/test command, and look at what it does. A scratch file " +
+                "outside the project (a temp script, a throwaway harness) is still fine.",
+              isError: true,
+            };
+          }
+        }
+        return t.execute(id, args, ctx);
+      },
+    };
+  });
+}
+
+/** Is this path inside the project tree (as opposed to a temp/scratch location)? */
+function isProjectPath(cwd: string, target: string): boolean {
+  const resolved = path.isAbsolute(target) ? target : path.join(cwd, target);
+  const tmp = os.tmpdir();
+  if (resolved.startsWith(tmp) || resolved.startsWith("/tmp/") || resolved.startsWith("/var/tmp/")) return false;
+  const relative = path.relative(cwd, resolved);
+  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/**
+ * Tools that OBSERVE the software while it runs, as opposed to reading its source.
+ *
+ * Name-prefix matched so an MCP server's spelling (`chrome__browser_navigate`,
+ * `mobilecli_tap`) counts too — the question is only "did this hop look at the
+ * thing running", and a namespace prefix does not change the answer.
+ *
+ * `bash` is NOT here. It is the one tool that can be either, and the difference
+ * decided a real run: see `isRuntimeCommand`.
+ */
+const OBSERVATION_TOOL_PREFIXES = [
+  "drive",
+  "mobile",
+  "browser_",
+  "activity_inspect",
+  "activity_collect",
+  "activity_study",
+  "activity_search",
+  "activity_tail_file",
+  "take_screenshot",
+  "take_snapshot",
+  "media_analysis",
+  "lighthouse_audit",
+  "performance_",
+];
+
+/** Tools that place or remove instrumentation, rather than observe with it. */
+const INSTRUMENTATION_TOOLS = ["activity_trace_start", "add_log", "remove_log", "activity_cleanup"];
+
+const bareName = (name: string): string =>
+  name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : name;
+
+const isNamed = (name: string, names: readonly string[]): boolean => {
+  const bare = bareName(name);
+  return names.some((n) => bare === n || bare.startsWith(n));
+};
+
+/**
+ * Shell commands that RUN the software, as opposed to asking questions about the
+ * checkout.
+ *
+ * This distinction is the whole point and it cost a run to learn. `bash` used to
+ * count as an observation unconditionally, so the QA hop's very first shell call
+ * — `find … -name "*test*"` — marked the hop as having "observed the software
+ * running". It then found a booted iPhone simulator with `flutter devices`,
+ * decided it needed to work out how to launch the app, stripped its own probes
+ * instead, and delivered a code analysis as a reproduced symptom. The guard
+ * meant to stop exactly that had already been satisfied by a `find`.
+ *
+ * Builds are deliberately absent: `flutter build`, `tsc`, `cargo check` prove the
+ * code COMPILES, which is the false confidence this guard exists to reject. Test
+ * runners are deliberately present — a logic fix verified by its own suite is
+ * genuinely verified. `flutter devices` / `adb devices` list hardware and run
+ * nothing, so they are absent too.
+ */
+export function isRuntimeCommand(command: unknown): boolean {
+  if (typeof command !== "string" || !command.trim()) return false;
+  const text = command.toLowerCase();
+  const RUNS = [
+    // Test runners — running the code is the point of them.
+    /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|dev|start|serve|e2e)\b/,
+    /\b(vitest|jest|mocha|ava|playwright\s+test|cypress|nightwatch)\b/,
+    /\bflutter\s+(run|test|drive|attach)\b/,
+    /\b(pytest|python\s+-m\s+pytest|unittest|tox|nox)\b/,
+    /\bgo\s+(test|run)\b/,
+    /\bcargo\s+(test|run)\b/,
+    /\b(dotnet|mvn|gradle|gradlew|sbt)\s+(test|run|bootrun)\b/,
+    /\brspec\b|\brails\s+(server|s|test)\b|\bbundle\s+exec\s+(rspec|rails)\b/,
+    /\bphpunit\b|\bartisan\s+(serve|test)\b/,
+    /\bmake\s+(test|run|dev|start|e2e)\b/,
+    // Exercising a running service.
+    /\bcurl\b|\bhttpie\b|\bwget\b|\bgrpcurl\b/,
+    // Driving a device or emulator for real.
+    /\b(xcrun\s+simctl\s+launch|adb\s+shell|idb\s+launch)\b/,
+    // Reading what a run produced, live.
+    /\b(tail|log(cat)?)\s+.*-f\b|\badb\s+logcat\b|\bxcrun\s+simctl\s+spawn\b/,
+  ];
+  return RUNS.some((re) => re.test(text));
+}
+
+/** Did this tool call observe the software actually running? */
+export function isObservationCall(name: string, args?: Record<string, unknown>): boolean {
+  if (isNamed(name, OBSERVATION_TOOL_PREFIXES)) return true;
+  if (bareName(name) === "bash") return isRuntimeCommand(args?.command);
+  return false;
+}
+
+/** Kept for callers that only have a tool NAME — a bash call needs its args. */
+export function isObservationTool(name: string): boolean {
+  return isNamed(name, OBSERVATION_TOOL_PREFIXES) || bareName(name) === "bash";
+}
+
+/**
+ * Make a QA hop observe the software before it reports on it.
+ *
+ * Two failures, from two consecutive runs, produced the three rules here.
+ *
+ * The first: the QA hop spent eight and a half minutes on 25 `read`s, 6 `grep`s
+ * and 6 `bash`es without one driving or capture call, then ended without
+ * delivering. A hop that reads source and reasons is a read hop; the prompts say
+ * so at length, and prose did not bind.
+ *
+ * The second, with the guard in place: it instrumented (one `add_log` landed,
+ * four were refused for not being log-only), asked `flutter devices`, found a
+ * booted simulator — and then called `activity_cleanup`, deleting the probes it
+ * had just placed, read two more files, and delivered `reproduced: true` for a
+ * defect it had never seen. Its own reasoning said it should use the simulator
+ * "however I need to check if there's a way to run the app". Cleanup was the exit.
+ *
+ * So: an observation must be a RUN (not a `find`), instrumentation may not be
+ * torn down before it has run, and a claim of reproduction that the harness can
+ * positively disprove is corrected rather than passed on.
+ *
+ * Graceful throughout, because a hop that genuinely CANNOT observe must not
+ * deadlock: the guard arms only when the hop holds an observation tool, and every
+ * refusal is one-shot — re-issue the call and it goes through, so the worst case
+ * costs a turn and the honest report still lands.
+ */
+export function enforceObserveFirst(tools: AgentTool[]): AgentTool[] {
+  const canObserve = tools.some((t) => t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name));
+  if (!canObserve) return tools;
+  let observed = false;
+  let instrumented = false;
+  const refused = { deliver: 0, cleanup: 0 };
+  return tools.map((t) => {
+    if (t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name)) {
+      return {
+        ...t,
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          const res = await t.execute(id, args, ctx);
+          // The ARGS decide for bash, so this is checked per call, not per tool.
+          if (!res.isError && isObservationCall(t.name, args)) observed = true;
+          return res;
+        },
+      };
+    }
+    // Placing a probe is a promise to run the flow it reports on.
+    if (isNamed(t.name, ["activity_trace_start", "add_log"])) {
+      return {
+        ...t,
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          const res = await t.execute(id, args, ctx);
+          if (!res.isError) instrumented = true;
+          return res;
+        },
+      };
+    }
+    // Tearing instrumentation down before it has run is giving up, not tidying.
+    if (isNamed(t.name, ["remove_log", "activity_cleanup"])) {
+      return {
+        ...t,
+        description:
+          t.description +
+          " Refused once if you instrumented and have NOT yet run the flow — probes record nothing " +
+          "until the code executes.",
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          if (instrumented && !observed && refused.cleanup < 1) {
+            refused.cleanup += 1;
+            return {
+              output:
+                `${t.name} refused — you placed probes and have not run the flow yet, so they have ` +
+                "recorded nothing. Taking them out now throws away the only evidence this pass was " +
+                "going to produce.\n\nRun it: `mobile {action:\"launch\"}` or `drive {action:\"open\"}` " +
+                "for a UI, the project's own run/test command through `bash` otherwise — then " +
+                "`activity_collect` to read what the probes saw. Strip them AFTER that.\n\nIf you " +
+                "genuinely cannot run it — nothing to launch on, credentials you do not have — " +
+                "re-issue this exact call and report `reproduced: false` with what you tried; the " +
+                "cleanup will go through and the honest answer is worth more than a guess.",
+              isError: true,
+            };
+          }
+          return t.execute(id, args, ctx);
+        },
+      };
+    }
+    if (t.name === DELIVER_TOOL_NAME) {
+      return {
+        ...t,
+        description:
+          t.description +
+          " Refused once if you have not yet RUN or CAPTURED anything in this categorizer — reading " +
+          "source is not observing behaviour.",
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          if (!observed && refused.deliver < 1) {
+            refused.deliver += 1;
+            return {
+              output:
+                "deliver refused — this categorizer has not observed the software running. Reading " +
+                "source and reasoning about it produces a hypothesis, and a hypothesis is what the " +
+                "READ pass already delivered; what is missing is one observation. Run it and look: " +
+                "`drive`/`mobile` for a UI, `activity_inspect` for a single screen, the project's own " +
+                "run or test command through `bash` for an endpoint or a code path, then " +
+                "`activity_collect` if you placed probes. Listing devices or searching for test files " +
+                "is not running it. If you genuinely cannot reach it — no device, no credentials, no " +
+                "way in — re-issue this exact call with `reproduced: false` and say what you tried; " +
+                "it will go through.",
+              isError: true,
+            };
+          }
+          // A claim the harness can positively disprove. Not invention: the hop
+          // either ran something or it did not, and passing `reproduced: true`
+          // downstream would tell the fixer a defect was witnessed when the run
+          // holds no evidence that anything was.
+          if (!observed && args?.reproduced === true) {
+            const symptom = typeof args.symptom === "string" ? args.symptom : "";
+            return t.execute(
+              id,
+              {
+                ...args,
+                reproduced: false,
+                symptom:
+                  `${symptom}\n\n(NOT OBSERVED — this pass ran nothing, so what follows is analysis, ` +
+                  "not a witnessed symptom.)".trim(),
+              },
+              ctx,
+            );
           }
           return t.execute(id, args, ctx);
         },
@@ -329,6 +652,7 @@ function buildOpening(
     imageNote?: string;
     fileNote?: string;
     mentionFiles: string[];
+    clarifications: ResolvedClarification[];
   },
 ): string {
   const lines: string[] = [];
@@ -338,6 +662,37 @@ function buildOpening(
   if (ctx.fileNote) lines.push(ctx.fileNote);
   for (const f of ctx.mentionFiles) lines.push(`MENTIONED FILE: ${f}`);
   if (ctx.mentionNote) lines.push(ctx.mentionNote);
+
+  // Placed immediately under TASK, and OUTSIDE the `accepts` contract below.
+  //
+  // `TASK:` above is the user's original wording, which never changes — so on a
+  // request like "change the title to something else" it reads as unspecified for
+  // the whole run, in every hop, even after the user has said what they want.
+  // A hop that saw only that line asked the question a second time. The answer is
+  // not another categorizer's finding to be granted or withheld by `accepts`; it
+  // is what the user said, and every hop after it gets it.
+  if (ctx.clarifications.length) {
+    lines.push(
+      [
+        "ALREADY ANSWERED BY THE USER (this run) — treat as part of the task and DO NOT ask again:",
+        ...ctx.clarifications.map((entry) => {
+          const files = entry.attachments?.length
+            ? `\n  they attached: ${entry.attachments
+                .map((file) => `${file.path} (${file.mimeType})`)
+                .join(", ")}`
+            : "";
+          return (
+            `- asked: ${entry.question}\n  answered: ${entry.answer}` +
+            (entry.reason ? `\n  why it was asked: ${entry.reason}` : "") +
+            files
+          );
+        }),
+        "These answers OUTRANK the task text above wherever they conflict — the task was written before the",
+        "user answered. Attached images are already in your attachment set; read any other attached file",
+        "rather than asking what it contains. Re-asking any of this is refused.",
+      ].join("\n"),
+    );
+  }
 
   if (hops.length === 0) {
     const fu = input.followUpContext;
@@ -460,17 +815,32 @@ async function runCategorizerHop(
     triageCallback?: (img: { path: string; mimeType: string }) => Promise<{ fact?: string; note?: string; category?: string } | undefined>;
     readCache: Map<string, string>;
     complexityByPath: Record<string, import("../types.js").ComplexityRating>;
+    comprehensionStore: ComprehensionStore;
+    /** True once the host flag OR the router says this run fixes a reported bug. */
+    isBugFix: boolean;
+    /**
+     * Questions the user has answered, run-wide. Grown after every hop and
+     * handed to the next one — the channel that stops a later categorizer
+     * asking for a value the user already gave.
+     */
+    clarifications: ResolvedClarification[];
   },
 ): Promise<HopRun> {
   const model = input.modelFor(def);
   const box: DeliverBox = { delivered: false };
   let tools = resolveCategorizerTools(input, def, box, shared.mentionTools, hops);
   if (def.id === "write_edit") tools = enforcePlanFirst(tools);
+  if (def.id === "activity_reproduce" || def.id === "activity_inspect") {
+    tools = enforceObserveFirst(enforceNoShellAuthoring(tools, input.cwd));
+  }
   const toolNames = tools.map((t) => t.name);
 
   const systemPrompt = buildCategorizerSystemPrompt(def, toolNames, {
     authorOnlyWrites: input.authorOnlyWrites,
-    isBugFix: input.isBugFix,
+    // The run's live verdict, not just the host's flag: the router also reads the
+    // request, and a bug report phrased outside the host's patterns used to lose
+    // write_edit's reproduce-first directive along with everything else.
+    isBugFix: shared.isBugFix || input.isBugFix,
     ...(input.projectCategory ? { projectCategory: input.projectCategory } : {}),
   });
 
@@ -479,6 +849,7 @@ async function runCategorizerHop(
     imageNote: shared.imageNote,
     fileNote: shared.fileNote,
     mentionFiles: shared.mentionFiles,
+    clarifications: shared.clarifications,
   });
 
   input.emit({ type: "categorizer_start", categorizer: def.id, model: model.openRouterSlug ?? model.id });
@@ -530,6 +901,10 @@ async function runCategorizerHop(
       ? { planApproval: input.planApproval }
       : {}),
     ...(shared.images.length ? { images: shared.images } : {}),
+    // The run-scoped comprehension store: the read hop's expert analyses are
+    // visible to (and re-injected into) every later hop at zero model cost, so a
+    // file is analysed once per run no matter how many hops touch it.
+    sharedComprehension: shared.comprehensionStore,
     // Read-deliverable snippets feed the AUTHORING context only (labeled as
     // extracts). They must not satisfy a `read` — write_edit's edit anchors
     // need the file's exact bytes, so a read in that hop executes for real
@@ -540,13 +915,18 @@ async function runCategorizerHop(
     sharedReadCache: shared.readCache,
     ...(Object.keys(shared.complexityByPath).length ? { complexityByPath: { ...shared.complexityByPath } } : {}),
     clarifyGate: shared.clarifyGate,
+    ...(shared.clarifications.length ? { clarifications: [...shared.clarifications] } : {}),
     phase: def.id,
     ...(input.projectCategory ? { projectCategory: input.projectCategory } : {}),
     label: `categorizer:${def.id}`,
   });
 
-  const deliverable = box.delivered
-    ? box.deliverable
+  // Split the routing fields out of the payload before anything else touches it:
+  // the deliverable is rendered verbatim into the next categorizer's opening, and
+  // a note addressed to the CHAIN reads there as a note addressed to that hop.
+  const handoff = takeHandoff(def, box.delivered ? box.deliverable : undefined);
+  let deliverable = box.delivered
+    ? handoff.deliverable
     : deriveFallbackDeliverable(def, {
         writtenPaths: loop.writtenPaths,
         readPaths: loop.readPaths,
@@ -560,10 +940,38 @@ async function runCategorizerHop(
     });
   }
 
+  // The read hop's deliverable carries the expert analyses the store holds for
+  // the files it read, so the write_edit hop's OPENING context already includes
+  // them — it can reason about the files before its first read, and the full
+  // texts travel in the shared store for zero-cost re-injection on its reads.
+  // Bounded here; `renderDeliverable` truncates the handoff in either case.
+  if (def.id === "read") {
+    const readSet = new Set(loop.readPaths.map((p) => path.normalize(p)));
+    const comprehensions = shared.comprehensionStore
+      .entries()
+      .filter(({ path: p, value }) => Boolean(value.analysis) && readSet.has(path.normalize(p)))
+      .map(({ path: p, value }) => ({
+        path: p,
+        rating: value.rating as "low" | "medium" | "high",
+        model: value.model ?? "unknown",
+        analysis: trunc(value.analysis ?? "", 700),
+      }))
+      .slice(0, 5);
+    if (comprehensions.length) {
+      deliverable = { ...(deliverable as object), comprehensions };
+    }
+  }
+
   const summaryText =
     (deliverable as { summary?: string }).summary ??
     (deliverable as { codeSummary?: string }).codeSummary ??
     (deliverable as { findings?: string }).findings ??
+    // A repro report's headline is the symptom, prefixed with whether it was
+    // actually seen — the router's one-line view of this hop must not read as
+    // "the defect is confirmed" when the answer was could-not-reproduce.
+    ((deliverable as { symptom?: string }).symptom
+      ? `${(deliverable as { reproduced?: boolean }).reproduced === false ? "NOT reproduced" : "reproduced"}: ${(deliverable as { symptom?: string }).symptom}`
+      : undefined) ??
     (deliverable as { notes?: string }).notes ??
     trunc(loop.finalText, 200) ??
     "(no summary)";
@@ -578,7 +986,17 @@ async function runCategorizerHop(
     writtenPaths: loop.writtenPaths,
     readPaths: loop.readPaths,
     ...(loop.planSet ? { planSet: loop.planSet } : {}),
+    ...(handoff.nominations.length ? { nominations: handoff.nominations } : {}),
+    ...(handoff.reason ? { nominationReason: handoff.reason } : {}),
   };
+  if (handoff.nominations.length) {
+    input.logStore.append({
+      tags: ["categorizer", `categorizer:${def.id}`, "categorizer:handoff"],
+      level: "info",
+      message: `${def.id} nominated ${handoff.nominations.join(" → ")}`,
+      data: { nominations: handoff.nominations, ...(handoff.reason ? { reason: handoff.reason } : {}) },
+    });
+  }
 
   // Progress telemetry only — the deliverable is the NEXT categorizer's
   // handoff, not UI content; the run's single user-facing summary is the final
@@ -851,13 +1269,19 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
   // RUN-LEVEL EFFICIENCY STATE, threaded through every hop:
   //  • readCache — one dedup cache across hops (write_edit never re-pays a
   //    read the read categorizer already made; writes still invalidate).
+  //  • comprehensionStore — one "analyse once per file" store across hops: the
+  //    read hop's expert analyses are re-injected into each later driver's
+  //    context at zero model cost instead of being re-rated/re-comprehended.
   //  • complexityByPath — difficulty floors (plan-task + tool-measured)
   //    ratchet UP across hops, so read's verdict reaches write_edit's gate.
   const readCache = new Map<string, string>();
+  const comprehensionStore = new ComprehensionStore();
   const complexityByPath: Record<string, import("../types.js").ComplexityRating> = {};
 
   const shared = {
     clarifyGate: new ClarifyGate(),
+    clarifications: [] as ResolvedClarification[],
+    isBugFix: input.isBugFix === true,
     mentionTools,
     mentionNote,
     images: triage.images,
@@ -867,32 +1291,80 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     ...(triageCallback ? { triageCallback } : {}),
     ...(triage.mediaFact ? { mediaFact: triage.mediaFact } : {}),
     readCache,
+    comprehensionStore,
     complexityByPath,
   };
 
   // --- hop loop ---
   let choices = entryCategories(input.setup);
   let lastSelection: RouterChoice | undefined;
+  // What the last hop's driver said comes next, not yet consumed. The driver is
+  // asked because it is the only party that has seen the code; the router is the
+  // fallback for when it says nothing usable. See route-policy.ts.
+  let nominationQueue: CategorizerId[] = [];
+  // The router's own read on "is this a reported bug", OR-ed with the host flag:
+  // bug detection used to hinge entirely on the host's regex list, so a bug
+  // report phrased outside it lost every bug-specific policy in the run.
+  let bugFixRun = shared.isBugFix;
   try {
     for (let hopIndex = 0; hopIndex < maxHops; hopIndex++) {
       if (input.signal?.aborted) throw new Error("aborted");
 
-      const routed = await routeCategorizer({
-        setup: input.setup,
+      const policyInput = {
         choices,
-        task: input.task,
-        attachments: [...(input.images ?? []), ...(input.files ?? [])],
-        ...(mentionNote ? { mentionNote } : {}),
         hops,
-        ...(lastSelection ? { lastId: lastSelection } : {}),
-        ...(input.isBugFix != null ? { isBugFix: input.isBugFix } : {}),
+        queue: nominationQueue,
+        writtenPaths,
+        isBugFix: bugFixRun,
         preferInspect: input.verifyEnabled !== false,
-        llm: input.llm,
-        model: input.routerModel,
-        ...(input.signal ? { signal: input.signal } : {}),
+      };
+      let decision = decideFromDriver(policyInput);
+      if (!decision) {
+        const routed = await routeCategorizer({
+          setup: input.setup,
+          choices,
+          task: input.task,
+          attachments: [...(input.images ?? []), ...(input.files ?? [])],
+          ...(mentionNote ? { mentionNote } : {}),
+          hops,
+          ...(lastSelection ? { lastId: lastSelection } : {}),
+          ...(bugFixRun ? { isBugFix: true } : {}),
+          preferInspect: input.verifyEnabled !== false,
+          llm: input.llm,
+          model: input.routerModel,
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        totalUsage = addUsage(totalUsage, routed.usage);
+        if (routed.bugFixHint === true) {
+          bugFixRun = true;
+          shared.isBugFix = true;
+        }
+        decision = applyPolicyToRouted(
+          { ...policyInput, isBugFix: bugFixRun },
+          routed.selection,
+          routed.reason,
+          routed.fallback,
+        );
+      }
+      nominationQueue = decision.queue;
+      lastSelection = decision.selection;
+      // The routing decision was previously unlogged — this failure mode could
+      // only be diagnosed by reconstructing what the router must have seen.
+      input.logStore.append({
+        tags: ["categorizer", "categorizer:route"],
+        level: "info",
+        message: `route → ${decision.selection} (${decision.source})`,
+        data: {
+          selection: decision.selection,
+          source: decision.source,
+          reason: decision.reason,
+          choices: choices.map((c) => c.id),
+          queued: nominationQueue,
+          isBugFix: bugFixRun,
+          writes: writtenPaths.length,
+        },
       });
-      totalUsage = addUsage(totalUsage, routed.usage);
-      lastSelection = routed.selection;
+      const routed = decision;
 
       if (routed.selection === "summarise") {
         if (hops.length === 0) {
@@ -922,6 +1394,21 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
         const prev = shared.complexityByPath[path];
         if (!prev || rank[rating] > rank[prev]) shared.complexityByPath[path] = rating;
       }
+      // Carry the run's Q&A and its attachments forward. Both are run-level
+      // facts: an answer the user gave in read is still their answer in
+      // write_edit, and a mockup they attached to it is still an attachment of
+      // this run. Before this, both died with the hop that collected them.
+      for (const entry of loop.resolvedClarifications ?? []) {
+        if (shared.clarifications.some((prior) => normalizeQuestion(prior.question) === normalizeQuestion(entry.question))) {
+          continue;
+        }
+        shared.clarifications.push(entry);
+        shared.clarifyGate.recordAnswer(entry);
+      }
+      for (const image of loop.liveImages ?? []) {
+        if (shared.images.some((prior) => prior.path === image.path)) continue;
+        shared.images.push(image);
+      }
       refs.push(...loop.refs);
       for (const p of loop.writtenPaths) if (!writtenPaths.includes(p)) writtenPaths.push(p);
       for (const p of loop.readPaths) if (!readPaths.includes(p)) readPaths.push(p);
@@ -936,6 +1423,10 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
         error = loop.error;
         break;
       }
+
+      // The hop's own nomination REPLACES whatever remained of an older one: the
+      // most recent driver has seen the most.
+      if (hop.nominations?.length) nominationQueue = [...hop.nominations];
 
       choices = def.children
         .map((id) => input.setup.categories.find((c) => c.id === id))

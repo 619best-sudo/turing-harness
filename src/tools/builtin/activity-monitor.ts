@@ -1132,6 +1132,22 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
     // authoring model — see `add_log`'s doc comment.
     mutates: true,
     categorizers: ["activity_inspect"],
+    // Same shape as `edit`, so the same synonyms reach it. Worth having here in
+    // particular: this tool refuses anything that is not a log-only replacement,
+    // so a call that fails on a NAME costs a turn on top of the ones the content
+    // rule already costs.
+    argAliases: {
+      old: "oldString",
+      oldText: "oldString",
+      find: "oldString",
+      target: "oldString",
+      anchor: "oldString",
+      new: "newString",
+      newText: "newString",
+      replacement: "newString",
+      filePath: "path",
+      file: "path",
+    },
     parameters: {
       type: "object",
       properties: {

@@ -45,11 +45,12 @@ export interface CategorizerReturnSpec {
    *   - "summary"         — `{ summary: string }` (conversation)
    *   - "code-summary"    — files + linked summary with line numbers + snippets (read)
    *   - "write-report"    — the writes/edits that landed (write_edit)
+   *   - "repro-report"    — the symptom observed + evidence + suspect lines (activity_reproduce)
    *   - "inspect-report"  — writes echo + log paths + findings + verdict (activity_inspect)
    * Any other string is a custom kind: `deliverSchema` becomes required and the
    * deliverable travels as opaque data.
    */
-  kind: "summary" | "code-summary" | "write-report" | "inspect-report" | (string & {});
+  kind: "summary" | "code-summary" | "write-report" | "repro-report" | "inspect-report" | (string & {});
   /** One paragraph, shown to the ROUTER: what this categorizer hands onward. */
   description: string;
   /** Optional override of the deliver tool's argument schema. */
@@ -99,6 +100,20 @@ export interface CategorizerDefinition {
   reasoning?: import("../types.js").ThinkingLevel;
   /** Whether the router may pick this as the FIRST categorizer. Default true. */
   entry?: boolean;
+  /**
+   * Resolve registry-SCOPED tools as if this categorizer were the named one.
+   *
+   * Tools declare which categorizer they serve (`AgentTool.categorizers`), and an
+   * MCP server's scope is inferred the same way — so a NEW categorizer sharing an
+   * existing one's surface would otherwise start empty, and every browser tool,
+   * every device tool and every activity builtin would have to name it too. That
+   * is a list no host can keep current: it lives partly in this library and partly
+   * in whatever MCP servers happen to be connected.
+   *
+   * `activity_reproduce` sets this to `activity_inspect`: same QA surface,
+   * different job. Its own `tools` list still applies on top.
+   */
+  toolScope?: CategorizerId;
   /** Optional hard cap on tool-call turns for this categorizer's loop. */
   maxSteps?: number;
 }
@@ -157,6 +172,18 @@ export interface ReadDeliverable {
   memoryUpdates?: string[];
   /** Project category observed from the files, for preset reconciliation. */
   projectCategory?: "frontend" | "mobile" | "games" | "backend";
+  /**
+   * Expert analyses a stronger model produced for files too complex for the
+   * reading model (staged-read comprehension). Bounded by the chain before it is
+   * handed on; the full analyses live in the run's `ComprehensionStore`, which
+   * the next hop's reads re-inject from with no extra model call.
+   */
+  comprehensions?: Array<{
+    path: string;
+    rating: "low" | "medium" | "high";
+    model: string;
+    analysis: string;
+  }>;
 }
 
 /** One write/edit that landed. */
@@ -171,6 +198,31 @@ export interface WriteDeliverable {
   writes: WriteRecord[];
   /** Notes for the follow-up categorizer (decisions, risks, what remains). */
   notes?: string;
+}
+
+/**
+ * `returns.kind: "repro-report"` — what a QA pass produces BEFORE the fix exists.
+ *
+ * Deliberately not an `InspectDeliverable`. The two QA jobs look alike from the
+ * outside and their outputs are opposites: verification answers "is the change
+ * good?" and carries a verdict; reproduction answers "what does the defect
+ * actually do, and where does it live?" and carries evidence. A run that reported
+ * `verdict: "pass"` from a pass that ran BEFORE any fix would mark the bug
+ * verified fixed — so the pre-fix pass gets a shape with no verdict in it at all.
+ */
+export interface ReproDeliverable {
+  /** Was the reported behaviour actually observed? */
+  reproduced: boolean;
+  /** What was seen, in the user's terms — the symptom, not the theory. */
+  symptom: string;
+  /** How it was produced: the steps, the screen, the request. */
+  steps?: string;
+  /** Where the evidence is: trace files, tailed logs, captures. */
+  logPaths: string[];
+  /** The lines a fix should target, with why each is suspected. */
+  suspects: Array<{ path: string; lines?: string; why?: string }>;
+  /** What the fixer still has to decide, when reproduction did not settle it. */
+  openQuestions?: string;
 }
 
 /** `returns.kind: "inspect-report"`. */
@@ -197,6 +249,7 @@ export type CategorizerDeliverable =
   | SummaryDeliverable
   | ReadDeliverable
   | WriteDeliverable
+  | ReproDeliverable
   | InspectDeliverable
   | Record<string, unknown>;
 
@@ -222,6 +275,24 @@ export interface CategorizerHop {
   readPaths: string[];
   /** Plan produced by `create_plan` in this hop, if any. */
   planSet?: import("../types.js").PlanSet;
+  /**
+   * Where this hop's own driver says the work goes next, in order — read off its
+   * `deliver` call and validated against this categorizer's `children`.
+   *
+   * The router is a separate, cheap, tool-free turn that sees one 240-character
+   * summary of the hop. The driver just spent twenty turns in the code. On the
+   * run that motivated this field, read produced a full root-cause analysis of a
+   * reported bug and the router — reading the first 240 characters of it, which
+   * looked like a finished report — ended the run without a line being written.
+   * The model that knew the answer had no way to say it.
+   *
+   * A nomination is a PROPOSAL, not a jump: the chain validates every id against
+   * `children`, applies the run's policy floors, and keeps the loop guard. Empty
+   * or absent ⇒ fall back to the router.
+   */
+  nominations?: CategorizerId[];
+  /** Why the driver nominated those, for the log and the router's fallback. */
+  nominationReason?: string;
 }
 
 /**

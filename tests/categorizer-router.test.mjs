@@ -71,9 +71,12 @@ test("the router prompt renders every choice with its contract", async () => {
   });
   const r = await routeCategorizer(baseInput({ llm, task: "explain the repo layout" }));
   assert.equal(r.selection, "read");
-  for (const id of ["conversation", "read", "write_edit", "activity_inspect", "summarise"]) {
+  // Entry choices only — the two QA hops are not entries, so they are correctly
+  // absent from the FIRST decision of a run.
+  for (const id of ["conversation", "read", "write_edit", "summarise"]) {
     assert.ok(seen.includes(id), `${id} is offered`);
   }
+  assert.ok(!seen.includes("activity_reproduce"), "a QA hop is not an entry choice");
   // Each choice carries its DELIVERS contract, so selection is informed.
   assert.match(seen, /delivers: /);
 });
@@ -108,16 +111,20 @@ test("heuristic: a failed inspect verdict routes back to write_edit; pass summar
   assert.equal(heuristicRoute(baseInput({ hops: hops("pass"), choices: cats(["write_edit"]) })), "summarise");
 });
 
-test("heuristic: a bug-fix read prefers activity_inspect (reproduction before fix)", () => {
+test("heuristic: a bug-fix read prefers activity_reproduce (see it before fixing it)", () => {
   const hops = [{ id: "read", index: 0, summary: "read", delivered: true, toolRecords: [], writtenPaths: [], readPaths: [] }];
   assert.equal(
-    heuristicRoute(baseInput({ hops, isBugFix: true, choices: cats(["write_edit", "activity_inspect"]) })),
-    "activity_inspect",
+    heuristicRoute(baseInput({ hops, isBugFix: true, choices: cats(["activity_reproduce", "write_edit"]) })),
+    "activity_reproduce",
   );
   assert.equal(
-    heuristicRoute(baseInput({ hops, isBugFix: false, choices: cats(["write_edit", "activity_inspect"]) })),
+    heuristicRoute(baseInput({ hops, isBugFix: false, choices: cats(["activity_reproduce", "write_edit"]) })),
     "write_edit",
   );
+  // Reproduction hands to the fixer either way — a could-not-reproduce report is
+  // still what a fix works from.
+  const after = [...hops, { id: "activity_reproduce", index: 1, summary: "NOT reproduced: …", delivered: true, toolRecords: [], writtenPaths: [], readPaths: [] }];
+  assert.equal(heuristicRoute(baseInput({ hops: after, isBugFix: true, choices: cats(["write_edit"]) })), "write_edit");
 });
 
 function cats(ids) {

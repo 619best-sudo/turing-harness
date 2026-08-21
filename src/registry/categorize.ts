@@ -128,6 +128,34 @@ export function categorizeTool(tool: AgentTool): string[] {
   return [...ids];
 }
 
+/**
+ * A provider whose tools are OVERWHELMINGLY a QA surface.
+ *
+ * The per-tool test reads one tool's name and blurb, which is all it has and not
+ * enough. `chrome-devtools` ships `browser_navigate` (obviously inspect) beside
+ * `list_pages` and `get_network_request` — neither of which contains a single
+ * inspect keyword, so both fell through to the generic non-mutating default and
+ * joined the READ hop. A read categorizer holding `get_network_request` is the
+ * same class of mistake the per-tool guard was written to stop, arriving from the
+ * other side: not a false positive on incidental words, but a false negative on
+ * their absence.
+ *
+ * The server is the better signal. A tool sitting in a browser-automation server
+ * is part of a browser-automation surface no matter how neutrally it describes
+ * itself, so when most of a provider's tools are inspect-exclusive the rest are
+ * read that way too. A tool that declared `categorizers` for itself is untouched
+ * — an explicit scope always wins.
+ *
+ * "Most" and not "any": a general-purpose server with one screenshot tool must
+ * not have its whole surface pulled into QA.
+ */
+export function isInspectSurface(tools: AgentTool[]): boolean {
+  const undeclared = tools.filter((t) => !t.categorizers?.length);
+  if (undeclared.length < 3) return false;
+  const inspect = undeclared.filter((t) => anyHit(haystack(t), INSPECT_HINTS)).length;
+  return inspect * 2 > undeclared.length;
+}
+
 /** Scope a provider as the union of its tools' categorizers. */
 export function categorizeProvider(tools: AgentTool[]): string[] {
   const set = new Set<string>();

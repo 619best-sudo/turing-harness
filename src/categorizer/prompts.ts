@@ -26,10 +26,12 @@ import type { JSONSchema } from "../types.js";
 const BUGFIX_SLOT = "%%BUGFIX%%";
 
 const BUGFIX_DIRECTIVE = [
-  "THIS RUN IS FIXING A REPORTED BUG. The inspect pass owns reproduction: if you received an",
-  "inspect report that localised the bug, fix exactly what its evidence shows. If you did NOT,",
-  "say so in your deliver notes rather than guessing a fix from reading alone — the chain can",
-  "route an activity_inspect pass to observe the broken behaviour first.",
+  "THIS RUN IS FIXING A REPORTED BUG. Reproduction is `activity_reproduce`'s job, not yours: if you",
+  "received a repro report, fix exactly what its evidence shows — its `suspects` are the lines that",
+  "were observed misbehaving, which beats any line reading alone would have picked. If it says",
+  "`reproduced: false`, or you received no repro report at all, then you are working from a",
+  "hypothesis: fix the most likely cause, SAY SO in your deliver notes, and nominate a QA pass",
+  "after you — a fix nobody watched fail is a fix nobody can confirm.",
 ].join("\n");
 
 /** Build-time facts a prompt must reflect that the tool list cannot reveal. */
@@ -111,6 +113,8 @@ const ASKING_IN_CATEGORY: Record<string, string> = {
   conversation: ASKING_CONVERSATION,
   read: ASKING_READ,
   write_edit: ASKING_WRITE_EDIT,
+  // Same question in both QA hops: whoever can reach the broken screen drives.
+  activity_reproduce: ASKING_ACTIVITY_INSPECT,
   activity_inspect: ASKING_ACTIVITY_INSPECT,
 };
 
@@ -139,7 +143,7 @@ function forCategory(blocks: GuidanceBlock[], category: CategorizerPromptOptions
  * write_edit on a bug run) the bug-fix directive.
  */
 export function buildCategorizerSystemPrompt(
-  def: Pick<CategorizerDefinition, "id" | "systemPrompt">,
+  def: Pick<CategorizerDefinition, "id" | "systemPrompt"> & Partial<Pick<CategorizerDefinition, "children">>,
   toolNames?: readonly string[],
   opts: CategorizerPromptOptions = {},
 ): string {
@@ -148,6 +152,12 @@ export function buildCategorizerSystemPrompt(
     .replace(GUIDANCE_SLOT, selectGuidance(forCategory(guidanceFor(def.id), opts.projectCategory), toolNames))
     .replace(ESCALATION_SLOT, toolEscalation(opts.authorOnlyWrites === true))
     .replace(ASKING_SLOT, askingFor(def.id))
+    // Terminal categorizers (no children) have no `nextCategorizers` field on
+    // their deliver tool, so telling them to fill one would describe a tool they
+    // do not have. `children` is absent when the prompt is exported statically —
+    // there the clause stands, since the default graph gives all three of these
+    // categorizers children.
+    .replace(HANDOFF_SLOT, def.children && def.children.length === 0 ? "" : handoffContract(def.children))
     // The conversation lookup clause is attached only when the web tools are:
     // teaching a model to search with no search tool is a wasted instruction.
     .replace(LOOKUP_SLOT, hasAny(toolNames, ["web_search", "web_fetch", "web_scrape"]) ? CONVERSATIONAL_LOOKUP : "");
@@ -185,6 +195,17 @@ const CATEGORIZER_GUIDANCE: Record<string, GuidanceBlock[]> = {
     GUIDANCE.verify,
     GUIDANCE.learning,
   ],
+  activity_reproduce: [
+    GUIDANCE.contract,
+    GUIDANCE.debugging,
+    GUIDANCE.build,
+    GUIDANCE.media,
+    GUIDANCE.driveTool,
+    GUIDANCE.browserRaw,
+    GUIDANCE.driving,
+    GUIDANCE.asking,
+    GUIDANCE.learning,
+  ],
   activity_inspect: [
     GUIDANCE.contract,
     GUIDANCE.debugging,
@@ -206,6 +227,50 @@ function guidanceFor(id: string): GuidanceBlock[] {
 // ---------------------------------------------------------------------------
 // The deliver contract text (stated in every default prompt)
 // ---------------------------------------------------------------------------
+
+/**
+ * The handoff clause: every non-terminal categorizer's driver names where the
+ * work goes next, in its own `deliver` call.
+ *
+ * This is here because the alternative failed in production. The chain's router
+ * is a separate tool-free turn whose entire view of a hop is one 240-character
+ * line; on a reported polling bug it read the opening of read's root-cause
+ * analysis, took it for a finished report, and ended the run with nothing
+ * written. The driver had spent twenty-four turns in the code and had no field in
+ * which to say "reproduce this, then fix it".
+ */
+function handoffContract(children?: readonly string[]): string {
+  // Named from the ACTUAL graph, never from fixed examples. The first draft
+  // hard-coded `["activity_reproduce", "write_edit"]` as the reproduce-then-fix
+  // example, and every categorizer got it — including `write_edit`, whose only
+  // child is `activity_inspect`. A model copying the example it was shown had its
+  // nomination silently dropped as illegal, which is a worse failure than no
+  // example at all: the prompt was telling it to do something the graph forbids.
+  const ids = children?.length ? [...children, "summarise"] : undefined;
+  const quoted = (id: string) => `"${id}"`;
+  const example = children?.length
+    ? `[${children.slice(0, 2).map(quoted).join(", ")}]`
+    : undefined;
+  const from = ids ? `: ${ids.join(", ")}` : " the ids the tool's schema lists for this field";
+  return [
+    "WHERE IT GOES NEXT — part of the same `deliver` call, and not optional:",
+    "  `nextCategorizers` — what must run after you, IN ORDER, chosen from" + from + ".",
+    "  You have just done the work; you know things the one-line summary of it cannot carry, so this",
+    "  is your call to make, not a guess for someone downstream to re-derive.",
+    "  - Name SEVERAL when several are needed" + (example ? ` — e.g. ${example}` : "") + ". Nothing",
+    "    outside the list above is legal here: the graph decides what can follow this categorizer,",
+    "    and an id it does not allow is dropped.",
+    '  - ["summarise"] means THE RUN IS OVER: the user asked to understand something and now they',
+    "    can, or there is genuinely nothing to change. Finding a bug's root cause is not the same as",
+    "    fixing it — an analysis, however complete, is reading, and a run that ends there ships",
+    "    nothing. Do not summarise your way out of the work.",
+    "  - `handoffReason` — one sentence on why. It goes in the run log.",
+    "  The chain validates your answer and keeps its own floors, so nominating is a proposal, not a",
+    "  jump. Nominate nothing and a router picks blind.",
+  ].join("\n");
+}
+
+const HANDOFF_SLOT = "%%HANDOFF%%";
 
 function deliverContract(returns: CategorizerReturnSpec): string {
   return [
@@ -281,13 +346,16 @@ const READ_TEMPLATE = [
   "  4. LINK: explain how the files connect — who imports whom, where a change ripples. That",
   "     combined story is the point of your deliverable.",
   '  5. DELIVER the code summary. For a read-only ask ("understand X and summarise") the chain ends',
-  "     after your deliver; for real work your deliverable IS the handoff write_edit or",
-  "     activity_inspect starts from.",
+  "     after your deliver; for real work your deliverable IS the handoff the next pass starts from —",
+  "     `activity_reproduce` when the task is a reported defect (it will drive the app to the symptom",
+  "     your files point at), `write_edit` when it is a change to make.",
   "",
   ASKING_SLOT,
   "",
   BUGFIX_SLOT,
   GUIDANCE_SLOT,
+  "",
+  HANDOFF_SLOT,
   "",
   deliverContract({ kind: "code-summary", description: "The relevant files + how they link" } as CategorizerReturnSpec),
   [
@@ -319,6 +387,11 @@ const WRITE_EDIT_TEMPLATE = [
   "  where the plan is a single step. The harness REFUSES every write/edit issued before create_plan",
   "  has succeeded, so there is no path to a file change that skips the plan. Reads, questions and",
   "  inspiration are the only calls that may precede it.",
+  "",
+  "ALL FILE CHANGES GO THROUGH \`write\`/\`edit\`. Do NOT modify files with \`bash\` — no \`sed\`/\`perl\`",
+  "  writes, no \`echo\`/\`cat\` redirection, no python/awk scripts rewriting source; the harness",
+  "  REFUSES those commands and points them back at \`write\`/\`edit\`. \`bash\` is for builds,",
+  "  tests, lint, git and read-only inspection only.",
   "",
   "HOW YOU WORK — in this exact order:",
   "  1. TAKE THE HANDOFF: the summary you received already carries the relevant files, how they",
@@ -353,6 +426,8 @@ const WRITE_EDIT_TEMPLATE = [
   BUGFIX_SLOT,
   GUIDANCE_SLOT,
   "",
+  HANDOFF_SLOT,
+  "",
   deliverContract({ kind: "write-report", description: "The writes/edits that landed" } as CategorizerReturnSpec),
   [
     "  deliver({ writes: [{ tool: \"write\"|\"edit\", path, summary }],",
@@ -371,10 +446,16 @@ const WRITE_EDIT_TEMPLATE = [
 ].join("\n");
 
 const ACTIVITY_INSPECT_TEMPLATE = [
-  "You are the ACTIVITY INSPECT categorizer of a coding agent — the QA/debugging pass. You receive",
-  "the write calls a work pass made (or a code summary, on a bug investigation) and your job is",
-  "EVIDENCE and a VERDICT. You do not author product code — \`add_log\`/\`remove_log\` probes are the",
-  "exception and are yours to place and strip.",
+  "You are the ACTIVITY INSPECT categorizer of a coding agent — the pass that VERIFIES a change that",
+  "has just been made. You receive the write calls the work pass made (and, on a bug fix, the repro",
+  "report describing what the defect looked like BEFORE it), and your job is EVIDENCE and a VERDICT.",
+  "You do not author product code — \`add_log\`/\`remove_log\` probes are the exception and are yours",
+  "to place and strip.",
+  "",
+  "ON A BUG FIX, THE VERDICT IS ABOUT THE SYMPTOM. A repro report tells you exactly what was seen",
+  "and how it was produced: re-run THAT, and pass only when the symptom is gone. A build that",
+  "compiles and a screen that renders are not the question — the question is whether the thing the",
+  "user reported still happens.",
   "",
   "THE PIPELINE — this exact order, few calls per step. Automation is ONE CALL PER STEP",
   "(`drive` for web, `mobile` for devices): never a snapshot→ref→click→re-snapshot ceremony.",
@@ -410,6 +491,8 @@ const ACTIVITY_INSPECT_TEMPLATE = [
   "",
   GUIDANCE_SLOT,
   "",
+  HANDOFF_SLOT,
+  "",
   deliverContract({ kind: "inspect-report", description: "Findings + where logs are + bug location" } as CategorizerReturnSpec),
   [
     "  deliver({ writes: [ <echo of the write calls you covered> ],",
@@ -429,14 +512,106 @@ const ACTIVITY_INSPECT_TEMPLATE = [
   "%%ESCALATION%%",
 ].join("\n");
 
+/**
+ * The pre-fix half of QA.
+ *
+ * Built as its own template rather than a mode flag on the inspect prompt,
+ * because the two jobs give opposite instructions at every step. Verification
+ * starts from a diff and asks "is this good?"; reproduction starts from a report
+ * and asks "what does it actually do?". A single prompt carrying both had to
+ * hedge every line, and on the run that motivated this the QA hop — entered
+ * before anything had been written — spent eight minutes reading source and never
+ * launched the app once, because the prompt it held was mostly about judging
+ * changes that did not exist yet.
+ */
+const ACTIVITY_REPRODUCE_TEMPLATE = [
+  "You are the ACTIVITY REPRODUCE categorizer of a coding agent — the pass that makes a reported",
+  "defect HAPPEN, on purpose, in front of you. You receive the code summary of the files involved.",
+  "There is NO fix yet and nothing to verify: your job is to turn a user's report into evidence a",
+  "fixer can act on. You do not author product code — `add_log`/`remove_log` probes are the",
+  "exception and are yours to place and strip.",
+  "",
+  "WHY THIS HOP EXISTS. A root-cause analysis written from reading alone is a hypothesis. It is",
+  "often right and it is not evidence, and the difference shows up later: the fix lands on the",
+  "line the reading pointed at, the symptom survives, and the run reports success. Seeing the",
+  "defect once — one screen, one log line, one wrong value — is worth more than another file.",
+  "",
+  "THE PIPELINE — this order, few calls per step. Automation is ONE CALL PER STEP (`drive` for web,",
+  "`mobile` for devices): never a snapshot→ref→click→re-snapshot ceremony.",
+  "",
+  "  0. WHO DRIVES: if reaching the broken screen needs a human — login, a real account, data only",
+  "     they have — `ask_user_question` FIRST: they drive / you drive / reproduction is skipped.",
+  "     Then follow the answer. Never guess at auth, and never fake the state you cannot reach.",
+  "  1. INSTRUMENT where the report points: `activity_trace_start` (once), then `add_log` probes at",
+  "     the risk sites the code summary named. Probes are how an invisible defect becomes visible —",
+  "     a status that does not repaint leaves no screenshot behind, only a value that never arrives.",
+  "  2. RUN the surface that exhibits it and DRIVE IT TO THE SYMPTOM:",
+  "       web:    `drive {action:\"open\"}` → `drive {action:\"look\"}` → `drive {action:\"click\"|\"fill\"}`",
+  "               per step → `drive {action:\"shot\"}` at the moment it misbehaves.",
+  "       device: `mobile {action:\"launch\"}` → `mobile {action:\"look\"}` → `mobile {action:\"tap\"}` →",
+  "               capture at the moment it misbehaves.",
+  "       no UI in it (an endpoint, a job, a pure function)? `bash` — curl it, or run the one test",
+  "               that exercises the path.",
+  "     Then `activity_collect` so the probes you placed come back with what they saw.",
+  "     A LOG-ONLY EDIT IS ONE INSERTED LINE. `add_log` refuses anything that also changes existing",
+  "     code — it exists so instrumentation can be stripped again with certainty. If it refuses,",
+  "     do not rewrite the function around the probe: send the SAME text back with a single",
+  "     `TURING_TRACE` line added and nothing else touched.",
+  "     AND NEVER STRIP PROBES YOU HAVE NOT RUN. `activity_cleanup`/`remove_log` come AFTER the",
+  "     flow has executed and `activity_collect` has read what they saw. Cleaning up first is",
+  "     abandoning the pass, and it is refused.",
+  "  3. READ THE EVIDENCE, not the code: `activity_study` / `activity_search` for where the trail",
+  "     STOPS and the first value that is wrong; `media_analysis` lens:\"qa\" on a capture when the",
+  "     defect is visual. The code summary you were handed already covers the source — re-reading",
+  "     it is how this hop turns into a second read pass.",
+  "  4. LOCALISE: name the lines a fix must change, and why each is suspected — the value that was",
+  "     wrong when it passed through them. One suspect with evidence beats five from reading.",
+  "",
+  "IF YOU CANNOT REPRODUCE IT, SAY SO. `reproduced: true` means YOU SAW IT — the harness knows",
+  "whether this pass ran anything, and a claim it can disprove is corrected to false before the",
+  "fixer sees it. `reproduced: false` with what you tried is a real and useful",
+  "answer: the fixer then knows it is working from a hypothesis, and the user learns their report",
+  "needs a step you could not guess. Reporting a defect you never saw as reproduced is the one",
+  "outcome worse than not reproducing it.",
+  "",
+  ASKING_SLOT,
+  "",
+  GUIDANCE_SLOT,
+  "",
+  HANDOFF_SLOT,
+  "",
+  deliverContract({
+    kind: "repro-report",
+    description: "The symptom as observed + where the evidence is + the lines a fix should target",
+  } as CategorizerReturnSpec),
+  [
+    "  deliver({ reproduced: true|false,",
+    "               symptom: \"<what you SAW, in the user's terms>\",",
+    "               steps: \"<how you produced it>\",",
+    "               logPaths: [\"<trace/log files written>\"],",
+    "               suspects: [{ path, lines: \"42-44\", why: \"<the wrong value that passed here>\" }],",
+    "               openQuestions: \"<what the fixer still has to decide>\" })",
+  ].join("\n"),
+  "",
+  "STRIP YOUR INSTRUMENTATION before you deliver: every probe you added comes back out",
+  "(`remove_log`, `activity_cleanup`). Debug logging left in source is a defect you shipped.",
+  "",
+  NARRATE_AROUND_TOOLS,
+  "",
+  TOOL_HYGIENE,
+  "",
+  "%%ESCALATION%%",
+].join("\n");
+
 /** The default combined prompts per built-in categorizer id. */
 export const DEFAULT_CATEGORIZER_PROMPTS: Record<
-  "conversation" | "read" | "write_edit" | "activity_inspect",
+  "conversation" | "read" | "write_edit" | "activity_reproduce" | "activity_inspect",
   string
 > = {
   conversation: CONVERSATION_TEMPLATE,
   read: READ_TEMPLATE,
   write_edit: WRITE_EDIT_TEMPLATE,
+  activity_reproduce: ACTIVITY_REPRODUCE_TEMPLATE,
   activity_inspect: ACTIVITY_INSPECT_TEMPLATE,
 };
 
@@ -458,27 +633,37 @@ export const DEFAULT_ROUTER_PROMPT = [
   "- a question/chat/internet lookup            → conversation",
   "- files must be found/understood first       → read",
   "- code/assets must be written or edited      → write_edit",
-  "- the work must be run/tested/debugged/QA'd  → activity_inspect",
+  "- a REPORTED defect must be made to happen   → activity_reproduce (before any fix)",
+  "- a change just made must be run/verified    → activity_inspect (after the fix)",
   "- nothing more is needed                     → summarise",
   "",
   "Worked examples (match the SHAPE, not the keywords):",
   '- "research the ecommerce market and the gaps a startup could fill"  → conversation',
   '- "understand the auth flow and give me a summary"                   → read → summarise',
   '- "build this feature from the attached mockup"                      → read → write_edit → activity_inspect',
-  '- "the logo is red though I set it blue" (a bug report)              → read → activity_inspect → write_edit',
+  '- "the logo is red though I set it blue" (a bug report)              → read → activity_reproduce → write_edit → activity_inspect',
   "",
   "Rules:",
   "- Judge the user's LATEST message together with the run state; the user may write any language.",
-  "- A bug report usually needs read (or activity_inspect when reproduction/logs matter more than",
-  "  reading) before write_edit.",
+  "- A bug report needs read, then activity_reproduce (SEE the defect), before write_edit. Pick",
+  "  activity_reproduce first only when the report is purely about runtime behaviour no file can",
+  "  explain — a crash with a stack trace, a hang, something that only appears on the device.",
+  "- activity_inspect VERIFIES; it is never the answer while the run has written nothing.",
+  "- A REPORTED BUG IS NOT RESOLVED BY DESCRIBING IT. A hop whose state line reads like a finished",
+  "  analysis — root cause found, fix located, lines named — has done the READING, not the work. If",
+  "  nothing has been written yet, the run is not finished: reproduce it (activity_reproduce) or fix",
+  "  it (write_edit). Only pick summarise when the user asked to UNDERSTAND something, or when the",
+  "  run has already changed what it needed to change.",
   "- After write_edit, prefer activity_inspect when the change is runtime-visible and verification",
   "  is enabled; summarise when the change is static (docs/config-only) or verification is off.",
   "- Never repeat the categorizer that just ran unless its state line says it was cut short.",
-  "- When in doubt between two, pick the one that gathers information (read / activity_inspect)",
+  "- When in doubt between two, pick the one that gathers information (read / activity_reproduce)",
   "  before the one that mutates (write_edit).",
   "",
-  "Respond with EXACTLY one line, nothing else:",
+  "Respond with these two lines, nothing else:",
   "  CATEGORY: <categorizer id from the choices, or summarise>",
+  "  BUGFIX: <yes if the request reports something BROKEN — wrong output, a crash, something that",
+  "           stopped working — otherwise no>",
 ].join("\n");
 
 // ---------------------------------------------------------------------------
@@ -520,6 +705,23 @@ export const DEFAULT_DELIVER_SCHEMAS: Record<string, JSONSchema> = {
       },
       memoryUpdates: { type: "array", items: str("Durable fact for project memory"), description: "Optional" },
       projectCategory: { type: "string", enum: ["frontend", "mobile", "games", "backend"], description: "Optional" },
+      comprehensions: {
+        type: "array",
+        description:
+          "Optional: expert analyses the harness produced (via the staged read) for files too complex " +
+          "for the reading model — the chain attaches them from the run's comprehension store; a model " +
+          "authoring read's deliverable may also fill it",
+        items: {
+          type: "object",
+          properties: {
+            path: str("File the analysis is about"),
+            rating: { type: "string", enum: ["low", "medium", "high"] },
+            model: str("Model that produced the analysis"),
+            analysis: str("The expert analysis, bounded"),
+          },
+          required: ["path"],
+        },
+      },
     },
     required: ["files", "codeSummary"],
   },
@@ -542,6 +744,34 @@ export const DEFAULT_DELIVER_SCHEMAS: Record<string, JSONSchema> = {
       notes: str("Decisions, risks, what remains"),
     },
     required: ["writes"],
+  },
+  "repro-report": {
+    type: "object",
+    properties: {
+      reproduced: { type: "boolean", description: "Was the reported behaviour actually observed?" },
+      symptom: str("What you SAW, in the user's terms — not the theory"),
+      steps: str("How you produced it"),
+      logPaths: {
+        type: "array",
+        items: str("Path where logs/traces were written"),
+        description: "Where the evidence is",
+      },
+      suspects: {
+        type: "array",
+        description: "The lines a fix should target, with the evidence for each",
+        items: {
+          type: "object",
+          properties: {
+            path: str("File path"),
+            lines: str('Lines, e.g. "42-44"'),
+            why: str("The wrong value or missing call observed here"),
+          },
+          required: ["path"],
+        },
+      },
+      openQuestions: str("What the fixer still has to decide"),
+    },
+    required: ["reproduced", "symptom"],
   },
   "inspect-report": {
     type: "object",

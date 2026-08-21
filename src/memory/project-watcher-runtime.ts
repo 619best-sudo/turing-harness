@@ -2,13 +2,9 @@ import { watch, type FSWatcher } from "node:fs";
 import * as path from "node:path";
 
 import type { FileMemoryRuntime } from "./file-memory-runtime.js";
-import { FILE_MEMORY_IGNORED_DIRS } from "./file-memory.js";
+import { FILE_MEMORY_IGNORED_DIRS, FILE_MEMORY_IGNORED_DIRS_BY_ROOT } from "./file-memory.js";
 import { type GraphMemory } from "./graph-memory.js";
 
-const MOBILE_ARTIFACT_DIRS_BY_ROOT = new Map<string, Set<string>>([
-  ["android", new Set([".cxx", ".gradle", "build"])],
-  ["ios", new Set([".symlinks", "Flutter", "Pods", "build", "xcuserdata"])],
-]);
 
 export interface ProjectWatcherRuntimeOptions {
   cwd: string;
@@ -165,7 +161,7 @@ export class ProjectWatcherRuntime {
     if (!relative || relative.startsWith("..")) return false;
     const parts = relative.split(path.sep).filter(Boolean);
     if (parts.some((part) => FILE_MEMORY_IGNORED_DIRS.has(part))) return true;
-    for (const [root, ignoredNames] of MOBILE_ARTIFACT_DIRS_BY_ROOT) {
+    for (const [root, ignoredNames] of FILE_MEMORY_IGNORED_DIRS_BY_ROOT) {
       if (parts.includes(root) && [...ignoredNames].some((name) => parts.includes(name))) return true;
     }
     return false;

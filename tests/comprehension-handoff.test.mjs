@@ -20,7 +20,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
+import {
+  Orchestrator,
+  PermissionGate,
+  OpenRouterBridge,
+  LogStore,
+  Registry,
+  registerBuiltins,
+} from "../dist/index.js";
 import {
   clearComprehensionMemory,
   comprehendFile,

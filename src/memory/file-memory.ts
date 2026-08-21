@@ -8,6 +8,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { IGNORED_PROJECT_DIRS } from "../project-tree.js";
 import {
   FILE_MEMORY_FRAMEWORK_HINTS,
   SUPPORTED_FILE_MEMORY_FRAMEWORKS,
@@ -22,37 +23,15 @@ const DEFAULT_MAX_FILE_SIZE = 256 * 1024;
 const MAX_RENDER_ENTRIES = 200;
 export const TEXT_SAMPLE_BYTES = 16 * 1024;
 export const FILE_MEMORY_SUMMARY_VERSION = 3;
-export const FILE_MEMORY_IGNORED_DIRS = new Set([
-  ".astro",
-  ".build",
-  ".dart_tool",
-  ".expo",
-  ".git",
-  ".gradle",
-  ".idea",
-  ".next",
-  ".nuxt",
-  ".pytest_cache",
-  ".svelte-kit",
-  ".turing",
-  ".tox",
-  ".venv",
-  ".zig-cache",
-  "bin",
-  "coverage",
-  "Build",
-  "DerivedData",
-  "dist",
-  "node_modules",
-  "obj",
-  "out",
-  "target",
-  "vendor",
-  "venv",
-]);
-const MOBILE_ARTIFACT_DIRS_BY_ROOT = new Map<string, Set<string>>([
-  ["android", new Set([".cxx", ".gradle", "build"])],
-  ["ios", new Set([".symlinks", "Flutter", "Pods", "build", "xcuserdata"])],
+export const FILE_MEMORY_IGNORED_DIRS = new Set(IGNORED_PROJECT_DIRS);
+/**
+ * The remaining path-DEPENDENT cases: names that are generated only beneath a
+ * specific root and are legitimate source anywhere else. `ios/Flutter` holds
+ * generated xcconfigs, while a `Flutter` directory elsewhere may not.
+ */
+export const FILE_MEMORY_IGNORED_DIRS_BY_ROOT = new Map<string, Set<string>>([
+  ["android", new Set(["generated"])],
+  ["ios", new Set(["Flutter"])],
 ]);
 
 export const FILE_MEMORY_SUPPORTED_FRAMEWORKS = [...SUPPORTED_FILE_MEMORY_FRAMEWORKS];
@@ -108,6 +87,23 @@ export interface FileMemoryEntry {
   summaryVersion?: number;
   summaryPending?: boolean;
   summaryError?: string;
+  /**
+   * The `contentHash` the LLM summary was written FROM.
+   *
+   * This is what makes "summarize only when the file changed" exact rather than
+   * inferred. Without it the question is answered by a chain of proxies — a
+   * metadata refresh notices new content and resets `summarySource` to
+   * "heuristic", which the hydration check then reads as "needs an LLM pass" —
+   * and every link in that chain has to fire, in order, for the answer to be
+   * right. When a write arrives through a path that skips the refresh, the file
+   * gets re-summarized on identical bytes; when the refresh runs twice, the
+   * signal is consumed and a real change can be missed.
+   *
+   * Comparing two hashes needs no ordering and cannot be consumed. Absent on
+   * entries written before this field existed: those fall back to the proxy
+   * chain rather than being re-summarized wholesale.
+   */
+  summaryContentHash?: string;
   lastSeenAt: number;
   lastModifiedMs: number;
   size: number;
@@ -425,6 +421,10 @@ export class FileMemory {
       summaryVersion: FILE_MEMORY_SUMMARY_VERSION,
       summaryPending: changedContent ? prior?.summarySource === "llm" || !!prior?.summaryPending : prior?.summaryPending ?? false,
       summaryError: changedContent ? undefined : prior?.summaryError,
+      // Carried across a refresh either way: on unchanged content it still
+      // describes the live bytes, and on changed content keeping it is how the
+      // skip check can see that the summary predates the edit.
+      summaryContentHash: prior?.summaryContentHash,
       lastSeenAt: now,
       lastModifiedMs: stat.mtimeMs,
       size: stat.size,
@@ -437,16 +437,25 @@ export class FileMemory {
     return true;
   }
 
+  /**
+   * Does this file need an LLM summary written for it?
+   *
+   * The three answers, in order: no summary yet ⇒ yes; a summary for THESE bytes
+   * ⇒ no; a summary for older bytes ⇒ yes. Everything else here is bookkeeping —
+   * a queued/in-flight marker, a stale flag, a failed attempt, a schema version
+   * bump — and each of those means the stored summary cannot be trusted as it
+   * stands.
+   */
   needsSummaryHydration(pathOrRelative: string): boolean {
     const entry = this.get(pathOrRelative);
     if (!entry) return false;
-    return (
-      entry.summarySource !== "llm" ||
-      entry.summaryPending === true ||
-      entry.summaryVersion !== FILE_MEMORY_SUMMARY_VERSION ||
-      entry.stale === true ||
-      !!entry.summaryError
-    );
+    if (entry.summarySource !== "llm") return true;
+    if (entry.summaryVersion !== FILE_MEMORY_SUMMARY_VERSION) return true;
+    if (entry.summaryPending === true || !!entry.summaryError || entry.stale === true) return true;
+    // The exact test, when the entry is new enough to carry it: same bytes, same
+    // summary, nothing to do — no matter how the file arrived here.
+    if (entry.summaryContentHash) return entry.summaryContentHash !== entry.contentHash;
+    return false;
   }
 
   listSummaryHydrationCandidates(query?: { includeFresh?: boolean }): FileMemoryEntry[] {
@@ -501,6 +510,7 @@ export class FileMemory {
       ...entry.frameworkHints,
     ]);
     entry.summarySource = "llm";
+    entry.summaryContentHash = entry.contentHash;
     entry.summaryModel = result.model;
     entry.summaryUpdatedAt = Date.now();
     entry.summaryVersion = FILE_MEMORY_SUMMARY_VERSION;
@@ -905,7 +915,7 @@ export class FileMemory {
     const relative = path.relative(this.cwd, absPath);
     if (!relative || relative.startsWith("..")) return false;
     const parts = relative.split(path.sep).filter(Boolean);
-    for (const [root, ignoredNames] of MOBILE_ARTIFACT_DIRS_BY_ROOT) {
+    for (const [root, ignoredNames] of FILE_MEMORY_IGNORED_DIRS_BY_ROOT) {
       if (parts.includes(root) && ignoredNames.has(entryName)) return true;
     }
     return false;

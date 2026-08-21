@@ -139,7 +139,12 @@ export interface SessionInfo {
 
 interface RunLifecycleHooks {
   onRunStart?: () => Promise<void> | void;
-  onRunEnd?: () => Promise<void> | void;
+  /**
+   * `writtenPaths` is what the run actually changed, so a subscriber can act on
+   * the edits instead of re-deriving them from filesystem events. Undefined when
+   * the run failed before producing a snapshot.
+   */
+  onRunEnd?: (summary?: { writtenPaths?: string[] }) => Promise<void> | void;
 }
 
 export class Session implements AgentHost {
@@ -389,6 +394,7 @@ export class Session implements AgentHost {
     this.assertLive();
     const { signal, done } = await this.beginRun(opts.signal);
     const followUpContext = this.resolveFollowUpContext(opts.followUpContext);
+    let writtenPaths: string[] | undefined;
     try {
       const result = await this.orchestrator.run(task, {
         ...opts,
@@ -399,9 +405,10 @@ export class Session implements AgentHost {
           : {}),
       });
       this.lastThreadSnapshot = result.threadSnapshot;
+      writtenPaths = result.threadSnapshot?.writtenPaths;
       return result;
     } finally {
-      await done();
+      await done({ writtenPaths });
     }
   }
 
@@ -500,7 +507,9 @@ export class Session implements AgentHost {
   }
 
   /** Create a run-scoped abort signal linked to any external signal + session abort. */
-  private async beginRun(external?: AbortSignal): Promise<{ signal: AbortSignal; done: () => Promise<void> }> {
+  private async beginRun(
+    external?: AbortSignal,
+  ): Promise<{ signal: AbortSignal; done: (summary?: { writtenPaths?: string[] }) => Promise<void> }> {
     const controller = new AbortController();
     this.activeRuns.add(controller);
     try {
@@ -519,9 +528,9 @@ export class Session implements AgentHost {
     }
     return {
       signal: controller.signal,
-      done: async () => {
+      done: async (summary) => {
         try {
-          await this.runLifecycleHooks?.onRunEnd?.();
+          await this.runLifecycleHooks?.onRunEnd?.(summary);
         } finally {
           this.activeRuns.delete(controller);
           // Remove the listener so reusing one external signal across many runs

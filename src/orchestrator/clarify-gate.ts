@@ -43,6 +43,35 @@
  */
 
 import { detectShellAuthoring } from "../tools/builtin/coding.js";
+import type { ResolvedClarification } from "../types.js";
+
+/**
+ * Collapse a question to a comparable key.
+ *
+ * Two hops asking for the same value rarely phrase it identically — the run that
+ * motivated this asked "What should the new title be for the delete account
+ * popup?" and then "What should the new title of the delete account popup be?".
+ * Word-set equality catches that; word ORDER and punctuation do not survive.
+ */
+export function normalizeQuestion(question: string): string {
+  const words = question
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word && !QUESTION_STOP_WORDS.has(word));
+  return [...new Set(words)].sort().join(" ");
+}
+
+const QUESTION_STOP_WORDS = new Set([
+  "a", "an", "the", "be", "is", "are", "was", "were", "do", "does", "did", "to", "of", "for", "in",
+  "on", "at", "it", "this", "that", "should", "would", "could", "will", "what", "which", "who",
+  "whom", "how", "and", "or", "please", "you", "your", "i", "me", "my", "we", "us", "new",
+]);
+
+/** Whether a tool call is the ask-the-user tool, under either name. */
+function isAskTool(name: string): boolean {
+  return name === "ask_user_question" || name.endsWith("__ask_user_question");
+}
 
 /** Whether a tool call is the harness's own file mutation pair. */
 export function isMutationTool(name: string): boolean {
@@ -113,6 +142,8 @@ export interface ClarifyReport {
   blocks: number;
   /** Whether the model asked the user at any point. */
   asked: boolean;
+  /** How many re-asks of an already-answered question were refused. */
+  reAsksRefused?: number;
 }
 
 /**
@@ -123,6 +154,10 @@ export class ClarifyGate {
   private readonly armed: boolean;
   private asked = false;
   private blocks = 0;
+  /** Answers the user has given, keyed by normalized question. */
+  private readonly answers = new Map<string, ResolvedClarification>();
+  /** Normalized questions already refused once, so a re-ask cannot deadlock. */
+  private readonly reAsksRefused = new Set<string>();
 
   constructor(private readonly opts: ClarifyGateOptions = {}) {
     this.armed = opts.valueUnspecified === true && !opts.hasAttachments;
@@ -140,9 +175,29 @@ export class ClarifyGate {
    * longer being made silently.
    */
   observe(toolName: string): void {
-    if (toolName === "ask_user_question" || toolName.endsWith("__ask_user_question")) {
+    if (isAskTool(toolName)) {
       this.asked = true;
     }
+  }
+
+  /**
+   * Record an answer the user actually gave.
+   *
+   * The gate outlives a single hop (the chain shares one instance across all of
+   * them), which makes it the only component that sees the whole run's Q&A. It
+   * already knew a question had been ASKED; it now knows what came back, which is
+   * what lets it refuse the second hop's re-ask by handing over the answer.
+   */
+  recordAnswer(entry: ResolvedClarification): void {
+    const key = normalizeQuestion(entry.question);
+    if (!key) return;
+    this.asked = true;
+    if (!this.answers.has(key)) this.answers.set(key, entry);
+  }
+
+  /** Every answer the run has collected, in the order they were given. */
+  get answered(): ResolvedClarification[] {
+    return [...this.answers.values()];
   }
 
   /**
@@ -150,6 +205,41 @@ export class ClarifyGate {
    * unknown and unasked; allows everything else, always.
    */
   check(toolName: string, args?: Record<string, unknown>): ClarifyDecision {
+    // Asking again for something the user already answered. Checked BEFORE the
+    // armed/asked short-circuit below, because this refusal has nothing to do
+    // with whether the request was missing a value — a hop can re-ask a question
+    // the gate was never armed for.
+    //
+    // The answer reaches a later hop as an ALREADY ANSWERED block in its opening,
+    // but that block competes with the verbatim task line (still unspecified,
+    // forever) and with a page of guidance about asking when a value is unnamed.
+    // On the run this fixes, the block's information was present in read's
+    // deliverable prose and lost that argument. Prose does not bind; this does.
+    if (isAskTool(toolName)) {
+      const asked = typeof args?.question === "string" ? args.question : "";
+      const key = normalizeQuestion(asked);
+      const prior = key ? this.answers.get(key) : undefined;
+      if (prior && !this.reAsksRefused.has(key)) {
+        this.reAsksRefused.add(key);
+        const files = prior.attachments?.length
+          ? `\n\nThey also attached: ${prior.attachments.map((file) => file.path).join(", ")} — ` +
+            `images are already in your attachment set; read any other file rather than asking for its contents.`
+          : "";
+        return {
+          kind: "block",
+          message:
+            `${toolName} refused — the user has already answered this.\n\n` +
+            `They were asked: "${prior.question}"\n` +
+            `They answered: ${prior.answer}${files}\n\n` +
+            `That answer is the value for this run. An earlier step asked and got it; the request text you ` +
+            `were handed still reads as unspecified because it is the user's ORIGINAL wording, from before ` +
+            `they answered. Asking again spends a second round trip on something you are holding.\n\n` +
+            `Act on it now. If you genuinely need something DIFFERENT from what was answered, ask that ` +
+            `narrower question instead — a re-worded version of the same one will go through unrefused and ` +
+            `waste the user's time.`,
+        };
+      }
+    }
     if (!this.armed || this.asked) return { kind: "allow" };
     // Only a call that AUTHORS FILE CONTENTS is refused — `write`, `edit`, or a
     // shell command that writes source. Deliberately not the loop's `mutates`
@@ -190,6 +280,11 @@ export class ClarifyGate {
 
   /** The run report. */
   toReport(): ClarifyReport {
-    return { triggered: this.armed, blocks: this.blocks, asked: this.asked };
+    return {
+      triggered: this.armed,
+      blocks: this.blocks,
+      asked: this.asked,
+      ...(this.reAsksRefused.size ? { reAsksRefused: this.reAsksRefused.size } : {}),
+    };
   }
 }

@@ -143,6 +143,8 @@ test("the write_edit prompt states THE FLOW: create_plan first, even for a one-l
   assert.match(p, /even for a one-line change/);
   assert.match(p, /REFUSES every write\/edit issued before create_plan/);
   assert.match(p, /no path to a file change that skips the plan/);
+  assert.match(p, /ALL FILE CHANGES GO THROUGH `write`\/`edit`/, "no-bash-source-edits rule");
+  assert.match(p, /Do NOT modify files with `bash`/, "explicitly forbids sed/rewrites via bash");
 });
 
 test("the write_edit hop's tool descriptions teach plan-first at the choosing layer", async () => {
@@ -190,5 +192,62 @@ test("an edit fired before the plan is refused with 'nothing is lost', then land
     "Title: Delete Account\n",
     "the same edit landed after the plan",
   );
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("an edit is refused on EVERY attempt before the plan — there is no bypass", async () => {
+  // STRICT plan-first: no with-nudges allowance. A model that keeps firing edit
+  // without ever calling create_plan is refused each and every time, so no write/
+  // edit can ever land outside a plan. (The bash-edit escape is separately closed
+  // by the shell-authoring guard, so there is no side door either.)
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "plan-first-strict-"));
+  const target = path.join(dir, "profile_screen.dart");
+  await fs.writeFile(target, "Title: nnnn\n");
+  const editArgs = { path: target, oldString: "Title: nnnn", newString: "Title: Delete Account" };
+
+  const llm = new OpenRouterBridge();
+  llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text"] });
+  const seen = { refusals: 0, planRan: false };
+  let routerCalls = 0;
+  let turn = 0;
+  llm.complete = async (model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      return msg([{ type: "text", text: `CATEGORY: ${routerCalls === 1 ? "write_edit" : "summarise"}` }]);
+    }
+    if (/breaking a task into an ordered implementation plan/.test(sys)) {
+      seen.planRan = true;
+      return msg([{ type: "text", text: `PLANS_JSON:\n${JSON.stringify({
+        plans: [{ id: "p1", title: "x", summary: "x",
+          tasks: [{ id: "t1", order: 1, title: "update title", summary: "x",
+            files: [target], fileMutations: { [target]: "edit" }, complexity: "low" }] }],
+        executionOrder: ["p1"],
+      })}` }]);
+    }
+    if (/closing summary/.test(sys)) return msg([{ type: "text", text: "done." }]);
+    return msg([{ type: "text", text: "ok" }]);
+  };
+  llm.stream = async function* (model, ctx) {
+    yield { type: "start", partial: msg([]) };
+    const results = JSON.stringify(ctx.messages?.map((m) => m.content ?? "") ?? "");
+    if (/create_plan comes FIRST/.test(results)) seen.refusals += 1;
+    const n = turn++;
+    // Fires edit repeatedly and NEVER creates a plan.
+    if (n < 3) {
+      yield { type: "done", message: toolMsg([[`e${n}`, "edit", editArgs]]) };
+      return;
+    }
+    yield { type: "done", message: toolMsg([["d1", "deliver", { writes: [{ tool: "edit", path: target, summary: "x" }], notes: "refused" }]]) };
+  };
+
+  const reg = new Registry();
+  registerBuiltins(reg, { logStore: new LogStore() });
+  const orch = new Orchestrator({ cwd: dir, llm, registry: reg, permission: new PermissionGate("bypass"), logStore: new LogStore() });
+  await orch.run("change the placeholder title to Delete Account");
+
+  assert.equal(seen.planRan, false, "the model never called create_plan");
+  assert.equal(seen.refusals, 3, "every one of the three edits was refused — no bypass");
+  assert.equal(await fs.readFile(target, "utf8"), "Title: nnnn\n", "the file was never edited without a plan");
   await fs.rm(dir, { recursive: true, force: true });
 });

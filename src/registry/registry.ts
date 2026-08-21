@@ -16,7 +16,7 @@
  * plus categorizer-scoped resolution used by the chain.
  */
 import type { AgentTool, Tool } from "../types.js";
-import { categorizeTool } from "./categorize.js";
+import { categorizeTool, isInspectSurface } from "./categorize.js";
 
 export type ProviderKind = "tool" | "mcp" | "skill";
 export type ProviderSource = "internal" | "external";
@@ -140,10 +140,15 @@ export class Registry {
 
     // Normalize per-tool scopes/mutates so downstream code never sees undefined.
     // Per-tool categorizers: explicit → custom categorizer(default) → default.
+    // Cohort scoping, decided once for the whole provider: a tool that names no
+    // QA keyword but sits in a QA server is still QA. See `isInspectSurface`.
+    const qaSurface = input.categorizers?.length ? false : isInspectSurface(input.tools);
     const tools = input.tools.map((t) => ({
       ...t,
       mutates: t.mutates ?? false,
-      categorizers: t.categorizers?.length ? t.categorizers : this.categorizer(t, categorizeTool(t)),
+      categorizers: t.categorizers?.length
+        ? t.categorizers
+        : this.categorizer(t, qaSurface ? ["activity_inspect"] : categorizeTool(t)),
     }));
     const categorizers = input.categorizers?.length
       ? input.categorizers
@@ -216,7 +221,7 @@ export class Registry {
     }
     // Demote bash in work-driving categorizers; read stays read-only by nature
     // and benefits from keeping bash in its natural position.
-    if (["write_edit", "activity_inspect", "perform", "perfect"].includes(categorizer)) {
+    if (["write_edit", "activity_inspect", "activity_reproduce", "perform", "perfect"].includes(categorizer)) {
       return this.demoteFallbackTools(out);
     }
     return out;

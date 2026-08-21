@@ -69,19 +69,39 @@ test("at least one entry categorizer is required", () => {
   );
 });
 
-test("the default setup is the four categories with the standard graph", () => {
+test("the default setup is the five categories with the standard graph", () => {
   const ids = DEFAULT_CATEGORIZER_SETUP.categories.map((c) => c.id);
-  assert.deepEqual(ids, ["conversation", "read", "write_edit", "activity_inspect"]);
+  assert.deepEqual(ids, ["conversation", "read", "write_edit", "activity_reproduce", "activity_inspect"]);
 
   const byId = Object.fromEntries(DEFAULT_CATEGORIZER_SETUP.categories.map((c) => [c.id, c]));
   assert.deepEqual(byId.conversation.children, []);
-  assert.deepEqual(byId.read.children, ["write_edit", "activity_inspect"]);
+  // A bug report reproduces before it is fixed; a feature goes straight to work.
+  assert.deepEqual(byId.read.children, ["activity_reproduce", "write_edit"]);
   assert.deepEqual(byId.write_edit.children, ["activity_inspect"]);
+  assert.deepEqual(byId.activity_reproduce.children, ["write_edit"]);
   assert.deepEqual(byId.activity_inspect.children, ["write_edit"]);
 
+  // The two QA hops are never entry points: reproducing needs read's files, and
+  // verifying needs a change to measure.
+  assert.equal(byId.activity_reproduce.entry, false);
+  assert.equal(byId.activity_inspect.entry, false);
+  assert.equal(byId.read.entry, true);
+
+  // One QA tool surface, two jobs.
+  assert.equal(byId.activity_reproduce.toolScope, "activity_inspect");
+  assert.equal(byId.activity_reproduce.returns.kind, "repro-report");
+  assert.equal(byId.activity_inspect.returns.kind, "inspect-report");
+
   // Context passing contract:
-  assert.deepEqual(byId.activity_inspect.accepts, { from: ["write_edit", "read"], tools: ["write", "edit"] });
-  assert.deepEqual(byId.write_edit.accepts, { from: ["read", "activity_inspect"], tools: [] });
+  assert.deepEqual(byId.activity_reproduce.accepts, { from: ["read"], tools: [] });
+  assert.deepEqual(byId.activity_inspect.accepts, {
+    from: ["write_edit", "read", "activity_reproduce"],
+    tools: ["write", "edit"],
+  });
+  assert.deepEqual(byId.write_edit.accepts, {
+    from: ["read", "activity_reproduce", "activity_inspect"],
+    tools: [],
+  });
 
   // Globals reach every categorizer.
   for (const g of ["bash", "ask_user_question", "clearing_doubt", "web_search", "web_fetch", "web_scrape"]) {
@@ -117,7 +137,7 @@ test("an app can extend the default setup with a new category (config-file flow)
     doubtModel: "test/senior",
     maxHops: 9,
   });
-  assert.equal(setup.categories.length, 5);
+  assert.equal(setup.categories.length, 6);
   assert.equal(setup.doubtModel, "test/senior");
   assert.equal(setup.maxHops, 9);
   // And the graph accepts wiring the new node in.

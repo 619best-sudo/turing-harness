@@ -41,6 +41,7 @@
  */
 import type { Context, LLMBridge, Model, Usage } from "../../types.js";
 import { emptyUsage } from "../../types.js";
+import { parseJsonArrayLoose } from "../../robust-json.js";
 
 /**
  * What the skill must emit, one per section of the designed page.
@@ -270,18 +271,11 @@ function truncateForFraming(text: string): string {
  * module it conceptually replaced.
  */
 export function parseSections(text: string): DesignedSection[] {
-  const firstBracket = text.indexOf("[");
-  const lastBracket = text.lastIndexOf("]");
-  if (firstBracket === -1 || lastBracket <= firstBracket) return [];
-  let candidate = text.slice(firstBracket, lastBracket + 1);
-  // Strip a markdown fence around the array if the model wrapped it anyway.
-  candidate = candidate.replace(/^```[a-zA-Z]*\s*/m, "").replace(/\s*```\s*$/m, "");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    return [];
-  }
+  // `parseJsonArrayLoose` replaces what used to be a first-`[`-to-last-`]` slice:
+  // that slice cannot tell a bracket inside a string from structure, and it threw
+  // away a truncated array wholesale instead of keeping the sections that did
+  // arrive.
+  const parsed = parseJsonArrayLoose(text);
   if (!Array.isArray(parsed)) return [];
   const sections: DesignedSection[] = [];
   for (const entry of parsed) {

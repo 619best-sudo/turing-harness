@@ -25,7 +25,8 @@ import { isBlankLineDriftOnly } from "./authored-output.js";
 import { coerceToString } from "../../orchestrator/tool-arg-coercion.js";
 import {
   comprehendFile,
-  coversRange,
+  comprehensionBudgetLeft,
+  coversAnyRange,
   forgetComprehension,
   reanchorComprehension,
   hashContent,
@@ -33,7 +34,9 @@ import {
   rateFileComplexity,
   recallComprehension,
   rememberComprehension,
+  spendComprehensionBudget,
 } from "./comprehension.js";
+import type { RememberedComprehension } from "./comprehension.js";
 import { selectModel } from "../../llm/model-selector.js";
 import { resolveModel } from "../../llm/models.js";
 import { resolveShellEnvironment } from "../../exec/shell-env.js";
@@ -53,6 +56,26 @@ import {
   type ImageScope,
   type LiveImage,
 } from "../../multimodal/attachment-routing.js";
+
+/**
+ * Comprehension cache access routed through the run's threaded store when one is
+ * present. The chain creates one `ComprehensionStore` per run so the read hop's
+ * analysis is visible to the write_edit hop's authoring; the module-level
+ * functions back the unthreaded direct-tool path. Every write/edit site that
+ * reads or invalidates a prior analysis must go through these, or a threaded run
+ * would inherit from (and invalidate) the wrong store.
+ */
+function recallComprehensionFor(ctx: ToolContext, file: string) {
+  return ctx.comprehensionStore?.recall(file) ?? recallComprehension(file);
+}
+function forgetComprehensionFor(ctx: ToolContext, file: string): void {
+  if (ctx.comprehensionStore) ctx.comprehensionStore.forget(file);
+  else forgetComprehension(file);
+}
+function reanchorComprehensionFor(ctx: ToolContext, file: string, fileHash: string): void {
+  if (ctx.comprehensionStore) ctx.comprehensionStore.reanchor(file, fileHash);
+  else reanchorComprehension(file, fileHash);
+}
 
 /**
  * Self-assessment fields shared by `write` and `edit`.
@@ -423,11 +446,19 @@ const AUTHORED_EXTENSIONS =
  * remove or produce files without any model deciding what the bytes say, which
  * is the thing this guard is about.
  */
-const SHELL_AUTHORING_FORMS: Array<{ label: string; re: RegExp; fullCommand?: boolean }> = [
+const SHELL_AUTHORING_FORMS: Array<{
+  label: string;
+  re: RegExp;
+  fullCommand?: boolean;
+  /** Shield quoted spans before matching — the target path lives OUTSIDE quotes,
+   *  and a `;`/`&` inside a quoted script must not masquerade as a shell
+   *  separator to the regex (the multiline `sed -i '' '...;...'` form). */
+  shieldQuote?: boolean;
+}> = [
   { label: "heredoc redirect", re: /(?:>{1,2})\s*([^\s<>|;&]+)[\s\S]*?<<-?\s*['"]?\w+/g },
-  { label: "output redirect", re: /(?:^|[^0-9<>])>{1,2}\s*([^\s<>|;&]+)/g },
-  { label: "sed -i", re: /\bsed\b[^|;&]*\s-i(?:\.\w+)?\b[^|;&]*?\s([^\s|;&]+)\s*$/g },
-  { label: "tee", re: /\btee\b(?:\s+-a)?\s+([^\s|;&]+)/g },
+  { label: "output redirect", re: /(?:^|[^0-9<>])>{1,2}\s*([^\s<>|;&]+)/g, shieldQuote: true },
+  { label: "sed -i", re: /\bsed\b[^|;&]*\s-i(?:\.\w+)?\b[^|;&]*?\s([^\s|;&]+)\s*$/g, shieldQuote: true },
+  { label: "tee", re: /\btee\b(?:\s+-a)?\s+([^\s|;&]+)/g, shieldQuote: true },
   { label: "python inline write", re: /\bpython3?\b[^|;&]*\bopen\(\s*['"]([^'"]+)['"]\s*,\s*['"][wa]/g },
   // `pathlib.Path("file").write_text(...)` / `write_bytes(...)` — the form a
   // model reaches for when `open(...,'w')` is recognised but it still wants to
@@ -449,36 +480,186 @@ const SHELL_AUTHORING_FORMS: Array<{ label: string; re: RegExp; fullCommand?: bo
  * it. That is not a sandbox failure (the shell is meant to be powerful); it is
  * the mode quietly not covering its own claim.
  *
+ * Detection is shell-aware about the two shapes a weak driver's bash-edit
+ * actually takes, both of which a naive newline split misses (observed run):
+ *
+ *   - a multiline `sed -i` whose script is quoted across lines — the newline
+ *     must not split the statement, or `sed` and its target path stop co-occurring;
+ *   - a `python3 << 'EOF'` heredoc whose `open(file, 'w')` write is on a later
+ *     line — the body lines must be judged together with the `python3` prefix.
+ *
+ * So heredoc bodies are checked as single units first (prefix + body), then
+ * blanked out, and the remainder is split into statements on `&&`/`||`/`;`/
+ * newlines while never cutting inside quotes or `(...)` groups.
+ *
  * Returns the offending path when the command writes authored content, else null.
  */
 export function detectShellAuthoring(command: string): { path: string; form: string } | null {
-  // `fullCommand` forms (the python pathlib write) are matched against the WHOLE
-  // command, because a `python3 -c` one-liner separates statements with `;` and
-  // the per-segment split below would break `Path(x); Path(x).write_text(y)` in
-  // two. The shell forms are matched per-segment so `npm test && cat > x.ts` is
-  // judged by its second segment alone.
-  for (const { label, re, fullCommand } of SHELL_AUTHORING_FORMS) {
-    if (!fullCommand) continue;
-    for (const m of command.matchAll(re)) {
+  // 0. Full-command forms first, against the WHOLE command: a `python3 -c` (or
+  //    heredoc) one-liner separates statements with `;`, and a per-statement
+  //    split would break `Path(x); Path(x).write_text(y)` — and the inline
+  //    `open(...)` form — apart from their `python3` prefix.
+  const whole = matchAuthoringForms(command, true);
+  if (whole) return whole;
+  // 1. Each heredoc is one unit: the leading command (`python3`, `cat > file`) and
+  //    its body must be judged together, because the write often lands mid-body.
+  for (const unit of extractHeredocUnits(command)) {
+    const hit = matchAuthoringForms(unit, true);
+    if (hit) return hit;
+  }
+  // 2. Blank heredoc bodies so step 3 cannot slice the body into statements.
+  const remainder = blankHeredocBodies(command);
+  // 3. Split the rest into statements — quote- and paren-aware, so a multiline
+  //    quoted `sed` script stays one statement with its target path.
+  for (const statement of splitShellStatements(remainder)) {
+    if (!statement.trim()) continue;
+    const hit = matchAuthoringForms(statement, false);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Apply every content-authoring form to one contiguous statement/heredoc unit. */
+function matchAuthoringForms(text: string, allowFullCommandForms: boolean): { path: string; form: string } | null {
+  const shielded = shieldQuoted(text);
+  for (const { label, re, fullCommand, shieldQuote } of SHELL_AUTHORING_FORMS) {
+    if (fullCommand && !allowFullCommandForms) continue;
+    for (const m of (shieldQuote ? shielded : text).matchAll(re)) {
       const target = m[1]?.replace(/^['"]|['"]$/g, "");
       if (target && AUTHORED_EXTENSIONS.test(target)) return { path: target, form: label };
     }
   }
-  // Split on separators so `npm test && cat > src/x.ts <<EOF` is judged per segment.
-  for (const segment of command.split(/&&|\|\||;|\n/)) {
-    for (const { label, re, fullCommand } of SHELL_AUTHORING_FORMS) {
-      if (fullCommand) continue;
-      // ALL matches, not the first. `echo '<h1>x</h1>' > index.html` contains a
-      // `>` inside the payload that matches the redirect pattern before the real
-      // redirect does; taking only `exec`'s first hit let exactly the commands
-      // this guard exists to catch slip past, because HTML is full of `>`.
-      for (const m of segment.trim().matchAll(re)) {
-        const target = m[1]?.replace(/^['"]|['"]$/g, "");
-        if (target && AUTHORED_EXTENSIONS.test(target)) return { path: target, form: label };
-      }
-    }
-  }
   return null;
+}
+
+/**
+ * Replace quoted spans with a single placeholder, so `;`/`&`/`|` inside a quoted
+ * script can no longer masquerade as shell separators to a regex. Only used by
+ * forms whose captured TARGET path sits outside quotes (sed/redirect/tee) — the
+ * python forms need their quoted paths intact and must NOT be shielded.
+ */
+function shieldQuoted(s: string): string {
+  return s.replace(
+    /'(?:[^'\\]|\\[\s\S])*'|"(?:[^"\\]|\\[\s\S])*"|`(?:[^`\\]|\\[\s\S])*`/g,
+    "Q",
+  );
+}
+
+/**
+ * Extract every heredoc as a single unit: from the start of the statement that
+ * opens `<< TOKEN` through the line that is only `TOKEN`. The body lines are not
+ * quote-delimited, so a plain statement split would tear `python3` away from the
+ * `open(..., 'w')` in its body — the exact gap the observed run walked through.
+ */
+function extractHeredocUnits(command: string): string[] {
+  const units: string[] = [];
+  const opener = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)\s*['"]?/g;
+  let m: RegExpExecArray | null;
+  while ((m = opener.exec(command)) !== null) {
+    const token = m[1];
+    const bodyStart = command.indexOf("\n", m.index);
+    if (bodyStart === -1) continue;
+    const terminator = new RegExp(`^[\\t ]*${escapeRegExp(token)}\\s*$`, "m");
+    const term = terminator.exec(command.slice(bodyStart + 1));
+    if (!term) continue;
+    const unitEnd = bodyStart + 1 + term.index + term[0].length;
+    // From the previous statement separator (or the head) so the leading command
+    // — the `python3`, the `cat > file` — is inside the unit with its body.
+    let unitStart = 0;
+    for (const sep of ["&&", "||", ";"]) {
+      const at = command.lastIndexOf(sep, m.index);
+      if (at !== -1 && at > unitStart) unitStart = at + sep.length;
+    }
+    const nl = command.lastIndexOf("\n", m.index);
+    if (nl !== -1 && nl + 1 > unitStart) unitStart = nl + 1;
+    units.push(command.slice(unitStart, unitEnd));
+  }
+  return units;
+}
+
+/**
+ * Remove heredoc bodies (from the line after `<< TOKEN` through the terminator
+ * line) so the statement split below cannot cut them into ordinary lines. The
+ * opening command line itself is kept — redirects like `cat > file <<EOF` still
+ * name their target on that line.
+ */
+function blankHeredocBodies(command: string): string {
+  let out = command;
+  const opener = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)\s*['"]?/g;
+  let m: RegExpExecArray | null;
+  while ((m = opener.exec(command)) !== null) {
+    const token = m[1];
+    const bodyStart = command.indexOf("\n", m.index);
+    if (bodyStart === -1) continue;
+    const terminator = new RegExp(`^[\\t ]*${escapeRegExp(token)}\\s*$`, "m");
+    const term = terminator.exec(command.slice(bodyStart + 1));
+    if (!term) continue;
+    const bodyEnd = bodyStart + 1 + term.index + term[0].length;
+    out = out.slice(0, bodyStart) + "\n" + out.slice(bodyEnd);
+    // Re-scan from the head against the SHRUNK command so indexes stay valid.
+    command = out;
+    opener.lastIndex = 0;
+  }
+  return out;
+}
+
+/**
+ * Split a command into statements on `&&`, `||`, `;` and NEWLINES — but never
+ * inside single/double quotes, backticks, or `(...)` groups. A multiline quoted
+ * `sed` script must stay one statement with its target path.
+ */
+function splitShellStatements(command: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let single = false;
+  let double = false;
+  let backtick = false;
+  let paren = 0;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (single) {
+      cur += ch;
+      if (ch === "'") single = false;
+      continue;
+    }
+    if (double) {
+      cur += ch;
+      if (ch === "\\") {
+        if (i + 1 < command.length) {
+          cur += command[i + 1];
+          i += 1;
+        }
+        continue;
+      }
+      if (ch === '"') double = false;
+      continue;
+    }
+    if (backtick) {
+      cur += ch;
+      if (ch === "`") backtick = false;
+      continue;
+    }
+    if (ch === "'") { single = true; cur += ch; continue; }
+    if (ch === '"') { double = true; cur += ch; continue; }
+    if (ch === "`") { backtick = true; cur += ch; continue; }
+    if (ch === "(") { paren += 1; cur += ch; continue; }
+    if (ch === ")") { if (paren > 0) paren -= 1; cur += ch; continue; }
+    const boundary =
+      paren === 0 &&
+      (ch === ";" ||
+        ch === "\n" ||
+        (ch === "&" && command[i + 1] === "&") ||
+        (ch === "|" && command[i + 1] === "|"));
+    if (boundary) {
+      if (cur.trim()) out.push(cur);
+      if (ch === "&" || ch === "|") i += 1; // consume the doubled separator
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
 }
 
 /**
@@ -681,6 +862,10 @@ export const bashTool: AgentTool = {
   // Mutating shell is only available once the chain reaches execution /
   // verification phases. Prepare/Plan must stay read-only.
   categorizers: ["write_edit", "activity_inspect"],
+  // `timeout` is deliberately NOT aliased to `timeoutMs`: seconds versus
+  // milliseconds is a unit change, not a rename, and silently reading `30` as
+  // 30ms would kill every command it was meant to allow.
+  argAliases: { cmd: "command", script: "command", shellCommand: "command", run: "command" },
   parameters: {
     type: "object",
     properties: {
@@ -1452,14 +1637,34 @@ const READ_PROPERTIES = {
   path: { type: "string", description: "File path (absolute or relative to cwd)." },
   offset: { type: "number", description: "1-based start line." },
   limit: { type: "number", description: "Max number of lines (a COUNT, not a last-line number)." },
+  endLine: {
+    type: "number",
+    description: "Last line to read, INCLUSIVE — the other way to say it, when a range is what you have. Use this OR `limit`, not both.",
+  },
 } as const;
 
 export const readTool: AgentTool = {
   name: "read",
   title: "Read a file",
-  description: "Read a UTF-8 text file. Supports optional line offset/limit for large files.",
+  description:
+    "Read a UTF-8 text file. Windowed by `offset` + `limit` (a count) or `offset` + `endLine` (a range).",
   mutates: false,
   categorizers: ["read", "write_edit", "activity_inspect"],
+  // Observed across four runs: `end`, `end_line`, `endLine`, `start_line`. The
+  // driver thinks in a line RANGE; the schema was an offset and a count, so every
+  // one of those calls was refused and cost a turn. Two of the four spellings the
+  // coercion pass already resolves against the schema; these are the rest.
+  argAliases: {
+    end: "endLine",
+    to: "endLine",
+    lastLine: "endLine",
+    endingLine: "endLine",
+    start: "offset",
+    startLine: "offset",
+    from: "offset",
+    fromLine: "offset",
+    startingLine: "offset",
+  },
   parameters: {
     type: "object",
     properties: { ...READ_PROPERTIES },
@@ -1495,7 +1700,8 @@ export const readTool: AgentTool = {
           `so nothing was read — an unrecognised window argument would silently return a DIFFERENT part of the ` +
           `file than you asked for, which is worse than an error. This tool takes: ` +
           `${[...declared].map((k) => `'${k}'`).join(", ")}. ` +
-          `'offset' is the 1-based first line and 'limit' is a COUNT of lines (not a last-line number). Re-issue the call.`,
+          `'offset' is the 1-based first line; give the window as 'limit' (a COUNT of lines) or ` +
+          `'endLine' (the last line, inclusive). Re-issue the call.`,
         isError: true,
         details: { path: String(rawPath), undeclaredArgs: undeclared },
       };
@@ -1506,15 +1712,25 @@ export const readTool: AgentTool = {
       const text = await fs.readFile(file, "utf8");
       let lines = text.split("\n");
       const offset = args.offset ? Math.max(1, Number(args.offset)) : 1;
-      if (args.offset || args.limit) {
-        const limit = args.limit ? Number(args.limit) : lines.length;
+      // `endLine` is a RANGE END; `limit` is a COUNT. Converting here rather than
+      // asking the caller to do the arithmetic is the point of accepting it: the
+      // intent of `offset: 500, endLine: 560` is not in doubt, and refusing it
+      // spent a turn teaching a lesson that did not take.
+      const windowed = args.offset != null || args.limit != null || args.endLine != null;
+      if (windowed) {
+        const limit =
+          args.limit != null
+            ? Number(args.limit)
+            : args.endLine != null
+              ? Math.max(1, Number(args.endLine) - offset + 1)
+              : lines.length;
         lines = lines.slice(offset - 1, offset - 1 + limit);
       }
       const numbered = lines.map((l, i) => `${offset + i}\t${l}`).join("\n");
       // Identify the FILE (not the window) for comprehension reuse, plus which
       // part of it this call actually looked at.
       const fileHash = hashContent(text);
-      const readRange = args.offset || args.limit ? `${offset}:${args.limit ?? "end"}` : "full";
+      const readRange = windowed ? `${offset}:${args.limit ?? args.endLine ?? "end"}` : "full";
 
       // ---- stage 2: rate, and escalate comprehension if the file is too hard ----
       // Mirrors the write/edit two-step, with the escalation decision made here
@@ -1522,12 +1738,12 @@ export const readTool: AgentTool = {
       const staged = await stageRead({ ctx, file, numbered, fullText: text, fileHash, readRange });
 
       return {
-        output: !staged.analysis
-          ? staged.analysisFailed && staged.comprehendedBy && staged.rating
-            ? `${numbered}\n\n${comprehensionUnavailable(staged.comprehendedBy, staged.rating)}`
-            : numbered
-          : staged.repeated
-            ? `${numbered}\n\n${comprehensionPointer(staged.comprehendedBy!)}`
+        output: staged.repeated
+          ? `${numbered}\n\n${comprehensionReuseNote(staged.comprehendedBy!)}`
+          : !staged.analysis
+            ? staged.analysisFailed && staged.comprehendedBy && staged.rating
+              ? `${numbered}\n\n${comprehensionUnavailable(staged.comprehendedBy, staged.rating)}`
+              : numbered
             : `${numbered}\n\n${comprehensionBanner(staged.comprehendedBy!)}\n${staged.analysis}`,
         details: {
           path: file,
@@ -1535,6 +1751,15 @@ export const readTool: AgentTool = {
           ...(staged.rating ? { complexity: staged.rating } : {}),
           ...(staged.why ? { complexityWhy: staged.why } : {}),
           ...(staged.comprehendedBy ? { comprehendedBy: staged.comprehendedBy } : {}),
+          ...(staged.comprehendedBy
+            ? {
+                comprehension: {
+                  rating: staged.rating,
+                  model: staged.comprehendedBy,
+                  reused: staged.repeated === true,
+                },
+              }
+            : {}),
         },
         ...(staged.rating ? { measuredComplexity: staged.rating, measuredPath: file } : {}),
         ...(staged.usage ? { usage: staged.usage } : {}),
@@ -1646,12 +1871,31 @@ function comprehensionBanner(model: string): string {
  * every window of the same file bought the reader nothing and cost real context
  * (six emissions of one 14KB analysis in an observed run). A pointer keeps the
  * fact that an analysis exists without paying for it twice.
+ *
+ * The one-line version of this note did not stop the re-reads it was meant to:
+ * "scroll back rather than re-reading the file to get it again" assumed the
+ * reader connects the pointer to the understanding it already has. Small drivers
+ * instead keep opening new windows of the file to "understand" it. So the note
+ * now states the CONTRACT explicitly: the analysis covers the whole file, it is
+ * already in context, and further window reads add bytes but not understanding.
  */
-function comprehensionPointer(model: string): string {
-  return (
-    `--- (${model}'s analysis of this file is unchanged and was already given with an earlier read of it; ` +
-    `scroll back rather than re-reading the file to get it again) ---`
-  );
+function comprehensionReuseNote(model: string): string {
+  return [
+    `--- (${model}'s whole-file expert analysis of this file was given with an earlier read of it and is`,
+    `still in this conversation.) It covers EVERY part of the file — including the lines above — so do`,
+    `not read more windows of this file to understand it. Read a precise range only when you need its`,
+    `exact bytes; otherwise continue with the task. ---`,
+  ].join("\n");
+}
+
+/**
+ * Bound the driver's reasoning before it is sent to the comprehension analyst.
+ * It is context for the analyst (what has already been covered), not something
+ * the reader needs back verbatim — a few hundred words carry the coverage, the
+ * rest is cost.
+ */
+function truncateReasoning(reasoning: string, maxChars = 1800): string {
+  return reasoning.length > maxChars ? `${reasoning.slice(0, maxChars)}\n…(truncated)` : reasoning;
 }
 
 /**
@@ -1783,45 +2027,109 @@ async function stageRead(input: {
   //
   // Gated on the content hash, not the path: an analysis of different bytes would
   // be worse than no analysis, because it reads as current.
-  const reusable = recallComprehension(file);
-  if (reusable && !(reusable.fileHash === fileHash && coversRange(reusable.coveredRange, readRange))) {
-    // Say WHICH precondition failed. "Escalated again" on its own is unactionable
-    // — it cannot distinguish a genuinely changed file from a cache that is
-    // silently never hitting, and telling those apart took a live log dig.
+  //
+  // The store is the run-scoped carrier (the chain threads one through every
+  // hop), so the analysis a hop produced is visible to every later hop: their
+  // first read of the file re-injects it in full at zero model cost. The
+  // module-level functions back the unthreaded direct-tool path.
+  const store = ctx.comprehensionStore;
+  const recallEntry = (p: string) => store?.recall(p) ?? recallComprehension(p);
+  const putEntry = (p: string, v: RememberedComprehension) =>
+    store ? store.put(p, v) : rememberComprehension(p, v);
+  const budgetLeft = (p: string) =>
+    store ? store.canComprehend(p) : comprehensionBudgetLeft(p);
+  const spendBudget = (p: string) =>
+    store ? store.noteComprehended(p) : spendComprehensionBudget(p);
+
+  const reusable = recallEntry(file);
+  if (reusable && reusable.fileHash !== fileHash) {
+    // The file changed since it was analysed; the analysis is stale. Say WHICH
+    // precondition failed. "Escalated again" on its own is unactionable — it
+    // cannot distinguish a genuinely changed file from a cache that is silently
+    // never hitting, and telling those apart took a live log dig.
     ctx.log({
       timestamp: Date.now(),
       level: "debug",
       tags: ["tool:read", "escalation", "escalation:miss"],
-      message:
-        `${file}: cannot reuse prior analysis — ` +
-        (reusable.fileHash !== fileHash
-          ? "the file changed since it was analysed"
-          : `it covers ${reusable.coveredRange ?? "an unrecorded range"} but this read wants ${readRange}`),
+      message: `${file}: cannot reuse prior analysis — the file changed since it was analysed`,
     });
   }
-  if (reusable?.fileHash === fileHash && coversRange(reusable.coveredRange, readRange)) {
-    ctx.log({
-      timestamp: Date.now(),
-      level: "info",
-      tags: ["tool:read", "escalation", "escalation:reused"],
-      message: `${file} unchanged since it was comprehended; reusing ${reusable.model} analysis (no re-rate, no re-escalation)`,
-    });
-    return {
-      rating: reusable.rating,
-      ...(reusable.why ? { why: reusable.why } : {}),
-      ...(reusable.analysis
-        ? { analysis: reusable.analysis, comprehendedBy: reusable.model, repeated: reusable.emitted === true }
-        : {}),
-    };
+  if (reusable && reusable.fileHash === fileHash) {
+    // A stored LOW rating is the rater's verdict for these bytes: never re-rate,
+    // never re-escalate — unless the loop's own floor (plan task / measurement)
+    // outranks it, in which case the loop's rating wins and the entry ratchets up.
+    if (reusable.rating === "low" && (!ctx.knownComplexity || ctx.knownComplexity === "low")) {
+      return { rating: "low", ...(reusable.why ? { why: reusable.why } : {}) };
+    }
+    if (coversAnyRange(reusable, readRange)) {
+      // The analysis covers this request. Re-inject in full when THIS loop's
+      // driver has never seen it — the write_edit hop's first read of a file the
+      // read hop comprehended must get the reasoning, not a pointer to a
+      // transcript it does not have. Same loop ⇒ a reuse note instead: the full
+      // text is already in this conversation and must not be paid for twice.
+      const emittedHere = reusable.emitted === true && reusable.emittedInLoop === ctx.loopLabel;
+      if (!emittedHere && reusable.analysis) {
+        putEntry(file, { ...reusable, emitted: true, emittedInLoop: ctx.loopLabel });
+        ctx.log({
+          timestamp: Date.now(),
+          level: "info",
+          tags: ["tool:read", "escalation", "escalation:reinjected"],
+          message: `${file} already comprehended by ${reusable.model}; analysis re-injected into ${ctx.loopLabel ?? "this loop"} from the store (no re-rate, no re-escalation)`,
+        });
+        return {
+          rating: reusable.rating,
+          ...(reusable.why ? { why: reusable.why } : {}),
+          analysis: reusable.analysis,
+          comprehendedBy: reusable.model,
+        };
+      }
+      ctx.log({
+        timestamp: Date.now(),
+        level: "info",
+        tags: ["tool:read", "escalation", "escalation:reused"],
+        message: `${file} unchanged since it was comprehended; reusing ${reusable.model} analysis (no re-rate, no re-escalation)`,
+      });
+      return {
+        rating: reusable.rating,
+        ...(reusable.why ? { why: reusable.why } : {}),
+        repeated: true,
+        comprehendedBy: reusable.model,
+      };
+    }
+    // Hash matches but this request's window is not covered — a file too large
+    // to send whole, being read in slices. The rating is already known, so the
+    // rater is skipped; comprehension of the new window is subject to the
+    // per-file cap (never a third comprehension for one file).
+    if (!withinFullCap && !budgetLeft(file)) {
+      ctx.log({
+        timestamp: Date.now(),
+        level: "info",
+        tags: ["tool:read", "escalation", "escalation:budget"],
+        message: `${file}: comprehension budget exhausted; returning bytes + pointer to the existing analysis`,
+      });
+      return {
+        rating: reusable.rating,
+        ...(reusable.why ? { why: reusable.why } : {}),
+        repeated: true,
+        comprehendedBy: reusable.model,
+      };
+    }
   }
 
-  // A rating the run already holds beats spending a call to recompute it.
-  let rating = ctx.knownComplexity;
-  let why: string | undefined;
+  // A rating the run already holds beats spending a call to recompute it — but
+  // only when it describes these SAME bytes. A stale entry (file changed since it
+  // was analysed) must go through the rater again: the new bytes may be trivial,
+  // or entirely different.
+  const sameBytes = reusable && reusable.fileHash === fileHash;
+  let rating = ctx.knownComplexity ?? (sameBytes ? reusable?.rating : undefined);
+  let why = sameBytes ? reusable?.why : undefined;
   let usage: Usage | undefined;
 
   if (!rating) {
-    if (looksTrivial(file, numbered)) return { rating: "low" };
+    if (looksTrivial(file, numbered)) {
+      putEntry(file, { rating: "low", fileHash });
+      return { rating: "low" };
+    }
     const rated = await rateFileComplexity({
       llm: ctx.llm,
       model: ctx.model,
@@ -1841,7 +2149,11 @@ async function stageRead(input: {
     usage = rated.usage;
   }
 
-  if (rating === "low") return { rating, ...(why ? { why } : {}), ...(usage ? { usage } : {}) };
+  if (rating === "low") {
+    // Persist the verdict so a later read of these same bytes never re-rates.
+    putEntry(file, { rating: "low", fileHash, ...(why ? { why } : {}) });
+    return { rating, ...(why ? { why } : {}), ...(usage ? { usage } : {}) };
+  }
 
   // The host's routing table wins: it names a model for this exact (kind,
   // rating) pair. Only when it has no opinion do we fall back to indexing the
@@ -1881,24 +2193,44 @@ async function stageRead(input: {
     category: categoryForPath(file, ctx.projectCategory),
     ...(readTask ? { task: readTask } : {}),
     ...(why ? { why } : {}),
+    // The driver's own reasoning about this file, so the analyst does not restate
+    // it — the escalation must be DISJOINT from what the weaker model already
+    // worked out, or it doubles the reasoning instead of compensating for it.
+    ...(ctx.currentReasoning ? { driverReasoning: truncateReasoning(ctx.currentReasoning) } : {}),
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
+  spendBudget(file);
 
   // Remember what B worked out, keyed by path, so the authoring pass for a later
-  // write/edit inherits it. Without this the understanding only ever reaches the
-  // author by way of the ORCHESTRATOR's paraphrase of it — the strong model
-  // explains the file, the weak model summarises the explanation, and the model
-  // that actually writes the bytes never sees the original.
+  // write/edit inherits it and every later hop re-injects it from the store.
+  // Without this the understanding only ever reaches the author by way of the
+  // ORCHESTRATOR's paraphrase of it — the strong model explains the file, the
+  // weak model summarises the explanation, and the model that actually writes the
+  // bytes never sees the original.
   if (comprehended.analysis) {
-    rememberComprehension(file, {
+    // Union of covered windows for a huge file read in slices: the latest range
+    // goes in `coveredRange`, every windowed range the run has comprehended stays
+    // answerable via `coveredRanges` (a full-file comprehension collapses this).
+    const prior = reusable && reusable.fileHash === fileHash ? reusable : undefined;
+    const coveredRanges =
+      comprehendRange === "full"
+        ? undefined
+        : [
+            ...(prior?.coveredRange && prior.coveredRange !== "full" ? [prior.coveredRange] : []),
+            ...(prior?.coveredRanges ?? []),
+            comprehendRange,
+          ];
+    putEntry(file, {
       rating,
       analysis: comprehended.analysis,
       model: escalatedId,
       fileHash,
       coveredRange: comprehendRange,
+      ...(coveredRanges?.length ? { coveredRanges } : {}),
       // This read is about to append it in full; every later read of the same
-      // bytes gets the pointer.
+      // bytes in THIS loop gets the reuse note.
       emitted: true,
+      emittedInLoop: ctx.loopLabel,
       ...(why ? { why } : {}),
     });
   }
@@ -2133,7 +2465,7 @@ async function executeWrite(
         // understanding out of the orchestrator's paraphrase — and its `rating` is
         // an independent judgement of the file, unlike `ctx.declaredComplexity`,
         // which is the requesting model's claim about work it has not done yet.
-        const priorRead = recallComprehension(file);
+        const priorRead = recallComprehensionFor(ctx, file);
         const authored = await authorFileContent({
           llm: ctx.llm,
           model: writeAuthor.model,
@@ -2141,11 +2473,18 @@ async function executeWrite(
           ...(priorRead
             ? {
                 rating: priorRead.rating,
-                comprehension: {
-                  analysis: priorRead.analysis,
-                  model: priorRead.model,
-                  ...(priorRead.why ? { why: priorRead.why } : {}),
-                },
+                // A rating-only entry (a `low` verdict) has no analysis — do not
+                // hand the author an empty comprehension that reads as "the strong
+                // model looked and found nothing".
+                ...(priorRead.analysis && priorRead.model
+                  ? {
+                      comprehension: {
+                        analysis: priorRead.analysis,
+                        model: priorRead.model,
+                        ...(priorRead.why ? { why: priorRead.why } : {}),
+                      },
+                    }
+                  : {}),
               }
             : {}),
           // What kind of work this is. It no longer selects a system prompt (the
@@ -2230,7 +2569,7 @@ async function executeWrite(
       // The stored analysis described the bytes that were just replaced. Keeping it
       // would hand the NEXT authoring pass a description of a file that no longer
       // exists — worse than having none, because it reads as current.
-      forgetComprehension(file);
+      forgetComprehensionFor(ctx, file);
       // An `ambiguous` scope means the run holds designs but could not tell which
       // one depicts this file, so it authored without any. Say so on the result:
       // the model can see the analyses and settle it in one more call, whereas
@@ -2284,6 +2623,10 @@ export function createWriteTool(authorOnly = false): AgentTool {
       : "Create or overwrite a file with the given contents.",
     mutates: true,
     categorizers: ["write_edit"],
+    // `contents`/`text`/`fileContent` are the same bytes under another name.
+    // `body` is deliberately absent: on a tool that also takes images and a
+    // request-shaped argument list it is not unambiguously the file's content.
+    argAliases: { contents: "content", text: "content", fileContent: "content", data: "content", filePath: "path", file: "path" },
     parameters: writeParameters(authorOnly),
     async execute(_id, args, ctx) {
       return executeWrite(args, ctx, authorOnly);
@@ -2324,6 +2667,161 @@ function editParameters(authorOnly: boolean) {
     },
     required: authorOnly ? ["path", "oldString"] : ["path", "oldString", "newString"],
   };
+}
+
+/**
+ * Whitespace-normalize a span of text the way `edit` matches leniently against
+ * a file: strip leading indentation per line, collapse every interior run of
+ * spaces/tabs to a single space, and strip line-trailing whitespace. The weak
+ * driver's edit anchors are usually right in every way except indentation;
+ * this is the lens that makes such an anchor match — while the byte-span
+ * mapping below guarantees the ORIGINAL bytes are the ones replaced, never a
+ * paraphrase.
+ */
+function normalizeWhitespace(s: string): string {
+  return s
+    .split("\n")
+    .map((l) => l.replace(/^[ \t]+/, "").replace(/[ \t]+/g, " ").replace(/ +$/g, ""))
+    .join("\n");
+}
+
+/**
+ * Normalize `text` and keep a per-normalized-character map back to the original
+ * byte offsets, so a match found in the normalized view can be located EXACTLY
+ * in the original file. Leading indentation per line is skipped entirely (the
+ * anchor is free to guess it); a collapsed interior whitespace run maps the
+ * normalized space to the whole original run (start..end), so the resolved span
+ * is the untouched original bytes — an edit that lands because of leniency still
+ * rewrites exactly the region the driver's words pointed at, and nothing
+ * adjacent to it.
+ */
+function normWithMap(text: string): { norm: string; starts: number[]; ends: number[] } {
+  let norm = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  const lines = text.split("\n");
+  let idx = 0;
+  for (const line of lines) {
+    const content = line.replace(/[ \t]+$/, "");
+    let i = 0;
+    // Leading indentation is free-form for the anchor: skip it (contributes no
+    // normalized char; the span mapping below re-attaches the real indentation).
+    while (i < content.length && (content[i] === " " || content[i] === "\t")) i += 1;
+    while (i < content.length) {
+      const ch = content[i];
+      if (ch === " " || ch === "\t") {
+        const runStart = i;
+        while (i < content.length && (content[i] === " " || content[i] === "\t")) i += 1;
+        norm += " ";
+        starts.push(idx + runStart);
+        ends.push(idx + i);
+      } else {
+        norm += ch;
+        starts.push(idx + i);
+        ends.push(idx + i + 1);
+        i += 1;
+      }
+    }
+    norm += "\n";
+    starts.push(idx + content.length);
+    ends.push(idx + content.length);
+    idx += line.length + 1;
+  }
+  return { norm, starts, ends };
+}
+
+/**
+ * Try to locate an edit anchor whose only defect is whitespace/indentation.
+ * Returns the ORIGINAL byte span when the anchor matches the file exactly once
+ * under whitespace normalization; `null` when it doesn't match, matches more
+ * than once (ambiguous — refusing is safer than guessing), or is empty. An
+ * anchor that fails this is a genuine miss, not an indentation slip.
+ */
+function resolveAnchorLenient(text: string, oldStr: string): { span: string } | null {
+  if (!oldStr.trim()) return null;
+  const { norm, starts, ends } = normWithMap(text);
+  const normOld = normalizeWhitespace(oldStr);
+  if (!normOld.trim()) return null;
+  const first = norm.indexOf(normOld);
+  if (first === -1) return null;
+  if (norm.indexOf(normOld, first + normOld.length) !== -1) return null; // not unique
+  const endIdx = first + normOld.length - 1;
+  let start = starts[first];
+  let end = ends[endIdx];
+  if (typeof start !== "number" || typeof end !== "number" || end <= start) return null;
+  // Re-attach the first line's real indentation when the anchor's first line IS
+  // that whole line (missing only its indent) — replacing a mid-line FRAGMENT
+  // must never swallow the line's indentation, so the extension is gated on the
+  // anchor's first normalized line equaling the file line's normalized content.
+  const lineStart0 = text.lastIndexOf("\n", start - 1) + 1;
+  const lineEnd0 = text.indexOf("\n", start);
+  const fileLine0 = text.slice(lineStart0, lineEnd0 === -1 ? text.length : lineEnd0);
+  if (normalizeWhitespace(oldStr.split("\n")[0]) === normalizeWhitespace(fileLine0)) {
+    const between = text.slice(lineStart0, start);
+    if (/^[ \t]*$/.test(between)) start = lineStart0;
+  }
+  return { span: text.slice(start, end) };
+}
+
+/**
+ * True when the anchor matches EXACTLY but only as a substring beginning right
+ * after a line's indentation, where the anchor's first line IS that whole line —
+ * i.e. the driver just forgot the leading indent. Using the exact substring
+ * would leave the orphaned indent in front of the replacement's own, doubling it;
+ * the line-anchored lenient span (indent included) is the real target.
+ */
+function forgotLineIndent(text: string, oldStr: string): boolean {
+  const at = text.indexOf(oldStr);
+  if (at === -1) return false;
+  const lineStart = text.lastIndexOf("\n", at - 1) + 1;
+  const lineEnd = text.indexOf("\n", at);
+  const before = text.slice(lineStart, at);
+  if (!/^[ \t]+$/.test(before) || before.length === 0) return false;
+  const fileLine = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
+  return normalizeWhitespace(oldStr.split("\n")[0]) === normalizeWhitespace(fileLine);
+}
+
+/** Pull a distinctive search token from an anchor's first line (longest identifier). */
+function anchorSearchToken(line: string): string | undefined {
+  const ids = [...line.matchAll(/[A-Za-z_][A-Za-z0-9_.$]*/g)].map((m) => m[0]);
+  if (!ids.length) return undefined;
+  return ids.sort((a, b) => b.length - a.length)[0];
+}
+
+/**
+ * The resolving diagnostic an edit misses with. Instead of a bare "oldString not
+ * found" — which is exactly where the weak driver gives up and reaches for
+ * `sed -i` — show the file's ACTUAL numbered bytes around the region the anchor
+ * was most likely pointing at, and remind it (when the run comprehended the
+ * file) that the whole-file expert analysis is already in its context. One
+ * correct re-issue beats a shell escape.
+ */
+function editAnchorDiagnostic(input: { file: string; oldStr: string; text: string; ctx: ToolContext }): string {
+  const { file, oldStr, text, ctx } = input;
+  const lines = text.split("\n");
+  const numbered = (from: number, to: number) =>
+    lines
+      .slice(Math.max(0, from), Math.min(lines.length, to))
+      .map((l, i) => `${from + i + 1}\t${l}`)
+      .join("\n");
+  const token = anchorSearchToken(oldStr.split("\n")[0]);
+  const hit =
+    token && token.length >= 3 ? lines.findIndex((l) => l.toLowerCase().includes(token.toLowerCase())) : -1;
+  const region = hit >= 0 ? numbered(hit - 1, hit + 2) : numbered(0, 12);
+  const priorRead = recallComprehensionFor(ctx, file);
+  const parts = [
+    `The 'oldString' you supplied does not match any text in ${file} — nothing was changed. ` +
+      `Re-issue 'edit' with an EXACT copy of the bytes you want to replace (whitespace and indentation count; ` +
+      `a single, unique fragment of one line is enough).`,
+  ];
+  if (priorRead?.analysis) {
+    parts.push(
+      `(The whole-file expert analysis of this file from an earlier read is still in this conversation — ` +
+        `if it names the region you meant, copy the bytes it shows verbatim.)`,
+    );
+  }
+  parts.push(`Current contents ${hit >= 0 ? "around the likely region" : "at the start of the file"}:\n${region}`);
+  return parts.join("\n\n");
 }
 
 /**
@@ -2387,13 +2885,47 @@ async function executeEdit(
     };
   }
   const file = resolveInCwd(ctx.cwd, String(args.path));
-  const oldStr = String(args.oldString);
+  let oldStr = String(args.oldString);
   const draftNewStr = String(args.newString ?? "");
   ctx.log({ timestamp: Date.now(), level: "info", tags: ["tool:edit", "mutation"], message: file });
   try {
     const text = await fs.readFile(file, "utf8");
-    const count = text.split(oldStr).length - 1;
-    if (count === 0) return { output: `oldString not found in ${file}`, isError: true };
+    let anchorLenient = false;
+    let count = text.split(oldStr).length - 1;
+    // The weak driver's most common miss is indentation. Two shapes, both
+    // resolved against a whitespace-normalized view (byte-exact, unique-only;
+    // an imprecise anchor must never edit the wrong region):
+    //   (a) the anchor does not match at all → resolve leniently; or
+    //   (b) the anchor matches EXACTLY but only as a substring beginning right
+    //       after a line's indentation whose first line IS that whole line — the
+    //       driver just forgot the leading indent. Used as-is, the exact match
+    //       stacks the replacement's own indentation on top of the leftover
+    //       indent; the line-anchored lenient span is the real target.
+    if (count === 0) {
+      const lenient = resolveAnchorLenient(text, oldStr);
+      if (lenient) {
+        oldStr = lenient.span;
+        count = 1;
+        anchorLenient = true;
+      }
+    } else if (count === 1 && !args.replaceAll && forgotLineIndent(text, oldStr)) {
+      const lenient = resolveAnchorLenient(text, oldStr);
+      if (lenient && lenient.span !== oldStr) {
+        oldStr = lenient.span;
+        anchorLenient = true;
+      }
+    }
+    if (count === 0) {
+      // A resolving diagnostic instead of a bare "not found": the weak driver
+      // falls to `sed -i` exactly here, so it needs the file's ACTUAL bytes and,
+      // when the run comprehended the file, the reminder that the analysis is
+      // already in its context. One correct re-issue beats a shell escape.
+      return {
+        output: `edit: 'oldString' not found in ${file} — nothing was changed.\n\n${editAnchorDiagnostic({ file, oldStr, text, ctx })}`,
+        isError: true,
+        details: { path: file, anchorMiss: true },
+      };
+    }
     if (count > 1 && !args.replaceAll)
       return {
         output: `oldString appears ${count} times in ${file}; pass replaceAll or make it unique.`,
@@ -2469,7 +3001,7 @@ async function executeEdit(
         });
         // See the write path: the read's own analysis and rating, not the
         // orchestrator's self-assessment.
-        const priorRead = recallComprehension(file);
+        const priorRead = recallComprehensionFor(ctx, file);
         const authored = await authorEditReplacement({
           llm: ctx.llm,
           model: editAuthor.model,
@@ -2478,11 +3010,18 @@ async function executeEdit(
           ...(priorRead
             ? {
                 rating: priorRead.rating,
-                comprehension: {
-                  analysis: priorRead.analysis,
-                  model: priorRead.model,
-                  ...(priorRead.why ? { why: priorRead.why } : {}),
-                },
+                // A rating-only entry (a `low` verdict) has no analysis — do not
+                // hand the author an empty comprehension that reads as "the strong
+                // model looked and found nothing".
+                ...(priorRead.analysis && priorRead.model
+                  ? {
+                      comprehension: {
+                        analysis: priorRead.analysis,
+                        model: priorRead.model,
+                        ...(priorRead.why ? { why: priorRead.why } : {}),
+                      },
+                    }
+                  : {}),
               }
             : {}),
           // See the write path: declared category wins, else infer from the path.
@@ -2561,9 +3100,9 @@ async function executeEdit(
       // run — and four multi-KB analyses appended into the conversation, each one
       // near-identical to the last. Re-anchor to the new bytes instead.
       if (literalEdit) {
-        reanchorComprehension(file, hashContent(updated));
+        reanchorComprehensionFor(ctx, file, hashContent(updated));
       } else {
-        forgetComprehension(file);
+        forgetComprehensionFor(ctx, file);
       }
       // Anchor-scope signal. A splice whose replacement is shorter than the region
       // it replaced deletes the difference — legitimate when the edit is a removal,
@@ -2597,6 +3136,11 @@ async function executeEdit(
           (literalEdit
             ? ` — literal-only change (text/number content, identical structure), written VERBATIM as you specified it; no authoring pass.`
             : "") +
+          // A whitespace-tolerant anchor resolution landed. Say so: the driver
+          // should use the file's EXACT bytes next time, but the edit is done.
+          (anchorLenient
+            ? ` — NOTE: 'oldString' matched after whitespace/indentation normalization (the file's own bytes were used). Copy the exact text from the file when re-issuing.`
+            : "") +
           (shrank
             ? ` — NOTE: the replacement is ${anchorLines - replacementLines} line(s) shorter than the anchor it replaced, so that many lines were removed. Read the file to confirm nothing needed was dropped.`
             : "") +
@@ -2608,6 +3152,7 @@ async function executeEdit(
           path: file,
           ...buildUnifiedDiff(file, text, updated),
           ...(literalEdit ? { verbatim: "literal-only" as const } : {}),
+          ...(anchorLenient ? { anchorLenient: true } : {}),
           ...(authoredBy ? { authoredBy, draftNewString: draftNewStr } : {}),
           ...(images.length ? { imagesUsed: images.map((i) => i.path), imageRouting: imageScope.reason } : {}),
           ...(imageScope.reason === "ambiguous" ? { imageCandidates: imageScope.candidates } : {}),
@@ -2648,6 +3193,23 @@ export function createEditTool(authorOnly = false): AgentTool {
       : "Replace an exact string in a file with a new string. `oldString` must appear exactly once unless `replaceAll` is set.",
     mutates: true,
     categorizers: ["write_edit"],
+    // Anchor-and-replacement under the names other agents use for them.
+    // `replace` is deliberately absent: `replace: true` plausibly means
+    // `replaceAll` and `replace: "text"` means `newString`, and a rename that
+    // depends on the VALUE's type is a guess, not a synonym.
+    argAliases: {
+      old: "oldString",
+      oldText: "oldString",
+      find: "oldString",
+      target: "oldString",
+      searchString: "oldString",
+      new: "newString",
+      newText: "newString",
+      replacement: "newString",
+      replaceWith: "newString",
+      filePath: "path",
+      file: "path",
+    },
     parameters: editParameters(authorOnly),
     async execute(_id, args, ctx) {
       return executeEdit(args, ctx, authorOnly);
@@ -2711,6 +3273,21 @@ export const grepTool: AgentTool = {
     "uses ripgrep when available, else `grep -rE`). Skips dependency, build and generated-index directories.",
   mutates: false,
   categorizers: ["read"],
+  // Exact synonyms only: each of these names, sent to a search tool, can mean
+  // one thing. `include`/`filePattern` are what other agents' grep calls the
+  // glob; `query`/`regex`/`search` are what a model calls the pattern when it is
+  // thinking of a search box rather than this schema.
+  argAliases: {
+    query: "pattern",
+    regex: "pattern",
+    search: "pattern",
+    searchPattern: "pattern",
+    dir: "path",
+    directory: "path",
+    include: "glob",
+    filePattern: "glob",
+    fileGlob: "glob",
+  },
   parameters: {
     type: "object",
     properties: {

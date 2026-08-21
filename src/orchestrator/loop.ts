@@ -40,6 +40,7 @@ import type {
   Message,
   Model,
   ReadFileContent,
+  ResolvedClarification,
   Tool,
   ToolResultMessage,
   Usage,
@@ -56,11 +57,17 @@ import type { Registry } from "../registry/registry.js";
 import { isMalformedToolArgs, MALFORMED_TOOL_ARGS_KEY } from "../llm/bridge.js";
 import { PermissionGate } from "./permission.js";
 import { StallGuard, STEP_BUDGET_EXHAUSTED } from "./stall-guard.js";
-import { ClarifyGate } from "./clarify-gate.js";
+import { ClarifyGate, normalizeQuestion } from "./clarify-gate.js";
 import { ToolFallbackAdvisor, type FallbackAdvice } from "./tool-fallback.js";
 import { SearchLadderAdvisor, type SearchAdvice } from "./search-ladder.js";
 import { nameBeforeFraming, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage } from "./tool-suggest.js";
-import { coerceStringArgs, coercionNote, type CoercedArg } from "./tool-arg-coercion.js";
+import {
+  coerceStringArgs,
+  coercionNote,
+  renameNote,
+  resolveArgAliases,
+  type CoercedArg,
+} from "./tool-arg-coercion.js";
 import { estimateComplexity, selectModel } from "../llm/model-selector.js";
 import { compactHistory, historySize, pruneHistoricalMedia, resolveCompactionThreshold } from "./compaction.js";
 import { designReferenceFromBrief } from "../tools/builtin/design-skill.js";
@@ -193,6 +200,12 @@ export interface ToolLoopInput {
    * callers are unaffected.
    */
   clarifyGate?: ClarifyGate;
+  /**
+   * Questions the user already answered in EARLIER hops. Seeds the authoring
+   * channel, re-enters answer attachments into the live image set, and arms the
+   * clarify gate against asking any of them again.
+   */
+  clarifications?: ResolvedClarification[];
   /** Optional plan JSON handed to the authoring context. */
   planJson?: unknown[];
   /** Optional surrounding-file snippets handed to the authoring context. */
@@ -216,6 +229,16 @@ export interface ToolLoopInput {
    * not re-pay (or re-escalate) reads the read categorizer already made.
    */
   sharedReadCache?: Map<string, string>;
+  /**
+   * The run-scoped comprehension store (the chain creates one per run and threads
+   * it through every hop). The staged `read` consults it before rating or
+   * comprehending, so a file the read hop already handed to a stronger model is
+   * reused — re-injected into each new hop's driver context at zero model cost,
+   * pointed-to (never re-emitted) within the same loop — instead of being
+   * re-rated and re-comprehended on every hop. Absent ⇒ tools fall back to the
+   * module-level default store (direct tool use).
+   */
+  sharedComprehension?: import("../tools/builtin/comprehension.js").ComprehensionStore;
   /**
    * The detected project category, threaded live so the post-Prepare correction
    * is seen here. Drives the non-UI skip: when `"backend"`, the
@@ -277,6 +300,17 @@ export interface ToolLoopResult {
   /** A pending clarifying question that paused the loop, if any. */
   pendingUserQuestion?: AskUserQuestionRequest;
   /**
+   * Questions the user has ANSWERED — the ones seeded into this loop plus any it
+   * resolved itself. The chain threads these into every later hop so no
+   * categorizer asks for something the user already supplied.
+   */
+  resolvedClarifications?: ResolvedClarification[];
+  /**
+   * The run's live attachment set as it stands at the end of this loop: what came
+   * in, plus any image the user handed over via `ask_user_question`.
+   */
+  liveImages?: LiveImage[];
+  /**
    * A plan produced by the `create_plan` tool during this loop. Surfaced here so
    * the orchestrator can execute a TOOL-authored plan the same way it executes
    * one scraped from the planning turn's text.
@@ -323,6 +357,23 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // Enforces the file-search order — memory index first, shell search only after
   // memory has actually been tried and come back empty.
   const searchLadder = new SearchLadderAdvisor();
+  // Files this loop has already told the driver it holds the whole-file expert
+  // analysis for. The re-visit advisor fires once per file per loop, then stays
+  // quiet — repeating the same note every turn is itself the no-progress pattern
+  // the stall guard exists to stop.
+  const readRevisitWarned = new Set<string>();
+  // Files whose whole-file analysis has been emitted into THIS loop's context
+  // (as of the end of the previous turn). Snapshot per turn into
+  // `preTurnEmitted` so the re-visit advisor never nags the turn that FIRST
+  // emitted an analysis.
+  const emittedInThisLoop = new Set<string>();
+  // Distinct files read this loop, and whether the "you have read enough —
+  // deliver or edit now" nudge has already fired. The comprehension store makes
+  // re-reads free, so the thing that still costs is opening NEW files: a driver
+  // that keeps opening more without delivering is gathering past the point of
+  // diminishing returns, and nothing but this nudge tells it so.
+  const loopReadFiles = new Set<string>();
+  let readCompletionWarned = false;
   // When only this many steps remain, inject a system note telling the model to
   // stop calling tools and produce its summary. Graceful wind-down beats a hard
   // cut that leaves the run looking "complete" but unfinished.
@@ -369,6 +420,21 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // folded, so the next write/edit authors toward the clarified instruction
   // rather than the run-level goal. Append-only: a run may ask more than once.
   let clarification: string | undefined;
+  /**
+   * Every question the user has answered, this hop and every hop before it.
+   *
+   * Seeded from `input.clarifications` so a later hop starts already knowing
+   * what the user said, and returned so the chain can hand it to the hop after
+   * this one. Without the seed the answer lived only in the asking hop and the
+   * next categorizer asked again.
+   */
+  const resolvedClarifications: ResolvedClarification[] = [...(input.clarifications ?? [])];
+  const CLARIFIED_QUESTIONS = new Set(resolvedClarifications.map((entry) => normalizeQuestion(entry.question)));
+  // Prior hops' answers reach the authoring model too, not just the driver.
+  for (const entry of resolvedClarifications) {
+    const rendered = renderClarification(entry);
+    clarification = clarification ? `${clarification}\n${rendered}` : rendered;
+  }
   // The run's LIVE attachment set. Seeded from what the host supplied, and grown
   // when the user hands a file over mid-run via `ask_user_question`.
   //
@@ -380,6 +446,16 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // round trip that costs the user an interruption and buys nothing.
   const liveImages: LiveImage[] = [...(input.images ?? [])];
   const LIVE_IMAGE_PATHS = new Set(liveImages.map((i) => i.path));
+  // A file the user attached to an answer in an EARLIER hop is an attachment of
+  // this run, not of that hop. Re-enter it here so a write/edit two hops later
+  // still authors from the mockup the user handed over.
+  for (const entry of input.clarifications ?? []) {
+    for (const file of entry.attachments ?? []) {
+      if (!file.mimeType.startsWith("image/") || LIVE_IMAGE_PATHS.has(file.path)) continue;
+      LIVE_IMAGE_PATHS.add(file.path);
+      liveImages.push({ path: file.path, mimeType: file.mimeType });
+    }
+  }
   const refs: MediaRef[] = [];
   const discoveredPaths: string[] = [];
   const readPaths: string[] = [];
@@ -454,14 +530,31 @@ function guessImageMime(p: string): string {
       tags: ["loop", "tools"],
       level: memoryTools.length === 0 ? "warn" : "info",
       message:
-        `loop starting with ${names.length} tools` +
+        `${input.phase ? `[${input.phase}] ` : ""}loop starting with ${names.length} tools` +
         (memoryTools.length === 0
           ? "; NO memory tools registered — the search ladder will fall through to the shell " +
             "(project_memory/file_memory/graph_memory are registered only by createProjectSession)"
           : `; memory: ${memoryTools.join(", ")}`),
-      data: { tools: names, memoryTools },
+      data: {
+        tools: names,
+        memoryTools,
+        // Without this the log cannot be attributed: a 61-tool list is correct
+        // for activity_inspect and alarming for read, and the entry looked
+        // identical either way.
+        ...(input.phase ? { categorizer: input.phase } : {}),
+        ...(input.label ? { label: input.label } : {}),
+      },
     });
   }
+
+  /**
+   * Argument names each tool has already been corrected on, this loop.
+   *
+   * The reminder that stops a repeat has to differ from the one that did not: a
+   * second identical note reads as the same generic warning. On a repeat the note
+   * restates the tool's whole signature and says it has happened before.
+   */
+  const ARG_NAME_MISTAKES = new Map<string, Set<string>>();
 
   // Per-tool streak of consecutive calls rejected for missing/empty required
   // arguments. A model that emits empty tool calls (e.g. `bash {}`) burns turns
@@ -479,6 +572,11 @@ function guessImageMime(p: string): string {
   try {
     for (let step = 0; step < maxSteps; step++) {
       if (signal?.aborted) throw new DOMExceptionLike("aborted");
+      // Files whose whole-file analysis was already in THIS loop's context before
+      // the upcoming turn. The comprehension re-visit advisor fires only on reads
+      // of files in this set — a file's FIRST read in the loop (which emits the
+      // analysis during its own turn) is not a re-visit, and must not be nagged.
+      const preTurnEmitted = new Set(emittedInThisLoop);
 
       // Prune old inlined media BEFORE sizing/compacting. Captures (screenshots,
       // audio, video, file bytes) arrive as base64 blocks that otherwise
@@ -621,6 +719,34 @@ function guessImageMime(p: string): string {
         // wanted written. Rejecting it burns a turn; `String(["a","b"])` (what
         // `edit` used to do) writes "a,b" into the user's file. Join it and say
         // so. Anything ambiguous is left for the validation below to reject.
+        // Rename before anything validates: an alias resolved here is a call
+        // that RUNS, where the same call yesterday was refused and cost a turn.
+        let renamedArgs: Array<{ from: string; to: string }> = [];
+        let renameRepeated = false;
+        if (tool) {
+          const aliased = resolveArgAliases(tool, call.arguments);
+          if (aliased.renamed.length) {
+            call.arguments = aliased.args;
+            renamedArgs = aliased.renamed;
+            const seen = ARG_NAME_MISTAKES.get(call.name) ?? new Set<string>();
+            renameRepeated = aliased.renamed.some((r) => seen.has(r.from));
+            for (const r of aliased.renamed) seen.add(r.from);
+            ARG_NAME_MISTAKES.set(call.name, seen);
+            logStore.append({
+              tags: ["loop", "tools", "tools:arg-renamed"],
+              level: renameRepeated ? "warn" : "info",
+              message:
+                `${call.name}: ${aliased.renamed.map((r) => `${r.from}→${r.to}`).join(", ")}` +
+                (renameRepeated ? " (repeat — signature restated)" : ""),
+              data: {
+                tool: call.name,
+                renamed: aliased.renamed,
+                repeat: renameRepeated,
+                ...(input.label ? { label: input.label } : {}),
+              },
+            });
+          }
+        }
         let coercedArgs: CoercedArg[] = [];
         if (tool) {
           const fixed = coerceStringArgs(tool, call.arguments);
@@ -630,7 +756,9 @@ function guessImageMime(p: string): string {
             logStore.append({
               tags: ["loop", "tools", "tools:arg-coerced"],
               level: "warn",
-              message: `${call.name}: ${fixed.coerced.map((c) => `${c.key} arrived as ${c.from}`).join("; ")}; joined into a string`,
+              message: `${call.name}: ${fixed.coerced
+                .map((c) => `${c.key} arrived as ${c.from} → ${c.to ?? "string"}`)
+                .join("; ")}`,
               data: { tool: call.name, ...(input.label ? { label: input.label } : {}) },
             });
           }
@@ -1139,6 +1267,16 @@ function guessImageMime(p: string): string {
               }
             : undefined;
 
+        // The driver's OWN reasoning from this turn, so a tool that escalates to a
+        // second model (the staged read's analyst) is told what the driver already
+        // covered and can keep its output disjoint from it. Bounded by the tool
+        // when it is passed on; here it is only gathered.
+        const currentReasoning = assistant.content
+          .filter((c): c is { type: "thinking"; thinking: string } => c.type === "thinking")
+          .map((c) => c.thinking)
+          .join("\n")
+          .trim();
+
         const toolCtx = {
           cwd,
           signal,
@@ -1149,6 +1287,7 @@ function guessImageMime(p: string): string {
           // cannot.
           ...(taskWithClarification ? { task: taskWithClarification } : {}),
           ...(input.phase ? { phase: input.phase } : {}),
+          ...(input.label ? { loopLabel: input.label } : {}),
           model: decision.model ? llm.resolveModel(decision.model) : callModel ?? input.model,
           ...(authorModel ? { authorModel } : {}),
           ...(authoringContext ? { authoringContext } : {}),
@@ -1160,6 +1299,13 @@ function guessImageMime(p: string): string {
           ...(input.toolModelCandidates?.length ? { toolModelCandidates: input.toolModelCandidates } : {}),
           ...(input.routeModel ? { routeModel: input.routeModel } : {}),
           ...(inheritedRating ? { knownComplexity: inheritedRating } : {}),
+          // The run-scoped comprehension store: "analyse once per file, inject
+          // into the tool chain". The staged read consults it before rating or
+          // comprehending, so a file the read hop already analysed is reused by
+          // every later hop — re-injected into each new driver context at zero
+          // model cost, pointed-to (never re-emitted) within the same loop.
+          ...(input.sharedComprehension ? { comprehensionStore: input.sharedComprehension } : {}),
+          ...(currentReasoning ? { currentReasoning } : {}),
           // The self-report travels separately from `knownComplexity` (which means
           // MEASURED, and gates whether a staged read spends a rater call). The
           // authoring escalation inside write/edit needs the effective rating for
@@ -1220,6 +1366,18 @@ function guessImageMime(p: string): string {
           if (coercedArgs.length) {
             resultMsg.content = boundResultContent(
               [{ type: "text", text: coercionNote(coercedArgs, call.name) }, ...(resultMsg.content ?? [])],
+              call.name,
+            );
+          }
+          if (renamedArgs.length && tool) {
+            resultMsg.content = boundResultContent(
+              [
+                {
+                  type: "text",
+                  text: renameNote(call.name, renamedArgs, renameRepeated, tool.parameters),
+                },
+                ...(resultMsg.content ?? []),
+              ],
               call.name,
             );
           }
@@ -1378,6 +1536,14 @@ function guessImageMime(p: string): string {
         const resolvedClarification = clarificationFromToolResult(resultMsg.details, resultMsg.content);
         if (resolvedClarification) {
           clarification = clarification ? `${clarification}\n${resolvedClarification}` : resolvedClarification;
+        }
+        // The structured twin: what leaves this hop, and what the gate checks a
+        // later question against.
+        const resolvedRecord = resolvedClarificationFromToolResult(resultMsg.details, resultMsg.content);
+        if (resolvedRecord && !CLARIFIED_QUESTIONS.has(normalizeQuestion(resolvedRecord.question))) {
+          CLARIFIED_QUESTIONS.add(normalizeQuestion(resolvedRecord.question));
+          resolvedClarifications.push(resolvedRecord);
+          clarifyGate.recordAnswer(resolvedRecord);
         }
 
         // Files the USER just handed over in answer to `ask_user_question`.
@@ -1591,6 +1757,110 @@ function guessImageMime(p: string): string {
         });
       }
 
+      // Comprehension-aware read advisors. Two problems, both the "read tool
+      // bottleneck" the field runs showed:
+      //
+      //  1. RE-VISIT — a driver that re-reads a file it ALREADY holds the
+      //     whole-file expert analysis for is re-reading to UNDERSTAND, not to get
+      //     bytes (one observed run read a single file at five different offsets).
+      //     The read tool's own reuse note covers the per-call case; this covers
+      //     the turn-level case with one explicit note per file per loop. Fires on
+      //     FULL re-reads too — a full re-read of a comprehended file returns the
+      //     same bytes and the same analysis, so it is equally redundant.
+      //
+      //  2. READ-COMPLETION — opening NEW files is what still costs (each new file
+      //     pays its own rater + comprehension). Once the loop has read a
+      //     threshold of distinct files with no deliver/write, the driver is told
+      //     to wrap up: deliver what it has (read/investigation) or make the
+      //     change (write_edit). A nudge, not a stop — it can still read one
+      //     specific file it names.
+      if (input.sharedComprehension) {
+        const store = input.sharedComprehension;
+        // Fold THIS turn's emissions into `emittedInThisLoop` — the NEXT turn's
+        // snapshot — and track every distinct file read this loop for the
+        // read-completion nudge.
+        for (const call of turnCalls) {
+          if (call.name !== "read") continue;
+          const rawPath = (call.arguments as { path?: unknown } | undefined)?.path;
+          if (typeof rawPath !== "string" || !rawPath.trim()) continue;
+          const file = normalizeToolPath(cwd, rawPath);
+          loopReadFiles.add(file);
+          const entry = store.recall(file);
+          if (entry?.emittedInLoop === input.label) emittedInThisLoop.add(file);
+        }
+        for (const call of turnCalls) {
+          if (call.name !== "read") continue;
+          const rawPath = (call.arguments as { path?: unknown } | undefined)?.path;
+          if (typeof rawPath !== "string" || !rawPath.trim()) continue;
+          const windowed =
+            (call.arguments as { offset?: unknown } | undefined)?.offset != null ||
+            (call.arguments as { limit?: unknown } | undefined)?.limit != null;
+          const file = normalizeToolPath(cwd, rawPath);
+          if (readRevisitWarned.has(file)) continue;
+          // Not a re-visit unless the analysis was already in context BEFORE this
+          // turn — the turn that first emitted it is the turn that INTRODUCED it.
+          if (!preTurnEmitted.has(file)) continue;
+          const entry = store.recall(file);
+          // Whole-file analyses only: a windowed analysis of a huge file does not
+          // explain the rest of it, so asking for another window there is real work.
+          if (!entry?.analysis || entry.coveredRange !== "full") continue;
+          readRevisitWarned.add(file);
+          const note = windowed
+            ? `NOTE: you already hold the whole-file expert analysis of ${file} (from a stronger model, ` +
+              `given with an earlier read of it in this run). It covers every part of the file — the window ` +
+              `you just read is already explained by it. Do not keep reading windows of this file to ` +
+              `understand it: read a precise range only when you need its exact bytes, then continue ` +
+              `toward the task.`
+            : `NOTE: you already read ${file} in full and hold its whole-file expert analysis (injected ` +
+              `earlier in this run). Re-reading it returns the same bytes and the same analysis. If you ` +
+              `need a specific line range, read that range once; otherwise continue toward the task — ` +
+              `edit, or deliver when you are gathering.`;
+          context.messages.push({
+            role: "user",
+            content: [{ type: "text", text: note }],
+            timestamp: Date.now(),
+          });
+          stallGuard.grantGrace();
+          logStore.append({
+            tags: ["loop", "loop:comprehension-revisit"],
+            level: "info",
+            message: `advised the driver it already holds the whole-file analysis of ${file}`,
+            data: { file, ...(input.label ? { label: input.label } : {}) },
+          });
+        }
+        if (!readCompletionWarned && loopReadFiles.size >= READ_COMPLETION_THRESHOLD) {
+          readCompletionWarned = true;
+          // A QA hop is told to RUN it, never to "make the change": it holds no
+          // write/edit, and on the run this fixes the generic wording landed in
+          // `activity_reproduce` — which then went and authored a fix through a
+          // `python3` heredoc instead of launching the app.
+          const qaHop = input.phase === "activity_reproduce" || input.phase === "activity_inspect";
+          const note = qaHop
+            ? `NOTE: you have read ${loopReadFiles.size} distinct files this step, and reading is not ` +
+              `this categorizer's job — RUN IT. Launch the surface (\`drive\`/\`mobile\`), or the ` +
+              `project's own run/test command, and look at what it does; collect your probes if you ` +
+              `placed any. More files will not tell you what the software does. Then deliver.`
+            : `NOTE: you have read ${loopReadFiles.size} distinct files this step. If the task is ` +
+              `understood, deliver now (when gathering/investigating) or make the change (when editing) — ` +
+              `reading more files is unlikely to change the answer. Name and read ONE specific file only if ` +
+              `you still need a concrete detail from it, then finish.`;
+          context.messages.push({
+            role: "user",
+            content: [{ type: "text", text: note }],
+            timestamp: Date.now(),
+          });
+          stallGuard.grantGrace();
+          logStore.append({
+            tags: ["loop", "loop:read-completion"],
+            level: "info",
+            message:
+              `advised the driver it has read ${loopReadFiles.size} files and should ` +
+              (input.phase === "activity_reproduce" || input.phase === "activity_inspect" ? "RUN it" : "deliver or edit"),
+            data: { files: loopReadFiles.size, ...(input.label ? { label: input.label } : {}) },
+          });
+        }
+      }
+
       // Stall detection: the loop has no step cap, so the only thing standing
       // between it and a model that cannot converge is this. A repeating or
       // wholly-failing turn is nudged first; a persistent one ends the loop with
@@ -1690,6 +1960,10 @@ function guessImageMime(p: string): string {
     readPaths,
     discoveredPaths,
     pendingUserQuestion,
+    ...(resolvedClarifications.length ? { resolvedClarifications } : {}),
+    // Grown by any file the user handed over mid-hop, so the chain can carry the
+    // run's live attachment set forward instead of re-deriving it from triage.
+    ...(liveImages.length ? { liveImages } : {}),
     ...(producedPlanSet ? { planSet: producedPlanSet } : {}),
     error,
     ...(terminatedBy ? { terminatedBy } : {}),
@@ -1703,6 +1977,16 @@ function guessImageMime(p: string): string {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Distinct files a single loop may read before the read-completion advisor tells
+ * the driver to deliver or edit. Comprehension makes re-reads free, so the cost
+ * that remains is opening NEW files (each pays its own rater + comprehension);
+ * past this many, a driver that is still gathering is past the point of
+ * diminishing returns and is nudged to wrap up. A nudge, not a stop — it may
+ * still read one specific file it names.
+ */
+const READ_COMPLETION_THRESHOLD = 6;
 
 const SEARCH_ADVICE_LABEL: Record<SearchAdvice["kind"], string> = {
   "memory-first": "searching the memory index before the shell",
@@ -1783,6 +2067,46 @@ function answerAttachmentsFromToolResult(
  * from the tool result's text, because `details.answerAttachments` carries files
  * only, not the answer text.
  */
+/**
+ * The same resolved Q&A as {@link clarificationFromToolResult}, structured, plus
+ * whatever the user attached to the answer.
+ *
+ * The string form seeds the authoring model inside this hop; this form is what
+ * survives the hop, so it keeps the question and answer as separate fields
+ * rather than one pre-rendered sentence — a later hop needs to compare the
+ * question it is about to ask against the one already answered.
+ */
+/** One resolved Q&A as a line of prompt text. */
+export function renderClarification(entry: ResolvedClarification): string {
+  const files = entry.attachments?.length
+    ? ` files the user attached: ${entry.attachments.map((file) => file.path).join(", ")}`
+    : "";
+  return `Clarification — question: ${entry.question} answer: ${entry.answer}${files}`;
+}
+
+export function resolvedClarificationFromToolResult(
+  details: unknown,
+  content: unknown,
+): ResolvedClarification | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const d = details as { kind?: unknown; answered?: unknown; question?: unknown; reason?: unknown };
+  if (d.kind !== "ask_user_question" || d.answered !== true) return undefined;
+  const question = typeof d.question === "string" ? d.question.trim() : "";
+  if (!question) return undefined;
+  const text = textFromToolResult(content).replace(/\n+/g, " ");
+  const answer = text.match(/User answered:\s*(.+?)\s*(?:\(clarification for:|$)/)?.[1]?.trim();
+  const attachments = answerAttachmentsFromToolResult(details);
+  // An answer that is files ONLY is still an answer — the user handed over the
+  // mockup instead of describing it. Keep it rather than dropping the record.
+  if ((!answer || answer === "(empty)") && attachments.length === 0) return undefined;
+  return {
+    question,
+    answer: !answer || answer === "(empty)" ? "(files only — see attachments)" : answer,
+    ...(typeof d.reason === "string" && d.reason.trim() ? { reason: d.reason.trim() } : {}),
+    ...(attachments.length ? { attachments } : {}),
+  };
+}
+
 export function clarificationFromToolResult(
   details: unknown,
   content: unknown,

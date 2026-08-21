@@ -17,6 +17,14 @@
 
 // ---- Types (pi-compatible surface) ----
 export * from "./types.js";
+export {
+  codeFenceBodies,
+  parseJsonLoose,
+  parseJsonObjectLoose,
+  parseJsonArrayLoose,
+  type JsonExtraction,
+  type JsonWant,
+} from "./robust-json.js";
 export * from "./tool-titles.js";
 
 // ---- Top-level entry ----
@@ -52,13 +60,22 @@ export {
 export {
   runCategorizerChain,
   type CategorizerChainInput,
+  enforceNoShellAuthoring,
+  enforceObserveFirst,
+  isObservationCall,
+  isObservationTool,
+  isRuntimeCommand,
   type CategorizerChainResult,
 } from "./categorizer/chain.js";
 export { routeCategorizer, heuristicRoute, type RouterChoice, type RouteCategorizerInput, type RouteCategorizerResult } from "./categorizer/router.js";
 export {
   createDeliverTool,
+  deliverSchemaFor,
   deriveFallbackDeliverable,
+  takeHandoff,
   DELIVER_TOOL_NAME,
+  HANDOFF_REASON_FIELD,
+  NEXT_CATEGORIZERS_FIELD,
   type DeliverBox,
 } from "./categorizer/deliver.js";
 export { createClearingDoubtTool, CLEARING_DOUBT_TOOL_NAME, DEFAULT_DOUBT_MODEL } from "./categorizer/clearing-doubt.js";
@@ -70,7 +87,15 @@ export {
 } from "./categorizer/mentions.js";
 export { PermissionGate } from "./orchestrator/permission.js";
 export {
+  applyPolicyToRouted,
+  decideFromDriver,
+  type RouteDecision,
+  type RoutePolicyInput,
+  type RouteSource,
+} from "./categorizer/route-policy.js";
+export {
   ClarifyGate,
+  normalizeQuestion,
   type ClarifyDecision,
   type ClarifyGateOptions,
   type ClarifyReport,
@@ -117,7 +142,11 @@ export {
 export { runToolLoop, type ToolLoopInput, type ToolLoopResult } from "./orchestrator/loop.js";
 export { suggestToolName, unknownToolMessage, unknownArgumentKeys, unknownArgumentMessage, levenshtein } from "./orchestrator/tool-suggest.js";
 export {
+  coerceFromJsonString,
   coerceStringArgs,
+  renameNote,
+  resolveArgAliases,
+  recoverSpilledArgs,
   coerceToString,
   coercionNote,
   type CoercedArg,
@@ -236,7 +265,7 @@ export type {
   InspectDeliverable,
   SummaryDeliverable,
 } from "./categorizer/types.js";
-export { categorizeTool, categorizeProvider } from "./registry/categorize.js";
+export { categorizeTool, categorizeProvider, isInspectSurface } from "./registry/categorize.js";
 export { defineSkill, type SkillDefinition } from "./registry/skill.js";
 
 // ---- LLM (OpenRouter) ----

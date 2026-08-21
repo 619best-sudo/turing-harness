@@ -119,7 +119,15 @@ export function heuristicRoute(input: RouteCategorizerInput): RouterChoice {
     return "summarise";
   }
   if (last?.id === "read") {
-    if (input.isBugFix && has("activity_inspect")) return "activity_inspect";
+    // A reported bug gets SEEN before it gets fixed. `activity_reproduce`, not
+    // `activity_inspect`: there is nothing to verify yet.
+    if (input.isBugFix && has("activity_reproduce")) return "activity_reproduce";
+    if (has("write_edit")) return "write_edit";
+    return "summarise";
+  }
+  // Reproduction hands to the fixer whether or not it managed to reproduce —
+  // a could-not-reproduce report is still the input a fix works from.
+  if (last?.id === "activity_reproduce") {
     if (has("write_edit")) return "write_edit";
     return "summarise";
   }
@@ -155,7 +163,7 @@ export async function routeCategorizer(input: RouteCategorizerInput): Promise<Ro
       `CHOICES:`,
       renderChoices(input.choices, input.lastId),
       ``,
-      `Answer with the single line "CATEGORY: <id or summarise>".`,
+      `Answer with the two lines "CATEGORY: <id or summarise>" and "BUGFIX: <yes|no>".`,
     ]
       .filter((l) => l !== "")
       .join("\n");
@@ -173,6 +181,15 @@ export async function routeCategorizer(input: RouteCategorizerInput): Promise<Ro
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
       .map((c) => c.text)
       .join("\n");
+    // The router reads the request anyway, so its own verdict on "is this a bug
+    // report" is free. OR-ed with the host flag by the chain: detection used to
+    // depend entirely on the host's regex list, so a bug phrased outside that list
+    // lost every bug-specific policy in the run.
+    const bugFixHint = /^\s*BUGFIX\s*:\s*(yes|true)\b/im.test(text)
+      ? true
+      : /^\s*BUGFIX\s*:\s*(no|false)\b/im.test(text)
+        ? false
+        : undefined;
     const parsed = parseReply(text, input.choices);
     if (!parsed) {
       return {
@@ -180,9 +197,16 @@ export async function routeCategorizer(input: RouteCategorizerInput): Promise<Ro
         reason: `unparseable router reply — heuristic fallback`,
         usage,
         fallback: true,
+        ...(bugFixHint != null ? { bugFixHint } : {}),
       };
     }
-    return { selection: parsed, reason: text.trim().slice(0, 300), usage, fallback: false };
+    return {
+      selection: parsed,
+      reason: text.trim().slice(0, 300),
+      usage,
+      fallback: false,
+      ...(bugFixHint != null ? { bugFixHint } : {}),
+    };
   } catch (err) {
     return {
       selection: fallbackSelection,

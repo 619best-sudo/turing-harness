@@ -597,6 +597,31 @@ export interface ToolContext {
    */
   phase?: string;
   /**
+   * The run-scoped comprehension store ("analyse once per file, inject into the
+   * tool chain"). The categorizer chain creates one per run and threads it into
+   * every loop; the staged `read` consults it before rating/comprehending, so a
+   * file the read hop already handed to a stronger model is reused — not
+   * re-rated, not re-comprehended — by every later hop that reads it. Absent ⇒
+   * the tool falls back to the module-level default store (direct tool use).
+   */
+  comprehensionStore?: import("./tools/builtin/comprehension.js").ComprehensionStore;
+  /**
+   * The CURRENT TURN's reasoning the driver produced before issuing this tool
+   * call (its `thinking` blocks, bounded). The staged `read` forwards it to the
+   * comprehension analyst so the stronger model does NOT restate what the driver
+   * already worked out — the analysis must be disjoint from the driver's own
+   * reasoning, or the escalation doubles it instead of compensating for it.
+   */
+  currentReasoning?: string;
+  /**
+   * This loop's label (e.g. `"categorizer:read"`). The comprehension store uses
+   * it to track which loop last had an analysis appended to its context, so the
+   * same analysis is emitted exactly once PER driver context — re-injected (free,
+   * from the store) when a new hop's driver first touches the file, pointed-to
+   * (never re-emitted) within the same loop.
+   */
+  loopLabel?: string;
+  /**
    * The detected project category, threaded live from the orchestrator. Tools
    * that only make sense for UI projects (inspiration/assets) decline with a
    * friendly note when this is `"backend"`, so the model doesn't burn calls on
@@ -628,6 +653,27 @@ export interface AgentTool<
    * spawning processes). Drives the "ask only for mutation calls" permission mode.
    */
   mutates?: boolean;
+  /**
+   * Argument names this tool ACCEPTS as other spellings of a declared one, as
+   * `{ alias: realField }`.
+   *
+   * For the mistakes a schema listing cannot prevent, because they are not typos
+   * — they are a different mental model of the same thing. Across four runs a
+   * driver called `read` with `end`, `endLine`, `end_line` and `start_line`: it
+   * was thinking in a line RANGE while the schema is an offset and a COUNT. Each
+   * call was refused (correctly — an ignored window argument silently returns a
+   * different part of the file), each refusal cost a turn, and the next run made
+   * the same call again, because "read accepts: limit, offset, path" answers
+   * which names exist and not which idea they encode.
+   *
+   * An alias is only for a rename whose meaning is EXACT. Where the conversion is
+   * arithmetic rather than a rename — a range end into a count — the tool
+   * declares the field it wants and converts it (see `read`'s `endLine`).
+   *
+   * Spelling variants (`old_string` → `oldString`) need no entry: the coercion
+   * pass matches those against the schema itself.
+   */
+  argAliases?: Record<string, string>;
   /**
    * Which categorizer(s) this tool belongs to, by id (e.g. ["read",
    * "write_edit"]). Used by the registry's categorizer scoping when a setup does
@@ -1103,6 +1149,35 @@ export interface AskUserQuestionAnswer {
  * offer a file picker never has to pretend it can.
  */
 export type AskUserQuestionResult = string | AskUserQuestionAnswer;
+
+/**
+ * A question the user has ANSWERED — run-level truth, not hop-level context.
+ *
+ * This exists because the answer used to die with the hop that asked. Read asked
+ * "what should the new title be?", the user said "Test", read delivered, and then
+ * write_edit — a fresh context whose opening restates the original unspecified
+ * task — asked the same question again. The answer had reached it only as prose
+ * inside a deliverable, which loses to the verbatim `TASK:` line and to the
+ * guidance telling the model to ask when a value is unnamed.
+ *
+ * So a resolved clarification travels OUTSIDE the `accepts` contract that governs
+ * deliverables and tool records. A hop may legitimately be denied another hop's
+ * findings; it is never right to deny it something the user has already said.
+ */
+export interface ResolvedClarification {
+  question: string;
+  answer: string;
+  /** Why the asking hop said it was blocked — kept so the block reads as a Q&A. */
+  reason?: string;
+  /**
+   * Files the user attached WITH the answer. Images from here re-enter the run's
+   * live attachment set so a later hop authors from the pixels; other files are
+   * named so it knows to `read` them. Carried per-clarification rather than as a
+   * loose list, because "the mockup that came with THIS answer" is the fact that
+   * makes it usable.
+   */
+  attachments?: Array<{ path: string; mimeType: string }>;
+}
 
 export interface AskUserQuestionRequest {
   /** Categorizer id the question came from (formerly the 4P phase). */

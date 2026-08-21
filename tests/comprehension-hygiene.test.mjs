@@ -272,7 +272,7 @@ test("re-reading an analysed file gets a pointer, not the analysis again", async
 
   const second = await readTool.execute("c2", { path: file, offset: 3, limit: 5 }, ctx);
   assert.ok(!second.output.includes("Line 12 holds the invariant"), "not repeated verbatim");
-  assert.match(second.output, /already given with an earlier read/, "a pointer instead");
+  assert.match(second.output, /covers EVERY part of the file/, "a reuse note instead of repeating the analysis");
   assert.ok(second.output.length < first.output.length, "and it is shorter");
   await fs.rm(dir, { recursive: true, force: true });
 });

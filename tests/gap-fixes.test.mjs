@@ -78,8 +78,9 @@ function ctxFor(llm, dir, extra = {}) {
 test("G1: DEFAULT_ROUTER_PROMPT asks for a single CATEGORY reply", () => {
   // The contract routeCategorizer's parser depends on.
   assert.match(DEFAULT_ROUTER_PROMPT, /CATEGORY:\s*<categorizer id from the choices, or summarise>/);
-  // Bug reports route read-first, inspection before mutation.
-  assert.match(DEFAULT_ROUTER_PROMPT, /A bug report usually needs read/);
+  // Bug reports route read-first, and REPRODUCTION before mutation.
+  assert.match(DEFAULT_ROUTER_PROMPT, /A bug report needs read, then activity_reproduce/);
+  assert.match(DEFAULT_ROUTER_PROMPT, /activity_inspect VERIFIES/);
   assert.match(DEFAULT_ROUTER_PROMPT, /Never repeat the categorizer that just ran/);
 });
 

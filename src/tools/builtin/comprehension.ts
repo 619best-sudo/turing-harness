@@ -59,6 +59,19 @@ function comprehendSystem(category: ComplexityCategory | undefined): string {
     "the invariants that must hold, the non-obvious control flow and coupling, the parts that look",
     "safe to change but are not, and the specific traps for the stated task.",
     "",
+    // The driver's own reasoning is part of the analyst's input (ComprehendFileInput.
+    // driverReasoning). Without being told what it already covered, the analyst
+    // re-derives the same points the driver just thought through — two models, two
+    // passes over the obvious, and the driver still misses the gaps. The contract
+    // below is what makes the escalation COMPENSATE the driver instead of doubling it.
+    "THE WEAKER MODEL IS ALSO REASONING ABOUT THIS FILE AS IT READS. Under 'DRIVER'S REASONING'",
+    "below is what it has already worked out about THIS task. Do NOT restate any of it, do NOT",
+    "improve its phrasing, do NOT re-derive the points it already made. Your output must be",
+    "DISJOINT from its reasoning: the things it got wrong, missed, or cannot see from this file",
+    "alone. If the driver's reasoning already covers everything this file contributes to the",
+    "task, say so in one line ('nothing beyond the driver's reasoning') and stop — an accurate",
+    "one-line close is a better result than a confident review it already has.",
+    "",
     // Mirrors `systemFor` on the authoring side: interface work gets the interface
     // risks, not the logic enumeration.
     category === "ui" || category === "svg" ? UI_RISK_FOR_COMPREHENSION : CODE_RISK_FOR_COMPREHENSION,
@@ -156,10 +169,15 @@ const COMPREHEND_EFFORT: Record<ComplexityRating, "low" | "medium" | "high"> = {
 export interface RememberedComprehension {
   /** Stage 1's independent judgement of the file — NOT the orchestrator's claim. */
   rating: ComplexityRating;
-  /** B's analysis, verbatim. */
-  analysis: string;
+  /**
+   * B's analysis, verbatim. Absent on a RATING-ONLY entry — a `low` verdict is
+   * remembered (so the file is never re-rated) without paying for an analysis
+   * there is nothing to escalate for. Every consumer must treat a missing
+   * analysis as "no comprehension", never as an empty one.
+   */
+  analysis?: string;
   /** Which model produced it, for the log and the authoring prompt's provenance. */
-  model: string;
+  model?: string;
   /** The rater's one-line justification, when there was one. */
   why?: string;
   /**
@@ -186,7 +204,16 @@ export interface RememberedComprehension {
    */
   coveredRange?: string;
   /**
-   * Whether this analysis has ALREADY been appended to a read result in this run.
+   * Every range this run has already comprehended for the path, for files too
+   * large to send whole (`coveredRange` stays the LATEST one). A windowed read
+   * of a huge file that misses the latest range but matches an earlier one is
+   * still reusable — and a hard per-file comprehension cap (see
+   * {@link ComprehensionStore}) means this array is never allowed to grow past
+   * the cap's length, so no third comprehension for one file.
+   */
+  coveredRanges?: string[];
+  /**
+   * Whether this analysis has ALREADY been appended to a read result.
    *
    * A run re-reads the same file constantly — check a detail, grep, come back —
    * and every one of those repeats re-appended the whole analysis. Observed: one
@@ -195,15 +222,28 @@ export interface RememberedComprehension {
    * something the model had already been told once. (It was also wrong, which is
    * how it got noticed, but it would have been waste either way.)
    *
-   * Once emitted, later reads get a one-line pointer instead of the full text.
+   * Emission is tracked PER LOOP (`emittedInLoop`), not just once per run: the
+   * analysis must be appended to EVERY driver context that touches the file —
+   * the read hop's driver sees it on its first read, and the write_edit hop's
+   * driver, whose context never contained the read hop's transcript, sees it
+   * again on ITS first read (free, from the store). Within one loop, later reads
+   * get a reuse note instead of the full text.
    */
   emitted?: boolean;
+  /** The loop (`ToolLoopInput.label`) that last had this analysis appended. */
+  emittedInLoop?: string;
 }
 
 /** Whether an analysis covering `covered` can answer a read of `wanted`. */
 export function coversRange(covered: string | undefined, wanted: string): boolean {
   if (!covered) return false;
   return covered === "full" || covered === wanted;
+}
+
+/** Whether any range an analysis covers can answer a read of `wanted`. */
+export function coversAnyRange(entry: Pick<RememberedComprehension, "coveredRange" | "coveredRanges">, wanted: string): boolean {
+  if (coversRange(entry.coveredRange, wanted)) return true;
+  return (entry.coveredRanges ?? []).some((r) => r === wanted || r === "full");
 }
 
 /** Stable digest of the file text an analysis was produced from. */
@@ -228,19 +268,93 @@ export function hashContent(content: string): string {
  * Superseded on re-read, so a file that changed under us gets the fresh analysis
  * rather than a stale one.
  */
-const comprehensionByPath = new Map<string, RememberedComprehension>();
+/**
+ * The run-scoped comprehension store.
+ *
+ * This is the "the strong model reasons once, and the reasoning becomes tool-chain
+ * state" part of the architecture. The chain creates ONE store per run and threads
+ * it into every categorizer loop (`ToolContext.comprehensionStore`), so:
+ *
+ *   - the read hop's comprehension of a file is visible to the write_edit hop —
+ *     its first read of the same file re-injects the analysis from the store with
+ *     zero additional model calls;
+ *   - the "analyse once" guarantee is per RUN, not per process: one rater + one
+ *     comprehension per file per run (within the size cap), no matter how many
+ *     windows/hops touch it afterwards;
+ *   - the per-file comprehension cap below guarantees a huge file is never
+ *     comprehended a third time.
+ *
+ * A default instance backs the module-level `remember/recall/forget/reanchor`
+ * functions so direct tool use and existing tests keep working unthreaded.
+ */
+export class ComprehensionStore {
+  private readonly byPath = new Map<string, RememberedComprehension>();
+  /** How many times each path has been comprehended this run (huge-file cap). */
+  private readonly comprehendCount = new Map<string, number>();
+
+  constructor(private readonly maxComprehensionsPerFile = 2) {}
+
+  recall(path: string): RememberedComprehension | undefined {
+    return this.byPath.get(path);
+  }
+
+  put(path: string, value: RememberedComprehension): void {
+    this.byPath.set(path, value);
+  }
+
+  /** Drop a path's analysis once the file has been rewritten — it describes the old bytes. */
+  forget(path: string): void {
+    this.byPath.delete(path);
+  }
+
+  /**
+   * Keep a path's analysis but re-anchor it to the file's NEW bytes — sound only
+   * for a literal-only edit (see the module-level `reanchorComprehension`).
+   */
+  reanchor(path: string, fileHash: string): void {
+    const existing = this.byPath.get(path);
+    if (!existing) return;
+    this.byPath.set(path, { ...existing, fileHash });
+  }
+
+  /** Whether this path still has comprehension budget left (huge-file cap). */
+  canComprehend(path: string): boolean {
+    return (this.comprehendCount.get(path) ?? 0) < this.maxComprehensionsPerFile;
+  }
+
+  /** Record that one more comprehension ran for a path. */
+  noteComprehended(path: string): void {
+    this.comprehendCount.set(path, (this.comprehendCount.get(path) ?? 0) + 1);
+  }
+
+  clear(): void {
+    this.byPath.clear();
+    this.comprehendCount.clear();
+  }
+
+  get size(): number {
+    return this.byPath.size;
+  }
+
+  /** Every stored entry (paths that got at least a rating this run). */
+  entries(): Array<{ path: string; value: RememberedComprehension }> {
+    return [...this.byPath.entries()].map(([path, value]) => ({ path, value }));
+  }
+}
+
+const defaultStore = new ComprehensionStore();
 
 export function rememberComprehension(path: string, value: RememberedComprehension): void {
-  comprehensionByPath.set(path, value);
+  defaultStore.put(path, value);
 }
 
 export function recallComprehension(path: string): RememberedComprehension | undefined {
-  return comprehensionByPath.get(path);
+  return defaultStore.recall(path);
 }
 
 /** Drop a path's analysis once the file has been rewritten — it describes the old bytes. */
 export function forgetComprehension(path: string): void {
-  comprehensionByPath.delete(path);
+  defaultStore.forget(path);
 }
 
 /**
@@ -259,14 +373,27 @@ export function forgetComprehension(path: string): void {
  * code that has moved is worse than having none.
  */
 export function reanchorComprehension(path: string, fileHash: string): void {
-  const existing = comprehensionByPath.get(path);
-  if (!existing) return;
-  comprehensionByPath.set(path, { ...existing, fileHash });
+  defaultStore.reanchor(path, fileHash);
 }
 
-/** Test seam. */
+/** Test seam (clears the default, unthreaded store only). */
 export function clearComprehensionMemory(): void {
-  comprehensionByPath.clear();
+  defaultStore.clear();
+}
+
+/**
+ * Whether the UNTHREADED store still has comprehension budget for a path
+ * (huge-file cap). The threaded store's own `canComprehend` is consulted when a
+ * run passes one; these module helpers keep the direct-tool path governed by the
+ * same cap.
+ */
+export function comprehensionBudgetLeft(path: string): boolean {
+  return defaultStore.canComprehend(path);
+}
+
+/** Record one comprehension against the unthreaded store's per-path budget. */
+export function spendComprehensionBudget(path: string): void {
+  defaultStore.noteComprehended(path);
 }
 
 export interface RateFileInput {
@@ -326,6 +453,23 @@ export interface ComprehendFileInput {
    * omits it is one that decided to escalate without saying why.
    */
   rating?: ComplexityRating;
+  /**
+   * The weaker model's OWN reasoning about this file (its current turn's thinking
+   * blocks), so the analyst does not restate it.
+   *
+   * The driver reasons as it reads — a small model produces a lot of thinking
+   * around every file — and the whole point of the escalation is to contribute
+   * what the driver cannot see, not to say the same thing better. Without this
+   * input the analyst has no way to know what was already covered, so it re-covers
+   * it: two models, two passes over the same obvious points, and the reader gets a
+   * wall of prose it mostly already knows. With it, the instructions change from
+   * "contribute only what the weaker model is likely to get wrong" to "here is
+   * exactly what it already worked out — add only the gaps".
+   *
+   * Bounded before it is sent (the reasoning is only context for the analyst, not
+   * something the reader needs back).
+   */
+  driverReasoning?: string;
   signal?: AbortSignal;
 }
 
@@ -565,6 +709,12 @@ function buildComprehendMessage(input: ComprehendFileInput): string {
   if (input.task) parts.push(`TASK:\n${input.task}`);
   if (input.why) parts.push(`WHY THIS FILE WAS FLAGGED AS COMPLEX:\n${input.why}`);
   parts.push(`CONTENTS:\n\`\`\`\n${input.content}\n\`\`\``);
+  if (input.driverReasoning) {
+    parts.push(
+      `DRIVER'S REASONING (what the weaker model already worked out about this file/task — your findings must be DISJOINT from this):\n` +
+        `\`\`\`\n${input.driverReasoning}\n\`\`\``,
+    );
+  }
   parts.push("Give the analysis now. No summary of the code itself.");
   return parts.join("\n\n");
 }

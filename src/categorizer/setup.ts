@@ -171,7 +171,11 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "graph_memory",
         "media_analysis",
       ],
-      children: ["write_edit", "activity_inspect"],
+      // A bug report goes to `activity_reproduce` (see it happen), a feature to
+      // `write_edit`. `activity_inspect` is deliberately NOT here: verifying is
+      // done AFTER a change exists, and offering it straight out of read is how a
+      // run ends up doing QA on code nobody has touched.
+      children: ["activity_reproduce", "write_edit"],
       accepts: {},
       returns: {
         kind: "code-summary",
@@ -200,19 +204,25 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "design_skill",
       ],
       children: ["activity_inspect"],
-      accepts: { from: ["read", "activity_inspect"], tools: [] },
+      accepts: { from: ["read", "activity_reproduce", "activity_inspect"], tools: [] },
       returns: {
         kind: "write-report",
         description: "The writes/edits that landed (tool, path, what changed) + notes",
       },
     },
     {
-      id: "activity_inspect",
-      name: "Activity Inspect",
+      id: "activity_reproduce",
+      name: "Activity Reproduce",
       description:
-        "QA and debugging: run the app, capture screens, compare against media, read/instrument " +
-        "logs and traces. Accepts the write calls a work pass made; localises bugs and reports a verdict.",
-      systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_inspect,
+        "Make a REPORTED defect happen, before any fix exists: run the app, drive it to the broken " +
+        "screen, instrument and read the logs. Accepts the read pass's code summary; delivers the " +
+        "symptom as observed, where the evidence is, and the lines a fix should target. Pick this " +
+        "for a bug report — never to check a change that was just made (that is activity_inspect).",
+      systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_reproduce,
+      // Same QA surface as activity_inspect — browsers, devices, activity
+      // builtins, and any MCP server scoped there — without every one of those
+      // tools having to name a second categorizer. See `toolScope`.
+      toolScope: "activity_inspect",
       tools: [
         "read",
         "grep",
@@ -232,7 +242,49 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "remove_log",
       ],
       children: ["write_edit"],
-      accepts: { from: ["write_edit", "read"], tools: ["write", "edit"] },
+      accepts: { from: ["read"], tools: [] },
+      // Not an entry: reproducing needs to know where to look, and that is the
+      // read pass's output. Entered cold, this hop has no files, no suspects and
+      // nothing to instrument — the run that motivated the split spent eight
+      // minutes reading source in a hop built for driving.
+      entry: false,
+      returns: {
+        kind: "repro-report",
+        description:
+          "The symptom as OBSERVED (or an honest could-not-reproduce) + where the evidence is + " +
+          "the lines a fix should target, for the write pass",
+      },
+    },
+    {
+      id: "activity_inspect",
+      name: "Activity Inspect",
+      description:
+        "VERIFY a change that was just made: run it, capture screens, compare against media, " +
+        "read/instrument logs and traces. Accepts the write calls a work pass made; reports a " +
+        "pass/fail verdict. Not for a bug report with no fix yet — that is activity_reproduce.",
+      systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_inspect,
+      // Verification measures a change, so there has to be one first.
+      entry: false,
+      tools: [
+        "read",
+        "grep",
+        "ls",
+        "media_analysis",
+        "mobile",
+        "drive",
+        "activity_search",
+        "activity_tags",
+        "activity_tail_file",
+        "activity_study",
+        "activity_trace_start",
+        "activity_collect",
+        "activity_cleanup",
+        "activity_inspect",
+        "add_log",
+        "remove_log",
+      ],
+      children: ["write_edit"],
+      accepts: { from: ["write_edit", "read", "activity_reproduce"], tools: ["write", "edit"] },
       returns: {
         kind: "inspect-report",
         description: "Findings + where logs are written + where the bug is (+ pass/fail verdict)",

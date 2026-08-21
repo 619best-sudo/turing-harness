@@ -1,5 +1,6 @@
 import type { AssistantMessage, Context, LLMBridge } from "../types.js";
 import { FILE_MEMORY_SUMMARY_VERSION, cleanSummary, dedupeStrings } from "./file-memory.js";
+import { parseJsonObjectLoose } from "../robust-json.js";
 
 export const DEFAULT_FILE_SUMMARIZER_MODEL = "xiaomi/mimo-v2.5";
 
@@ -96,11 +97,16 @@ export async function summarizeFileWithLlm(input: FileSummaryLlmInput): Promise<
   const message = await input.llm.complete(model, context, {
     temperature: 0,
     signal: input.signal,
-    maxTokens: Math.min(model.maxTokens ?? 2048, 800),
-    // The 800-token ceiling is for the JSON body. Without a reasoning bound a
-    // reasoning model spends all 800 thinking, returns no content, and the
-    // resulting parse failure re-queues the file forever.
-    reasoningMaxTokens: 200,
+    // The whole budget goes to the JSON body. Nine fields plus a 100-200 word
+    // summary does not fit in 800 tokens, and the earlier attempt to make it fit
+    // — 800 total with 200 reserved for thinking — left ~600 for the body and
+    // truncated EVERY call: `finish_reason: length`, unparseable JSON, a file
+    // re-queued forever. Paid for, never used.
+    maxTokens: Math.min(model.maxTokens ?? 2048, 1600),
+    // Off, not bounded. This is extraction from text that is already in the
+    // prompt — there is nothing to reason about, and reasoning tokens bill at
+    // output rates while producing none of the answer.
+    reasoning: "off",
   });
   const text = assistantText(message);
   const parsed = parseJsonObject(text);
@@ -130,10 +136,18 @@ function assistantText(message: AssistantMessage): string {
     .trim();
 }
 
+/**
+ * The summarizer's own output, which arrives fenced, prefaced, or cut off.
+ *
+ * This parser is why the 800-token ceiling was so expensive: it was strict, so a
+ * truncated response — which was every response — threw, the file was marked
+ * failed, and the failure re-queued it forever. The budget is fixed now, and this
+ * no longer turns a nearly-complete answer into nothing.
+ */
 function parseJsonObject(text: string): Record<string, unknown> {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const raw = (fenced ?? text).trim();
-  return JSON.parse(raw) as Record<string, unknown>;
+  const parsed = parseJsonObjectLoose(text);
+  if (!parsed) throw new Error("summarizer returned no parseable JSON object");
+  return parsed;
 }
 
 function normalizeKeywords(value: unknown): string[] {

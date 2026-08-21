@@ -135,8 +135,23 @@ function makeSummaryLlm() {
   };
 }
 
-function makeHarness(t) {
-  const harness = new Harness({ permissionMode: "bypass", llm: makeSummaryLlm() });
+function makeCountingSummaryLlm() {
+  const inner = makeSummaryLlm();
+  const calls = [];
+  return {
+    calls,
+    resolveModel: inner.resolveModel,
+    async complete(model, context, options) {
+      const prompt = String(context.messages?.[0]?.content ?? "");
+      calls.push({ path: /path:\s*(.+)/.exec(prompt)?.[1]?.trim() ?? "unknown", options });
+      return inner.complete(model, context, options);
+    },
+    async *stream() {},
+  };
+}
+
+function makeHarness(t, llm) {
+  const harness = new Harness({ permissionMode: "bypass", llm: llm ?? makeSummaryLlm() });
   // Dispose even when the test throws. The harness holds a recursive fs watcher
   // per project, and an assertion failure that skips the explicit dispose() at
   // the end of a test leaves that handle open — which does not fail the run, it
@@ -325,6 +340,78 @@ test("file_memory ignores Android/iOS build artifacts but keeps native source fi
   await harness.dispose();
 });
 
+test("file_memory ignores build output and dependency trees across ecosystems, at any depth", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "file-memory-stacks-"));
+  const kept = [
+    // Real source that shares a parent name with generated trees, or sits one
+    // level away from one. None of these may be skipped.
+    "lib/main.dart",
+    "assets/images/logo.svg",
+    "packages/ui/src/Button.tsx",
+    "src/app/page.tsx",
+    "cmd/server/main.go",
+    "app/models/user.rb",
+    "Sources/App/Service.swift",
+    "unity/Assets/Scripts/Player.cs",
+    "docs/public/index.md",
+  ];
+  const ignored = [
+    // Flutter/Gradle/CMake: the case that started this — a top-level `build/`.
+    "build/app/intermediates/flutter/release/flutter_assets/assets/icon.svg",
+    "build/ios/Release-iphoneos/Runner.app/Info.plist",
+    ".dart_tool/package_config.json",
+    // JS / TS
+    "node_modules/react/index.js",
+    "apps/web/node_modules/lodash/index.js",
+    "apps/web/.next/server/pages.js",
+    ".turbo/cache/log.txt",
+    "web/dist/bundle.js",
+    "storybook-static/iframe.html",
+    // Python
+    "api/__pycache__/main.cpython-312.pyc",
+    ".venv/lib/python3.12/site-packages/fastapi/main.py",
+    ".ruff_cache/content.json",
+    // JVM / Android
+    "service/target/classes/App.class",
+    "android/app/.cxx/debug/log.txt",
+    ".gradle/caches/journal.bin",
+    // Apple
+    "ios/Pods/Firebase/Firebase.h",
+    "Carthage/Build/iOS/Alamofire.framework/Info.plist",
+    "DerivedData/App/Build/Products/App.app/Info.plist",
+    // Rust / Go / Ruby / PHP / .NET / Elixir / Haskell
+    "rust/target/debug/deps/app.d",
+    "go/vendor/github.com/pkg/errors/errors.go",
+    ".bundle/config",
+    "php/vendor/laravel/framework/src/App.php",
+    "dotnet/bin/Debug/net8.0/App.dll",
+    "dotnet/obj/project.assets.json",
+    "elixir/_build/dev/lib/app/app.beam",
+    "haskell/dist-newstyle/build/app/App.hi",
+    // Bazel / infra / static sites
+    "bazel-out/k8-fastbuild/bin/app",
+    "infra/.terraform/plugins/registry.json",
+    "cdk.out/App.template.json",
+    "site/_site/index.html",
+  ];
+  for (const name of [...kept, ...ignored]) {
+    const file = path.join(dir, name);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, `// ${name}\n`);
+  }
+
+  const harness = makeHarness(t);
+  const { fileMemory } = await harness.createProjectSession({ cwd: dir, connectMcp: false });
+  for (const name of kept) {
+    assert.ok(fileMemory.get(path.join(dir, name)), `expected ${name} to be indexed`);
+  }
+  for (const name of ignored) {
+    assert.equal(fileMemory.get(path.join(dir, name)), undefined, `expected ${name} to be ignored`);
+  }
+
+  await harness.dispose();
+});
+
 test("external edits become stale on reopen and refresh clears staleness", async (t) => {
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
@@ -375,7 +462,13 @@ test("background hydration upgrades summaries and watcher refreshes changed file
   const cwd = await mkproject();
   const target = path.join(cwd, "src", "search-engine.ts");
   const harness = makeHarness(t);
-  const first = await harness.createProjectSession({ cwd, connectMcp: false });
+  // Eager mode, opted into explicitly: sweep the whole index at startup and run
+  // summaries as paths arrive. Not the default — see the deferred tests below.
+  const first = await harness.createProjectSession({
+    cwd,
+    connectMcp: false,
+    fileMemoryRuntime: { summarizeOn: "all", deferUntilFlush: false },
+  });
 
   await first.fileMemoryRuntime?.drain();
   const hydrated = first.fileMemory?.get(target);
@@ -489,7 +582,7 @@ test("watcher does not run llm before enablement and resumes changed-file llm re
   const first = await harness.createProjectSession({
     cwd,
     connectMcp: false,
-    fileMemoryRuntime: { autoStartHydration: false, llmSyncEnabled: false },
+    fileMemoryRuntime: { autoStartHydration: false, llmSyncEnabled: false, deferUntilFlush: false },
   });
 
   await fs.writeFile(
@@ -523,6 +616,174 @@ test("watcher does not run llm before enablement and resumes changed-file llm re
   const afterEnable = first.fileMemory?.get(target);
   assert.equal(afterEnable?.summarySource, "llm");
   assert.match(afterEnable?.summary ?? "", /refreshSearchIndex|search-engine\.ts/i);
+
+  await harness.dispose();
+});
+
+test("by default no summary runs on session open — only on the files a run wrote", async (t) => {
+  const cwd = await mkproject();
+  const target = path.join(cwd, "src", "search-engine.ts");
+  const other = path.join(cwd, "src", "index.ts");
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemory, fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  // Opening a project owes it nothing. The old default swept the whole index
+  // here — one LLM call per file, on every session, invisible in the transcript.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await fileMemoryRuntime?.drain();
+  assert.equal(llm.calls.length, 0, "session open must not summarize anything");
+  assert.equal(fileMemory?.get(target)?.summarySource, "heuristic");
+
+  // What a run wrote, summarized at run end and nothing else.
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  assert.equal(llm.calls.length, 0, "queued writes must wait for the flush");
+  await fileMemoryRuntime?.flush();
+
+  assert.deepEqual(llm.calls.map((call) => call.path), ["src/search-engine.ts"]);
+  assert.equal(fileMemory?.get(target)?.summarySource, "llm");
+  assert.equal(fileMemory?.get(other)?.summarySource, "heuristic", "untouched files keep their parser summary");
+
+  await harness.dispose();
+});
+
+test("summaries are held for the duration of a run and released after it", async (t) => {
+  const cwd = await mkproject();
+  const target = path.join(cwd, "src", "search-engine.ts");
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  await fileMemoryRuntime?.hold();
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(llm.calls.length, 0, "nothing may reach the network mid-run");
+  assert.equal(fileMemoryRuntime?.getStatus().held, true);
+  assert.equal(fileMemoryRuntime?.getStatus().queuedCount, 1);
+
+  // drain() must settle while held — a caller waiting on in-flight work should
+  // not block on paths that are parked by design.
+  await fileMemoryRuntime?.drain();
+
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 1);
+  assert.equal(fileMemoryRuntime?.getStatus().held, true, "flush re-holds for the next run");
+  assert.equal(fileMemoryRuntime?.getStatus().queuedCount, 0);
+
+  await harness.dispose();
+});
+
+test("the summarizer spends no tokens on reasoning", async (t) => {
+  const cwd = await mkproject();
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  fileMemoryRuntime?.noteFilesWritten([path.join(cwd, "src", "search-engine.ts")]);
+  await fileMemoryRuntime?.flush();
+
+  const [call] = llm.calls;
+  assert.ok(call, "expected one summary call");
+  assert.equal(call.options?.reasoning, "off");
+  assert.equal(call.options?.reasoningMaxTokens, undefined, "a reasoning budget would compete with the JSON body");
+  assert.ok(
+    (call.options?.maxTokens ?? 0) >= 1200,
+    "the body needs room for nine fields — 800 truncated every call",
+  );
+
+  await harness.dispose();
+});
+
+test("a file is summarized once, and again only when its bytes change", async (t) => {
+  const cwd = await mkproject();
+  const target = path.join(cwd, "src", "search-engine.ts");
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemory, fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  // First write: no summary exists, so one is made.
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 1);
+  const first = fileMemory?.get(target);
+  assert.equal(first?.summarySource, "llm");
+  assert.equal(first?.summaryContentHash, first?.contentHash, "the summary records the bytes it was made from");
+  const firstUpdatedAt = first?.summaryUpdatedAt;
+
+  // Reported again with the file untouched — nothing to do, no call.
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 1, "an unchanged file must not be summarized twice");
+  assert.equal(fileMemory?.get(target)?.summaryUpdatedAt, firstUpdatedAt, "the stored summary is untouched");
+  assert.equal(fileMemoryRuntime?.getStatus().skippedCount, 1);
+
+  // A write that produces IDENTICAL bytes (a revert, a formatter no-op) is still
+  // not a change: the hash decides, not the fact that a write happened.
+  const bytes = await fs.readFile(target, "utf8");
+  await fs.writeFile(target, bytes);
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 1, "rewriting the same bytes is not a change");
+
+  // Real change ⇒ a fresh summary.
+  await fs.writeFile(target, "export function renamedEntirely(q: string) {\n  return q;\n}\n");
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 2, "changed bytes must be re-summarized");
+  const second = fileMemory?.get(target);
+  assert.equal(second?.summaryContentHash, second?.contentHash);
+  assert.notEqual(second?.summaryContentHash, first?.summaryContentHash);
+  assert.match(second?.summary ?? "", /search-engine/);
+
+  await harness.dispose();
+});
+
+test("needsSummaryHydration answers from the hash, not from event order", async (t) => {
+  const cwd = await mkproject();
+  const target = path.join(cwd, "src", "search-engine.ts");
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemory, fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  assert.equal(fileMemory?.needsSummaryHydration(target), true, "no llm summary yet");
+  fileMemoryRuntime?.noteFilesWritten([target]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(fileMemory?.needsSummaryHydration(target), false, "summarized at the current bytes");
+
+  // Change the file WITHOUT telling the memory. The answer must still be right:
+  // the check reads the file, so it cannot be desynchronised by a missed event.
+  await fs.writeFile(target, "export const changedOutsideTheRuntime = true;\n");
+  await fileMemory?.refreshPathMetadata(target);
+  assert.equal(fileMemory?.needsSummaryHydration(target), true, "the bytes moved on");
+
+  // A double metadata refresh must not consume the signal — the old proxy chain
+  // (reset summarySource on change) could, a hash comparison cannot.
+  await fileMemory?.refreshPathMetadata(target);
+  assert.equal(fileMemory?.needsSummaryHydration(target), true);
+
+  await harness.dispose();
+});
+
+test("only the changed file of several written is summarized", async (t) => {
+  const cwd = await mkproject();
+  const a = path.join(cwd, "src", "search-engine.ts");
+  const b = path.join(cwd, "src", "index.ts");
+  const llm = makeCountingSummaryLlm();
+  const harness = makeHarness(t, llm);
+  const { fileMemoryRuntime } = await harness.createProjectSession({ cwd, connectMcp: false });
+
+  fileMemoryRuntime?.noteFilesWritten([a, b]);
+  await fileMemoryRuntime?.flush();
+  assert.equal(llm.calls.length, 2);
+
+  await fs.writeFile(b, "export const onlyThisMoved = true;\n");
+  fileMemoryRuntime?.noteFilesWritten([a, b]);
+  await fileMemoryRuntime?.flush();
+  assert.deepEqual(
+    llm.calls.slice(2).map((call) => call.path),
+    ["src/index.ts"],
+    "the untouched file must not be re-summarized alongside the changed one",
+  );
 
   await harness.dispose();
 });

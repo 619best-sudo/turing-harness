@@ -23,16 +23,95 @@ export interface DeliverBox {
   delivered: boolean;
 }
 
-/** Resolve the deliver schema: explicit override → built-in per kind → minimal. */
+/** Field names the chain reads for routing and strips from the deliverable. */
+export const NEXT_CATEGORIZERS_FIELD = "nextCategorizers";
+export const HANDOFF_REASON_FIELD = "handoffReason";
+
+/**
+ * Resolve the deliver schema: explicit override → built-in per kind → minimal,
+ * plus the handoff tail every categorizer with children gets.
+ *
+ * The tail is added HERE rather than in each schema so it cannot drift: it is a
+ * property of the chain (a hop hands off), not of any one return kind, and a
+ * host shipping a custom `deliverSchema` gets it without knowing it exists.
+ * `enum` is the categorizer's own `children` plus `summarise`, so the driver
+ * cannot nominate a category the graph does not allow after it — an id outside
+ * the enum is rejected by the loop's own argument validation before the chain
+ * ever sees it.
+ */
 export function deliverSchemaFor(def: CategorizerDefinition) {
-  return (
+  const base =
     def.returns.deliverSchema ??
     DEFAULT_DELIVER_SCHEMAS[def.returns.kind] ?? {
       type: "object",
       properties: { summary: { type: "string" } },
       required: ["summary"],
-    }
-  );
+    };
+  // Optional-chained: a caller may hand in a partial definition (the schema is
+  // public API), and a categorizer with no children hands off to nothing.
+  if (!def.children?.length) return base;
+  const properties = (base as { properties?: Record<string, unknown> }).properties ?? {};
+  return {
+    ...base,
+    properties: {
+      ...properties,
+      [NEXT_CATEGORIZERS_FIELD]: {
+        type: "array",
+        description:
+          "REQUIRED. What must happen next, in order, chosen from: " +
+          `${def.children.join(", ")}, summarise. You have just done the work and know things a ` +
+          "one-line summary of it cannot carry — say where it goes. List SEVERAL when several are " +
+          "needed (a reported bug is usually reproduce-then-fix: activity_inspect, then write_edit). " +
+          'Use ["summarise"] only when the run is genuinely COMPLETE — the user asked to understand ' +
+          "something and now they can, or nothing needs changing. Describing a defect is not fixing it.",
+        items: { type: "string", enum: [...def.children, "summarise"] },
+      },
+      [HANDOFF_REASON_FIELD]: {
+        type: "string",
+        description: "One sentence: why that is what comes next. Shown in the run log.",
+      },
+    },
+  };
+}
+
+/**
+ * Split a captured `deliver` payload into the deliverable and the routing
+ * fields.
+ *
+ * Stripped rather than left in place: the deliverable is rendered verbatim into
+ * the NEXT categorizer's opening, and a routing instruction addressed to the
+ * chain reads there as an instruction addressed to that categorizer.
+ */
+export function takeHandoff(
+  def: CategorizerDefinition,
+  deliverable: CategorizerDeliverable | undefined,
+): {
+  deliverable: CategorizerDeliverable | undefined;
+  nominations: string[];
+  reason?: string;
+} {
+  if (!deliverable || typeof deliverable !== "object") return { deliverable, nominations: [] };
+  const record = { ...(deliverable as Record<string, unknown>) };
+  const rawNext = record[NEXT_CATEGORIZERS_FIELD];
+  const rawReason = record[HANDOFF_REASON_FIELD];
+  delete record[NEXT_CATEGORIZERS_FIELD];
+  delete record[HANDOFF_REASON_FIELD];
+  // A small model may answer with a bare string where an array was asked for.
+  const list = Array.isArray(rawNext) ? rawNext : typeof rawNext === "string" ? rawNext.split(/[,\s]+/) : [];
+  const allowed = new Set([...(def.children ?? []), "summarise"]);
+  const nominations: string[] = [];
+  for (const entry of list) {
+    const id = String(entry ?? "").trim();
+    if (!allowed.has(id) || nominations.includes(id)) continue;
+    nominations.push(id);
+    // Everything after a "summarise" is unreachable by definition.
+    if (id === "summarise") break;
+  }
+  return {
+    deliverable: record as CategorizerDeliverable,
+    nominations,
+    ...(typeof rawReason === "string" && rawReason.trim() ? { reason: rawReason.trim() } : {}),
+  };
 }
 
 /**
@@ -106,6 +185,18 @@ export function deriveFallbackDeliverable(
       return {
         files: loop.readPaths.map((path) => ({ path })),
         codeSummary: text || "(deliver was not called; file list from loop tracking)",
+      };
+    case "repro-report":
+      // `reproduced: false` is the only honest default for a hop that stopped
+      // without saying. Defaulting to true would hand the fixer a confirmed
+      // symptom that nobody confirmed.
+      return {
+        reproduced: false,
+        symptom: text
+          ? `(derived from the loop's closing report — deliver was not called)\n${text}`
+          : "(deliver was not called; the hop ended without reporting what it saw)",
+        logPaths: [],
+        suspects: loop.readPaths.map((path) => ({ path })),
       };
     default:
       return { summary: text || "(no deliverable produced)" };

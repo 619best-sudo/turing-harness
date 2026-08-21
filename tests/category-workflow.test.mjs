@@ -51,7 +51,10 @@ test("read teaches memory-first → read → attachments → link → deliver", 
   assert.match(p, /media_analysis/);
   assert.match(p, /route/);
   assert.match(p, /the chain ends/);
-  assert.match(p, /handoff write_edit or/);
+  // The handoff names the pass that follows a READ, and which one depends on the
+  // task: a reported defect reproduces first, a change goes straight to work.
+  assert.match(p, /your deliverable IS the handoff the next pass starts from/);
+  assert.match(p, /`activity_reproduce` when the task is a reported defect/);
   // The deliver contract teaches the per-attachment handoff notes.
   assert.match(p, /attachmentNotes/);
 });
@@ -94,7 +97,8 @@ test("the router prompt carries the worked example shapes (research / read-only 
   assert.match(DEFAULT_ROUTER_PROMPT, /research the ecommerce market/);
   assert.match(DEFAULT_ROUTER_PROMPT, /read → summarise/);
   assert.match(DEFAULT_ROUTER_PROMPT, /read → write_edit → activity_inspect/);
-  assert.match(DEFAULT_ROUTER_PROMPT, /read → activity_inspect → write_edit/);
+  // A bug report now reproduces BEFORE the fix and verifies after it.
+  assert.match(DEFAULT_ROUTER_PROMPT, /read → activity_reproduce → write_edit → activity_inspect/);
 });
 
 test("setup wires the tools each flow promises: read and write_edit carry media_analysis", () => {
@@ -104,9 +108,14 @@ test("setup wires the tools each flow promises: read and write_edit carry media_
   assert.ok(byId.read.tools.includes("graph_memory"), "read starts from graph memory");
   assert.ok(byId.write_edit.tools.includes("create_plan"), "write_edit always plans first");
   assert.match(byId.read.returns.description, /attachment/);
-  // The flow graph the prompts describe: read → write_edit | activity_inspect,
-  // write_edit → activity_inspect, activity_inspect → write_edit.
-  assert.deepEqual(byId.read.children, ["write_edit", "activity_inspect"]);
+  // The flow graph the prompts describe: read → activity_reproduce | write_edit,
+  // write_edit → activity_inspect, either QA hop → write_edit.
+  assert.deepEqual(byId.read.children, ["activity_reproduce", "write_edit"]);
   assert.deepEqual(byId.write_edit.children, ["activity_inspect"]);
+  assert.deepEqual(byId.activity_reproduce.children, ["write_edit"]);
   assert.deepEqual(byId.activity_inspect.children, ["write_edit"]);
+  // The reproduce hop shares the QA tool surface without re-declaring it.
+  assert.ok(byId.activity_reproduce.tools.includes("drive"));
+  assert.ok(byId.activity_reproduce.tools.includes("mobile"));
+  assert.equal(byId.activity_reproduce.toolScope, "activity_inspect");
 });

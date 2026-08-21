@@ -28,6 +28,7 @@
  */
 import type { AgentTool, ToolContext } from "../../types.js";
 import type { Registry } from "../../registry/registry.js";
+import { codeFenceBodies, parseJsonLoose } from "../../robust-json.js";
 
 /** One search hit. */
 export interface WebSearchHit {
@@ -149,24 +150,26 @@ const EXTRACT_TEXT_FN = `() => JSON.stringify({
  * rather than assumed to be the whole output.
  */
 export function extractJsonPayload(output: string): unknown {
-  const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidates = [fenced?.[1], output];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    const trimmed = candidate.trim();
+  const trimmed = output.trim();
+  // Strict first, on the whole output and then each fence body. A bare scalar is
+  // a legitimate `browser_evaluate` result (`42`, `"text"`, `true`) and the shared
+  // locator answers only with objects and arrays, so it cannot own this step.
+  for (const candidate of [trimmed, ...codeFenceBodies(trimmed)]) {
+    const parsed = safeParse(candidate.trim());
+    if (parsed === undefined) continue;
     // The value may itself be a JSON *string* containing JSON (evaluate returns a
     // string; some servers re-encode it), so unwrap one level when that happens.
-    for (const attempt of [trimmed, sliceOutermost(trimmed, "[", "]"), sliceOutermost(trimmed, "{", "}")]) {
-      if (!attempt) continue;
-      try {
-        const parsed = JSON.parse(attempt);
-        return typeof parsed === "string" ? safeParse(parsed) ?? parsed : parsed;
-      } catch {
-        /* try the next candidate */
-      }
-    }
+    return typeof parsed === "string" ? unwrapEncoded(parsed) : parsed;
   }
-  return undefined;
+  // Prose-wrapped, truncated, or otherwise sloppy: locate it.
+  const located = parseJsonLoose(trimmed)?.value;
+  if (located === undefined) return undefined;
+  return typeof located === "string" ? unwrapEncoded(located) : located;
+}
+
+/** One level of "the payload arrived as a JSON string". */
+function unwrapEncoded(text: string): unknown {
+  return safeParse(text) ?? parseJsonLoose(text)?.value ?? text;
 }
 
 function safeParse(text: string): unknown {
@@ -177,11 +180,6 @@ function safeParse(text: string): unknown {
   }
 }
 
-function sliceOutermost(text: string, open: string, close: string): string | undefined {
-  const start = text.indexOf(open);
-  const end = text.lastIndexOf(close);
-  return start !== -1 && end > start ? text.slice(start, end + 1) : undefined;
-}
 
 /** The message shown when no browser MCP is connected — the only hard dependency. */
 function noBrowserResult(tool: string, registry: Registry | undefined) {

@@ -17,6 +17,7 @@ import type {
   PlanSet,
   PlanTask,
 } from "../types.js";
+import { parseJsonArrayLoose, parseJsonObjectLoose } from "../robust-json.js";
 
 /** Parse the "PLANS_JSON:" object into a normalized {@link PlanSet}. */
 export function extractPlanSet(text: string): PlanSet | undefined {
@@ -133,10 +134,8 @@ export function extractPlanJson(text: string): unknown[] | undefined {
   const body = extractSection(text, "PLAN_JSON");
   if (!body) return undefined;
   for (const candidate of normalizePlanJsonCandidates(body)) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {}
+    const parsed = parseJsonArrayLoose(candidate);
+    if (parsed) return parsed;
   }
   return undefined;
 }
@@ -149,19 +148,17 @@ export function extractSection(text: string, marker: string): string | undefined
   return body || undefined;
 }
 
-/** Extract and JSON.parse the first balanced {...} object from a text blob. */
+/**
+ * The first JSON object in a text blob, however the model wrapped it.
+ *
+ * Was a local balanced-brace scanner plus two `JSON.parse` attempts; now the
+ * shared parser, which additionally survives a fence, a trailing remark, a
+ * trailing comma, and a plan that was cut off mid-task.
+ */
 export function parseFirstJsonObject(body: string): unknown {
   for (const candidate of normalizePlanJsonCandidates(body)) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-    } catch {}
-    const slice = extractFirstJsonObjectSlice(candidate);
-    if (slice) {
-      try {
-        return JSON.parse(slice);
-      } catch {}
-    }
+    const parsed = parseJsonObjectLoose(candidate);
+    if (parsed) return parsed;
   }
   return undefined;
 }
@@ -225,35 +222,6 @@ function normalizePlanJsonCandidates(body: string): string[] {
   return [...out];
 }
 
-function extractFirstJsonObjectSlice(text: string): string | undefined {
-  const start = text.indexOf("{");
-  if (start === -1) return undefined;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
-    const char = text[index]!;
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (char === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (char === "{") depth += 1;
-    if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return text.slice(start, index + 1).trim();
-    }
-  }
-  return undefined;
-}
 
 function extractFirstJsonArray(text: string): string | undefined {
   const start = text.indexOf("[");

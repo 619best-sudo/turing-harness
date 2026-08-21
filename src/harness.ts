@@ -309,17 +309,39 @@ export class Harness implements AgentHost {
         tools: [createGraphMemoryTool(graphMemory, fileMemory)],
       });
     }
-    if ((session.fileMemoryRuntime || graphMemory) && opts.fileMemoryRuntime?.watch !== false) {
-      const projectWatcher = this.acquireProjectWatcher(cwd);
+    // File summaries are LLM calls with no tool call attached, so they run at the
+    // seam between runs: held while a run is in flight, released once it ends
+    // against the files the run actually wrote. The watcher hooks share the same
+    // seam — suspended during a run, flushed after it — and are registered
+    // together so a host that disables the watcher still gets its summaries.
+    const projectWatcher =
+      (session.fileMemoryRuntime || graphMemory) && opts.fileMemoryRuntime?.watch !== false
+        ? this.acquireProjectWatcher(cwd)
+        : undefined;
+    if (projectWatcher) {
       projectWatcher.subscribe(session.id, {
         fileMemoryRuntime: session.fileMemoryRuntime,
         graphMemory,
       });
-      session.configureRunLifecycleHooks({
-        onRunStart: () => projectWatcher.suspend(session.id),
-        onRunEnd: () => projectWatcher.resume(session.id),
-      });
       this.sessionProjectWatchers.set(session.id, this.projectWatcherKey(cwd));
+    }
+    if (projectWatcher || session.fileMemoryRuntime) {
+      const fileMemoryRuntime = session.fileMemoryRuntime;
+      session.configureRunLifecycleHooks({
+        onRunStart: async () => {
+          projectWatcher?.suspend(session.id);
+          await fileMemoryRuntime?.hold();
+        },
+        onRunEnd: async (summary) => {
+          // Resume first: the watcher hands its suspended paths to the runtime,
+          // which parks them next to the run's own writes so one flush covers both.
+          await projectWatcher?.resume(session.id);
+          fileMemoryRuntime?.noteFilesWritten(summary?.writtenPaths);
+          // Deliberately not awaited — the run's reply must not wait behind a
+          // summarizer. `hold()` on the next run start waits for this instead.
+          void fileMemoryRuntime?.flush().catch(() => undefined);
+        },
+      });
     }
 
     // Policy already merged at construction (explicit opts win), so only connect
