@@ -60,3 +60,68 @@ export function traceMarker(traceId: string): string {
  * `TURING_TRACE_ab12` is reported whole rather than as its family prefix.
  */
 export const ANY_MARKER_RE = new RegExp(`${markerAlternation()}[_A-Za-z0-9-]*`);
+
+/**
+ * A line whose ONLY purpose is a probe: whitespace, then a log call that carries
+ * the marker, then optional whitespace. `print("TURING_TRACE_x …");`,
+ * `console.log(`TURING_TRACE_x …`)`, `printf("TURING_TRACE_x …\n")`, a `//`
+ * comment about one.
+ *
+ * Deliberately narrow, because deleting a line is not reversible. A line that
+ * MIXES a probe with code — `if (x) { print("TURING_TRACE_x"); return; }` — is
+ * not matched: removing the probe there means re-authoring the statement, which
+ * is a judgement call and belongs to a model or a human, not to a regex. Those
+ * get REPORTED instead.
+ */
+export const PURE_PROBE_LINE_RE = new RegExp(
+  String.raw`^[ \t]*(?:\/\/|#|--)[^\n]*` +
+    markerAlternation() +
+    String.raw`[^\n]*$|` +
+    String.raw`^[ \t]*(?:await\s+)?` +
+    String.raw`(?:[\w.$]*(?:print|log|write|puts|echo|NSLog|Debug\.\w+|Log\.\w+|fmt\.Print\w*)[\w.$]*)` +
+    String.raw`\s*\(?[^;]*` +
+    markerAlternation() +
+    String.raw`[\s\S]*?\)?\s*;?\s*$`,
+);
+
+/** What a deterministic strip did to one file. */
+export interface ProbeStripResult {
+  /** Lines removed whole — they were nothing but a probe. */
+  removed: number;
+  /** 1-based line numbers that carry a marker MIXED with code, left in place. */
+  mixed: number[];
+  /** The file's new content, or undefined when nothing changed. */
+  content?: string;
+}
+
+/**
+ * Remove every whole-line probe from `source`, reporting any that are entangled
+ * with code.
+ *
+ * Deterministic and model-free ON PURPOSE. The chain's existing strip pass asks a
+ * model to do this, which makes it slow, costly, and — the reason this exists —
+ * abortable: a run stopped by hand takes its own cleanup down with it, and the
+ * probes stay in the tree. One field run left 24 of them across three files that
+ * way, and the NEXT run read them as product code and authored a fix around them.
+ */
+export function stripProbeLines(source: string): ProbeStripResult {
+  if (!PROBE_MARKER_RE.test(source)) return { removed: 0, mixed: [] };
+  const lines = source.split("\n");
+  const kept: string[] = [];
+  const mixed: number[] = [];
+  let removed = 0;
+  for (const [index, line] of lines.entries()) {
+    if (!PROBE_MARKER_RE.test(line)) {
+      kept.push(line);
+      continue;
+    }
+    if (PURE_PROBE_LINE_RE.test(line)) {
+      removed += 1;
+      continue;
+    }
+    mixed.push(index + 1);
+    kept.push(line);
+  }
+  if (!removed) return { removed: 0, mixed };
+  return { removed, mixed, content: kept.join("\n") };
+}

@@ -46,7 +46,7 @@ import type { LogStore } from "../logging/logger.js";
 import { PermissionGate } from "../orchestrator/permission.js";
 import { ClarifyGate, normalizeQuestion, shellAuthoringTarget } from "../orchestrator/clarify-gate.js";
 import { runToolLoop, type ToolLoopResult } from "../orchestrator/loop.js";
-import { PROBE_MARKER_RE } from "../probe-marker.js";
+import { stripProbeLines } from "../probe-marker.js";
 import { triageImageAttachment, triageDocumentAttachment, isDocumentRef } from "../orchestrator/attachment-triage.js";
 import type { ModelRouter } from "../types.js";
 import type { ProjectCategory } from "../presets/project-presets.js";
@@ -1188,26 +1188,6 @@ function buildTriageCallback(
 // Probe stripping (post-chain cleanup)
 // ---------------------------------------------------------------------------
 
-async function scanForProbeMarkers(cwd: string, paths: string[]): Promise<string[]> {
-  if (!paths.length) return [];
-  const fs = await import("node:fs/promises");
-  // Parallel reads: the scan runs after every chain and the files are
-  // independent.
-  const checked = await Promise.all(
-    paths.map(async (p) => {
-      const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
-      try {
-        const content = await fs.readFile(abs, "utf8");
-        return PROBE_MARKER_RE.test(content) ? p : null;
-      } catch {
-        // missing/unreadable → can't confirm a marker; skip
-        return null;
-      }
-    }),
-  );
-  return checked.filter((p): p is string => p !== null);
-}
-
 async function stripRemainingProbes(
   input: CategorizerChainInput,
   paths: string[],
@@ -1483,13 +1463,52 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
   }
 
   // --- probe strip ---
+  //
+  // Deterministic FIRST, and outside the try that guards the model pass. The old
+  // shape was a model loop only, which made cleanup as abortable as the run it
+  // followed: one field run was stopped by hand, its strip loop died with it
+  // (`end loop: cleanup:strip-probes error=aborted`), and 24 probe lines stayed
+  // in three files. The NEXT run then read them as product code and authored a
+  // fix around one of them.
+  //
+  // Scanned over everything the run READ as well as what it wrote: a stale probe
+  // in a file this run only read is exactly the case above, and the file is
+  // already in the read cache so looking is free.
+  const probeCandidates = new Set<string>([...instrumented, ...writtenPaths, ...readPaths]);
+  const mixedProbeFiles: string[] = [];
   try {
-      for (const p of writtenPaths) instrumented.add(p);
-      const remaining = await scanForProbeMarkers(input.cwd, [...instrumented]);
-    if (remaining.length) {
+    const fsp = await import("node:fs/promises");
+    for (const candidate of probeCandidates) {
+      const abs = path.isAbsolute(candidate) ? candidate : path.join(input.cwd, candidate);
+      let source: string;
+      try {
+        source = await fsp.readFile(abs, "utf8");
+      } catch {
+        continue;
+      }
+      const result = stripProbeLines(source);
+      if (result.content != null) {
+        await fsp.writeFile(abs, result.content, "utf8");
+        input.logStore.append({
+          tags: ["categorizer", "categorizer:cleanup", "cleanup:probes"],
+          level: "info",
+          message: `stripped ${result.removed} probe line(s) from ${abs}`,
+          data: { path: abs, removed: result.removed, mixed: result.mixed },
+        });
+      }
+      // A probe entangled with code cannot be removed by rule — taking it out
+      // means re-authoring the statement. Those are the only ones the model pass
+      // is needed for.
+      if (result.mixed.length) mixedProbeFiles.push(abs);
+    }
+  } catch {
+    // best-effort: a cleanup failure never fails the run
+  }
+  try {
+    if (mixedProbeFiles.length) {
       const stripUsage = await stripRemainingProbes(
         input,
-        remaining,
+        mixedProbeFiles,
         input.modelFor(getCategory(input.setup, "activity_inspect")),
         shared.readCache,
       );

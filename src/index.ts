@@ -18,6 +18,14 @@
 // ---- Types (pi-compatible surface) ----
 export * from "./types.js";
 export {
+  PROBE_MARKER_RE,
+  PURE_PROBE_LINE_RE,
+  TRACE_MARKER_PREFIX,
+  stripProbeLines,
+  traceMarker,
+  type ProbeStripResult,
+} from "./probe-marker.js";
+export {
   codeFenceBodies,
   parseJsonLoose,
   parseJsonObjectLoose,
