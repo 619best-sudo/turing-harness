@@ -116,7 +116,7 @@ test("the reproduce prompt is about seeing the defect, not judging a change", ()
   assert.match(p, /ACTIVITY REPRODUCE categorizer/);
   assert.match(p, /There is NO fix yet and nothing to verify/);
   assert.match(p, /IF YOU CANNOT REPRODUCE IT, SAY SO/);
-  assert.match(p, /re-reading\s+it is how this hop turns into a second read pass/);
+  assert.match(p, /going back to\s+read more of it is how this hop turns into a second read pass/);
   // It must not carry the verify half's instructions.
   assert.ok(!/VERDICT: pass \| fail/.test(p), "no verdict in the pre-fix pass");
 });
@@ -538,7 +538,45 @@ test("the prompt makes the visible/invisible call before the launch", () => {
     systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_reproduce,
     children: ["write_edit"],
   });
-  assert.match(p, /decide this BEFORE you launch, because a probe has to be compiled in/);
-  assert.match(p, /VALUE\s+THAT NEVER ARRIVES/);
+  // The procedure is numbered and ordered, and the order is the fix: classify,
+  // prove you can run it, THEN instrument — the two failures this came from were
+  // instrumenting something that could not run, and running something with no
+  // probes in it.
+  const steps = [...p.matchAll(/^STEP (\d) — ([A-Z][^.,]*)/gm)].map((m) => `${m[1]}:${m[2]}`);
+  assert.equal(steps.length, 7, `expected seven steps, got ${steps.join(" | ")}`);
+  assert.match(steps[0], /1:CLASSIFY THE SYMPTOM/);
+  assert.match(steps[1], /2:ESTABLISH THAT YOU CAN RUN IT/);
+  assert.match(steps[2], /3:SETTLE WHO DRIVES/);
+  assert.match(steps[3], /4:INSTRUMENT/);
+  assert.match(steps[4], /5:RUN IT AND DRIVE IT TO THE SYMPTOM/);
+  assert.match(steps[5], /6:READ THE EVIDENCE/);
+  assert.match(steps[6], /7:LOCALISE/);
+  assert.match(p, /VISIBLE\s+— wrong text/);
+  assert.match(p, /INVISIBLE\s+— a value that never arrives/);
   assert.match(p, /not hard, it is impossible/);
+  assert.match(p, /a probe has to be in the code that\s+gets built/);
+  // Step 2 exists because instrumenting first and discovering you cannot run it
+  // wasted a whole pass.
+  assert.match(p, /Do not instrument code you cannot\s+execute/);
+  // Project-independent: it says where to LOOK for the run command, and never
+  // names a framework's.
+  assert.match(p, /never from memory, and never a command you invented/);
+  assert.match(p, /README, CLAUDE\.md \/ AGENTS\.md, a Makefile/);
+  assert.match(p, /BUILDS ONLY \(build \/ assemble \/ compile \/ archive \/ typecheck\) is not a way/);
+  for (const framework of ["flutter ", "npm run", "pnpm ", "pytest", "cargo ", "gradlew"]) {
+    assert.ok(
+      !p.slice(p.indexOf("STEP 2"), p.indexOf("STEP 5")).includes(framework),
+      `the procedure must not name ${framework} — it is project-independent`,
+    );
+  }
+  // The invariants are stated once, as rules, not buried inside a step.
+  assert.match(p, /RULES THAT HOLD AT EVERY STEP/);
+  for (const rule of [
+    /A LOG-ONLY EDIT IS ONE INSERTED LINE/,
+    /NEVER STRIP PROBES YOU HAVE NOT RUN/,
+    /THE SHELL RUNS THINGS HERE; IT DOES NOT WRITE THEM/,
+    /IF YOU CANNOT REPRODUCE IT, SAY SO/,
+  ]) {
+    assert.match(p, rule);
+  }
 });
