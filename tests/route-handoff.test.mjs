@@ -462,21 +462,26 @@ async function runBug({ nominate, isBugFix = true }) {
   return { dir, target, seen, result, logStore };
 }
 
-test("read's nomination takes the run through reproduce → fix, past a router saying summarise", async () => {
+test("read's nomination takes the run through reproduce → fix → verify, past a router saying summarise", async () => {
   const { dir, target, seen, result, logStore } = await runBug({ nominate: ["activity_reproduce", "write_edit"] });
   assert.equal(result.success, true, `error=${result.error}`);
-  assert.deepEqual(seen.hops, ["read", "activity_reproduce", "write_edit"]);
+  // write_edit nominates `summarise` and does not get it: it WROTE a file, and
+  // FLOOR 0 sends written-and-unlooked-at work to verification (which opens by
+  // asking the user whether it drives, they drive, or QA is skipped).
+  assert.deepEqual(seen.hops, ["read", "activity_reproduce", "write_edit", "activity_inspect"]);
   assert.equal(await fs.readFile(target, "utf8"), "fixed\n", "the bug must actually get fixed");
 
-  // The router was asked for the FIRST hop only; after that the driver answered,
-  // so the chain skipped the call entirely.
-  assert.equal(seen.routerCalls, 1);
+  // The router opens the run and closes it; in between every hop's driver
+  // answered, so those calls were skipped.
+  assert.equal(seen.routerCalls, 2);
 
-  // Four decisions: the router opens the run, then each hop's driver names the
-  // next — including write_edit ending it, which it has earned by writing.
   const routes = logStore.entries.filter((e) => e.tags?.includes("categorizer:route"));
-  assert.deepEqual(routes.map((e) => e.data.selection), ["read", "activity_reproduce", "write_edit", "summarise"]);
-  assert.deepEqual(routes.map((e) => e.data.source), ["router", "driver", "driver", "driver"]);
+  assert.deepEqual(
+    routes.map((e) => e.data.selection),
+    ["read", "activity_reproduce", "write_edit", "activity_inspect", "summarise"],
+  );
+  assert.deepEqual(routes.map((e) => e.data.source), ["router", "driver", "driver", "policy", "router"]);
+  assert.match(routes[3].data.reason, /nothing has verified/);
 
   await fs.rm(dir, { recursive: true, force: true });
 });
@@ -484,7 +489,11 @@ test("read's nomination takes the run through reproduce → fix, past a router s
 test("read nominating the fix directly is redirected through reproduction, end to end", async () => {
   const { dir, target, seen, result, logStore } = await runBug({ nominate: ["write_edit"] });
   assert.equal(result.success, true, `error=${result.error}`);
-  assert.deepEqual(seen.hops, ["read", "activity_reproduce", "write_edit"], `hops: ${seen.hops.join(" → ")}`);
+  assert.deepEqual(
+    seen.hops,
+    ["read", "activity_reproduce", "write_edit", "activity_inspect"],
+    `hops: ${seen.hops.join(" → ")}`,
+  );
   const routes = logStore.entries.filter((e) => e.tags?.includes("categorizer:route"));
   assert.equal(routes[1].data.source, "policy");
   assert.equal(routes[1].data.selection, "activity_reproduce");

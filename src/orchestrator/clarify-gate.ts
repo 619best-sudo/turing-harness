@@ -1,9 +1,9 @@
 /**
- * The ask-before-you-invent gate — a sibling of {@link ReproductionGate} and
- * {@link VerificationGate}, and it exists for the same reason both of those do:
- * prose does not bind.
+ * The ask-before-you-invent gate — a sibling of the observe-first wrappers in
+ * `categorizer/chain.ts` (`enforceObserveFirst` and friends), and it exists for
+ * the same reason those do: prose does not bind.
  *
- * `ASKING_THE_USER` (in phases/prompts.ts) is a page of careful guidance about
+ * `ASKING_THE_USER` (in `categorizer/guidance.ts`) is a page of careful guidance about
  * when a decision belongs to the user. On the run that motivated this file, the
  * model read that guidance, reached the right conclusion five separate times in
  * its own reasoning — the request had not said what to change the value to, so it
@@ -88,7 +88,12 @@ export function shellAuthoringTarget(
   name: string,
   args: Record<string, unknown> | undefined,
 ): { path: string; form: string } | null {
-  if (name !== "bash") return null;
+  // Every shell surface, not just the one called `bash`. `bash_readonly` is the
+  // one that actually got through: the read hop authored a Dart file with a
+  // `python3 -c` script and this function, asked only about "bash", said no
+  // authoring had happened. An MCP-prefixed spelling counts too.
+  const bare = name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : name;
+  if (bare !== "bash" && bare !== "bash_readonly") return null;
   const command = typeof args?.command === "string" ? args.command : "";
   if (!command) return null;
   return detectShellAuthoring(command);

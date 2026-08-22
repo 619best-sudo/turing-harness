@@ -109,8 +109,15 @@ test("a hard file gets room to be explained; an easy one stays terse", async () 
 
   // The file that most needed explaining was being held to the same word budget
   // as the borderline one, so its analysis got truncated where it got interesting.
-  assert.match(hard.calls[0].context.systemPrompt, /700 words/);
-  assert.match(medium.calls[0].context.systemPrompt, /250 words/);
+  // The contract now has two parts — task-led findings plus a durable whole-file
+  // map — with budgets per part, so the map (what later hops work from) is never
+  // squeezed out by the findings.
+  assert.match(hard.calls[0].context.systemPrompt, /500 words of findings/);
+  assert.match(hard.calls[0].context.systemPrompt, /about 1600 words/);
+  assert.match(medium.calls[0].context.systemPrompt, /200 words/);
+  assert.match(medium.calls[0].context.systemPrompt, /600 words total/);
+  assert.match(hard.calls[0].context.systemPrompt, /PART 2 — THE MAP/);
+  assert.match(hard.calls[0].context.systemPrompt, /reason about any part of it from YOUR text alone/);
 });
 
 test("an omitted rating is treated as hard, not as easy", async () => {

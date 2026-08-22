@@ -37,6 +37,7 @@ import {
   deliverSchemaFor,
   enforceNoShellAuthoring,
   enforceObserveFirst,
+  isBuildOnlyCommand,
   isObservationCall,
   isObservationTool,
   isRuntimeCommand,
@@ -84,7 +85,12 @@ test("neither QA hop can start a run", () => {
 });
 
 test("the reproduce hop inherits the whole QA tool surface without re-declaring it", () => {
-  const reg = new Registry();
+  // auto mode: the legacy heuristic scoping this test originally pinned. Under
+  // the default "selection" mode a connected external MCP reaches no hop until
+  // it is named (see category-leaks.test.mjs) — but a SELECTED server must
+  // still reach the reproduce hop through the very same toolScope seam, which
+  // the second registry below pins.
+  const reg = new Registry({ externalMcpScoping: "auto" });
   registerBuiltins(reg, { logStore: new LogStore() });
   const browser = ["browser_navigate", "browser_click", "browser_take_screenshot", "browser_snapshot"].map(
     (name) => ({
@@ -105,6 +111,16 @@ test("the reproduce hop inherits the whole QA tool surface without re-declaring 
   for (const name of ["browser_navigate", "browser_take_screenshot", "activity_trace_start", "drive", "mobile"]) {
     assert.ok(scoped.includes(name), `${name} reaches the reproduce hop`);
   }
+
+  // Selection mode: a composer-selected server rides the same seam.
+  const reg2 = new Registry();
+  registerBuiltins(reg2, { logStore: new LogStore() });
+  reg2.add({ id: "mcp:chrome", kind: "mcp", source: "external", name: "chrome-devtools", tools: browser });
+  reg2.selectExternalMcps(["chrome-devtools"], ["conversation", "read", "write_edit", "activity_inspect"]);
+  const scoped2 = reg2.getToolsForCategorizer(cat("activity_reproduce").toolScope).map((t) => t.name);
+  for (const name of ["browser_navigate", "browser_take_screenshot", "drive", "mobile"]) {
+    assert.ok(scoped2.includes(name), `${name} reaches the reproduce hop when selected`);
+  }
 });
 
 test("the reproduce prompt is about seeing the defect, not judging a change", () => {
@@ -116,7 +132,8 @@ test("the reproduce prompt is about seeing the defect, not judging a change", ()
   assert.match(p, /ACTIVITY REPRODUCE categorizer/);
   assert.match(p, /There is NO fix yet and nothing to verify/);
   assert.match(p, /IF YOU CANNOT REPRODUCE IT, SAY SO/);
-  assert.match(p, /going back to\s+read more of it is how this hop turns into a second read pass/);
+  assert.match(p, /whole-file analyses are ALREADY IN YOUR CONTEXT/, "the handed analyses are named");
+  assert.match(p, /going back for more of them is how this hop turns into a second\s+read pass/);
   // It must not carry the verify half's instructions.
   assert.ok(!/VERDICT: pass \| fail/.test(p), "no verdict in the pre-fix pass");
 });
@@ -136,6 +153,76 @@ const t = (name, over = {}) => ({
 });
 
 const call = (tool, args = {}) => tool.execute("id", args, { cwd: process.cwd() });
+
+test("reproduced:true demands evidence — a launched process nobody drove is corrected", async () => {
+  // The field run this replays: the app was launched through the trace, the
+  // agent REASONED about navigating to the reported screen, never made one
+  // mobile/drive call, collected nothing, and delivered `reproduced: true`
+  // from analysis plus glimpsed log lines. The gate now refuses once (go
+  // drive it), then corrects the re-issue to an honest false.
+  const box = { delivered: false };
+  const collect = t("activity_collect", {
+    async execute() {
+      return { output: "no lines yet", details: { captured: 0 } };
+    },
+  });
+  const tools = enforceObserveFirst(
+    [t("bash"), t("mobile"), t("activity_trace_start"), t("add_log"), collect, createDeliverTool(cat("activity_reproduce"), box)],
+    { probesBeforeLaunch: true },
+  );
+  const T = (n) => tools.find((x) => x.name === n);
+
+  await call(T("activity_trace_start"), {});
+  await call(T("add_log"), { path: "/a.dart" });
+  await call(T("bash"), { command: "flutter run -d sim" }); // observed: a process ran
+  await call(T("activity_collect"), { traceId: "t1" }); // captured: 0
+
+  const first = await call(T("deliver"), { reproduced: true, symptom: "status never repaints" });
+  assert.equal(first.isError, true, "refused once: nobody drove the app");
+  assert.match(first.output, /nobody drove it/);
+  assert.match(first.output, /mobile \{ action: "look" \}/, "names how to start walking");
+  assert.equal(box.delivered, false);
+
+  // The re-issue goes through — corrected to the honest report.
+  const second = await call(T("deliver"), { reproduced: true, symptom: "status never repaints" });
+  assert.notEqual(second.isError, true, "the re-issue is not blocked");
+  assert.equal(box.delivered, true);
+  assert.equal(box.deliverable.reproduced, false, "corrected: not witnessed");
+  assert.match(box.deliverable.symptom, /NOT DRIVEN/, "the symptom says what is missing");
+});
+
+test("evidence unlocks reproduced:true — a drive or a collected probe line", async () => {
+  const walk = async (collectCaptured, useMobile) => {
+    const box = { delivered: false };
+    const collect = t("activity_collect", {
+      async execute() {
+        return { output: "lines", details: { captured: collectCaptured } };
+      },
+    });
+    const tools = enforceObserveFirst(
+      [t("bash"), t("mobile"), t("activity_trace_start"), t("add_log"), collect, createDeliverTool(cat("activity_reproduce"), box)],
+      { probesBeforeLaunch: true },
+    );
+    const T = (n) => tools.find((x) => x.name === n);
+    await call(T("activity_trace_start"), {});
+    await call(T("add_log"), { path: "/a.dart" });
+    await call(T("bash"), { command: "flutter run -d sim" });
+    if (useMobile) await call(T("mobile"), { action: "look" });
+    await call(T("activity_collect"), { traceId: "t1" });
+    const res = await call(T("deliver"), { reproduced: true, symptom: "saw it" });
+    return { res, box };
+  };
+
+  // A VISIBLE defect: no probes collect, but the screen was walked and captured.
+  const visible = await walk(0, true);
+  assert.notEqual(visible.res.isError, true, "a driven/captured UI is evidence");
+  assert.equal(visible.box.deliverable.reproduced, true, "not corrected");
+
+  // An INVISIBLE defect: no screenshot proves anything, but the probes printed.
+  const invisible = await walk(3, false);
+  assert.notEqual(invisible.res.isError, true, "collected probe lines are evidence");
+  assert.equal(invisible.box.deliverable.reproduced, true, "not corrected");
+});
 
 test("a QA hop's deliver is refused once until it has observed something", async () => {
   const box = { delivered: false };
@@ -298,7 +385,7 @@ test("probes may not be stripped before the flow has run", async () => {
   const cleanup = await call(T("activity_cleanup"), { traceId: "t1" });
   assert.equal(cleanup.isError, true, "node 62: refused");
   assert.match(cleanup.output, /recorded nothing/);
-  assert.match(cleanup.output, /mobile \{action:"launch"\}/, "names how to run it");
+  assert.match(cleanup.output, /startCommand/, "names the launch-through-trace road");
 
   const delivered = await call(T("deliver"), { reproduced: true, symptom: "status never repaints" });
   assert.equal(delivered.isError, true, "node 65: refused");
@@ -343,6 +430,43 @@ test("cleanup is untouched when no probe was ever placed", async () => {
   assert.notEqual(cleanup.isError, true, "nothing to protect, nothing to refuse");
 });
 
+test("every driving category asks at a UI wall instead of dying on it", () => {
+  // The field run (session 6f38e661): the reproduce hop READ that the app uses
+  // Auth0, concluded "I can't run the full app", never launched the simulator,
+  // never called ask_user_question, and spent the pass reverse-engineering
+  // mockability. A wall is a question for the user — met by driving, not
+  // convicted from source. Taught in the QA asking slot, the shared driving
+  // guidance (so write_edit and any custom driving category get it too), and
+  // each hop's own procedure.
+  const build = (id, children) =>
+    buildCategorizerSystemPrompt({ id, systemPrompt: DEFAULT_CATEGORIZER_PROMPTS[id], children });
+
+  for (const id of ["activity_reproduce", "activity_inspect"]) {
+    const p = build(id, ["write_edit"]);
+    assert.match(p, /A WALL MET WHILE DRIVING/, `${id}: the asking slot names the wall case`);
+    assert.match(p, /BLOCKED IN THE UI/, `${id}: the driving guidance carries the protocol`);
+    assert.match(p, /ask_user_question` AT THE WALL|ask_user_question` with the/, `${id}: ask AT the wall`);
+    assert.match(p, /do (?:that one|the) step themselves/, `${id}: the user can drive one step`);
+    // Anti-pre-judgment: never decide from code that the run is impossible.
+    assert.match(
+      p,
+      /login exists SOMEWHERE, not that (your|YOUR) run will meet it|pre-judge the wall from the/,
+      `${id}: reading code is not a verdict on the run`,
+    );
+  }
+
+  const repro = build("activity_reproduce", ["write_edit"]);
+  assert.match(repro, /A WALL IS A QUESTION, NOT A VERDICT/);
+  assert.match(repro, /LAUNCH FIRST and see/, "walls are settled by meeting them, not by reading");
+
+  const inspect = build("activity_inspect", ["write_edit"]);
+  assert.match(inspect, /pre-judge the\n?\s*wall from the code/i);
+
+  // The shared driving guidance reaches the work pass too.
+  const work = build("write_edit", ["activity_inspect"]);
+  assert.match(work, /BLOCKED IN THE UI/, "write_edit carries the same wall protocol");
+});
+
 test("the reproduce prompt says what to do when add_log refuses, and not to strip early", () => {
   const p = buildCategorizerSystemPrompt({
     id: "activity_reproduce",
@@ -353,6 +477,103 @@ test("the reproduce prompt says what to do when add_log refuses, and not to stri
   assert.match(p, /do not rewrite the function around the probe/);
   assert.match(p, /NEVER STRIP PROBES YOU HAVE NOT RUN/);
   assert.match(p, /the harness knows\s+whether this pass ran anything/);
+});
+
+test("the reproduce prompt launches the app THROUGH the trace, and carries the repro spine", () => {
+  // Six field runs against one Flutter bug produced six empty trace files: every
+  // one launched the app OUTSIDE the trace (`mobile launch` of an installed
+  // build, a bare `flutter run` in bash), so probe output went where
+  // `activity_collect` never reads. The prompt now makes startCommand the
+  // launch vehicle, and the ordered spine states it where prose cannot be
+  // skipped past.
+  const p = buildCategorizerSystemPrompt({
+    id: "activity_reproduce",
+    systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_reproduce,
+    children: ["write_edit"],
+  });
+  assert.match(p, /THE REPRO SEQUENCE — seven steps/, "the ordered spine is attached");
+  assert.match(p, /\b3\. PROBE\b/, "probes come BEFORE the launch");
+  assert.match(p, /\b4\. LAUNCH\b/, "the launch attaches to the open session");
+  assert.match(p, /activity_trace_start\ { startCommand:/, "step LAUNCH names the startCommand form");
+  assert.match(p, /attaches to the SAME session/, "relaunch keeps the probe marker");
+  assert.match(p, /only road probe output has to the\s+trace file/, "and says WHY: that pipe is the evidence road");
+  assert.match(p, /LAUNCHING IS NOT REPRODUCING/, "launch alone is not a reproduction");
+  assert.match(
+    p,
+    /mobile \{action:\\"launch\\"\} of an installed build|of the installed build/,
+    "warns against outside-the-trace launches",
+  );
+  assert.match(p, /STEP 4 — INSTRUMENT THEN LAUNCH THROUGH THE TRACE/);
+  assert.match(p, /re-issu\w+ `activity_trace_start` with `startCommand`/, "the relaunch road is named");
+
+  // The verify pass keeps its own spine — the two must not collapse into one.
+  const w = buildCategorizerSystemPrompt({
+    id: "write_edit",
+    systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.write_edit,
+    children: ["activity_inspect"],
+  });
+  assert.match(w, /THE QA SEQUENCE — eight steps/, "write_edit still carries the QA spine");
+});
+
+test("the reproduce hop refuses a build-only bash call once, the verify hop does not", async () => {
+  // `flutter build web`, three times, in one field run — an artifact on disk
+  // while the defect stayed unobserved. One-shot in the reproduce hop only:
+  // the verify sequence has an explicit BUILD step before its run. The rule is
+  // about the ACT, not the stack — every ecosystem's build shape is covered.
+  const bash = t("bash");
+  const buildCmd = "cd /app && flutter build web --release";
+
+  const reproTools = enforceObserveFirst([bash], { probesBeforeLaunch: true });
+  const first = await call(reproTools.find((x) => x.name === "bash"), { command: buildCmd });
+  assert.equal(first.isError, true, "build-only in the reproduce hop is refused");
+  assert.match(first.output, /BUILDS but runs nothing/);
+  assert.match(first.output, /startCommand/, "points at the launch-through-trace road");
+  const second = await call(reproTools.find((x) => x.name === "bash"), { command: buildCmd });
+  assert.notEqual(second.isError, true, "one-shot: the re-issue goes through");
+
+  const verifyTools = enforceObserveFirst([bash], { probesBeforeLaunch: false });
+  const verifyRun = await call(verifyTools.find((x) => x.name === "bash"), { command: buildCmd });
+  assert.notEqual(verifyRun.isError, true, "the verify hop's BUILD step is legitimate");
+
+  // A command that runs after building is not build-only.
+  const reproTools2 = enforceObserveFirst([bash], { probesBeforeLaunch: true });
+  const mixed = await call(reproTools2.find((x) => x.name === "bash"), {
+    command: "cd /app && flutter build web --release && flutter run -d chrome",
+  });
+  assert.notEqual(mixed.isError, true, "build && run is a run, not a build");
+
+  // A TEST command is named as what it is. The field run interrupted
+  // `flutter test` with "you are about to run the app" and the model spent a
+  // turn parsing the mismatch; the advice is only usable if it names the
+  // thing it interrupted.
+  const reproTools3 = enforceObserveFirst(
+    [bash, t("activity_trace_start"), t("add_log")],
+    { probesBeforeLaunch: true },
+  );
+  const testRun = await call(reproTools3.find((x) => x.name === "bash"), {
+    command: "cd /app && flutter test --no-pub 2>&1 | tail -20",
+  });
+  assert.equal(testRun.isError, true, "a first test run with no probes is still interrupted once");
+  assert.match(testRun.output, /TEST suite/, "names the test suite, not 'the app'");
+  assert.match(testRun.output, /legitimate way to run it/, "a test exercising the path counts as a run");
+});
+
+test("build-only and run detection are stack-balanced, not Flutter-shaped", async () => {
+  // The rule must hold on a native-android, native-iOS, backend or plain-web
+  // project exactly as it does on the Flutter one the field run happened on.
+  assert.equal(isBuildOnlyCommand("cd /app && go build ./..."), true, "go build is a build");
+  assert.equal(isBuildOnlyCommand("xcodebuild -workspace App.xcworkspace -scheme App"), true, "xcodebuild is a build");
+  assert.equal(isBuildOnlyCommand("./gradlew assembleRelease"), true, "gradle assemble is a build");
+  assert.equal(isBuildOnlyCommand("swift build"), true, "swift build is a build");
+  assert.equal(isBuildOnlyCommand("mvn package -DskipTests"), true, "maven package is a build");
+  assert.equal(isBuildOnlyCommand("cargo build --release"), true, "cargo build is a build");
+
+  // Runs that build on the way are runs, and other stacks' launches are runs.
+  assert.equal(isBuildOnlyCommand("npx react-native run-ios"), false, "RN launches the app");
+  assert.equal(isBuildOnlyCommand("expo start"), false, "expo starts the dev server");
+  assert.equal(isRuntimeCommand("npx react-native run-ios --simulator 'iPhone 17 Pro'"), true);
+  assert.equal(isRuntimeCommand("npx expo start --port 8081"), true);
+  assert.equal(isRuntimeCommand("uvicorn app.main:app --reload"), false, "pre-existing scope: only listed shapes");
 });
 
 // ---------------------------------------------------------------------------
@@ -477,17 +698,31 @@ test("launching with no probes is interrupted once, as a choice", async () => {
   assert.match(launch.output, /VALUE THAT NEVER ARRIVES/, "so is the invisible one");
   assert.match(launch.output, /compiled in/, "and why the deadline is now");
 
-  // Visible defect: re-issue and go. Never a deadlock.
+  // Visible defect: re-issue, go CAPTURE the screen, deliver. Never a deadlock.
   const again = await call(T("bash"), { command: "fvm flutter run --flavor staging -d 'iPhone 17 Pro'" });
   assert.equal(again.isError ?? false, false);
+  await call(T("mobile"), { action: "look" }); // the capture that is the evidence
   const delivered = await call(T("deliver"), { reproduced: true, symptom: "the row never repaints" });
   assert.equal(delivered.isError ?? false, false);
-  assert.equal(box.deliverable.reproduced, true, "the launch counted as observing");
+  assert.equal(box.deliverable.reproduced, true, "the capture counted as witnessing");
 });
 
 test("instrumenting first means never being interrupted", async () => {
   const box = { delivered: false };
-  const tools = reproTools([createDeliverTool(cat("activity_reproduce"), box)]);
+  // The invisible-defect shape: the probes' collected lines are the evidence.
+  const collect = t("activity_collect", {
+    async execute() {
+      return { output: "3 trace lines", details: { captured: 3 } };
+    },
+  });
+  const tools = enforceObserveFirst(
+    [
+      t("read"), t("grep"), t("bash"), t("mobile"), t("drive"),
+      t("activity_trace_start"), t("add_log"), collect,
+      createDeliverTool(cat("activity_reproduce"), box),
+    ],
+    { probesBeforeLaunch: true },
+  );
   const T = (n) => tools.find((x) => x.name === n);
 
   await call(T("activity_trace_start"), { hint: "polling" });
@@ -506,8 +741,13 @@ test("a build is neither a launch nor an observation", async () => {
   const box = { delivered: false };
   const tools = reproTools([createDeliverTool(cat("activity_reproduce"), box)]);
   const T = (n) => tools.find((x) => x.name === n);
-  // `flutter build` proves it compiles. It is not interrupted, and it does not
-  // satisfy the deliver guard either.
+  // `flutter build` proves it compiles. The FIRST one is refused once with the
+  // launch-through-trace road named; the re-issue goes through — and even then
+  // it does not satisfy the deliver guard, because an artifact is not an
+  // observation.
+  const first = await call(T("bash"), { command: "fvm flutter build ios --debug" });
+  assert.equal(first.isError, true, "the first build-only call is interrupted once");
+  assert.match(first.output, /BUILDS but runs nothing/);
   assert.equal((await call(T("bash"), { command: "fvm flutter build ios --debug" })).isError ?? false, false);
   assert.equal((await call(T("deliver"), { reproduced: true, symptom: "x" })).isError, true);
 });
@@ -543,14 +783,17 @@ test("the prompt makes the visible/invisible call before the launch", () => {
   // instrumenting something that could not run, and running something with no
   // probes in it.
   const steps = [...p.matchAll(/^STEP (\d) — ([A-Z][^.,]*)/gm)].map((m) => `${m[1]}:${m[2]}`);
-  assert.equal(steps.length, 7, `expected seven steps, got ${steps.join(" | ")}`);
-  assert.match(steps[0], /1:CLASSIFY THE SYMPTOM/);
-  assert.match(steps[1], /2:ESTABLISH THAT YOU CAN RUN IT/);
-  assert.match(steps[2], /3:SETTLE WHO DRIVES/);
-  assert.match(steps[3], /4:INSTRUMENT/);
-  assert.match(steps[4], /5:RUN IT AND DRIVE IT TO THE SYMPTOM/);
-  assert.match(steps[5], /6:READ THE EVIDENCE/);
-  assert.match(steps[6], /7:LOCALISE/);
+  // Eight now: the enforced handshake (who makes the defect happen) comes before
+  // the classification, because it decides whether this pass drives at all.
+  assert.equal(steps.length, 8, `expected eight steps, got ${steps.join(" | ")}`);
+  assert.match(steps[0], /0:WHO MAKES IT HAPPEN/);
+  assert.match(steps[1], /1:CLASSIFY THE SYMPTOM/);
+  assert.match(steps[2], /2:ESTABLISH THAT YOU CAN RUN IT/);
+  assert.match(steps[3], /3:WALLS/);
+  assert.match(steps[4], /4:INSTRUMENT THEN LAUNCH THROUGH THE TRACE/);
+  assert.match(steps[5], /5:DRIVE IT TO THE SYMPTOM/);
+  assert.match(steps[6], /6:READ THE EVIDENCE/);
+  assert.match(steps[7], /7:LOCALISE/);
   assert.match(p, /VISIBLE\s+— wrong text/);
   assert.match(p, /INVISIBLE\s+— a value that never arrives/);
   assert.match(p, /not hard, it is impossible/);
@@ -589,7 +832,7 @@ test("the prompt makes the visible/invisible call before the launch", () => {
   }
   assert.match(p, /start → add → run → collect → study → cleanup/, "and the order they go in");
   // Each is also named at the step that uses it.
-  assert.match(p, /`remove_log \{logId\}` takes that one back out/);
+  assert.match(p, /`remove_log \{logId\}` takes it back out/);
   assert.match(p, /`activity_collect \{traceId\}`/);
   assert.match(p, /`activity_cleanup \{traceId\}`/);
 

@@ -36,13 +36,15 @@ function or(
  */
 export const MODEL_CATALOG: Record<string, Model> = {
   "xiaomi/mimo-v2.5": or("xiaomi/mimo-v2.5", "Xiaomi MiMo v2.5", {
-    // TEXT ONLY — driver/study/summarizer model. Registered explicitly so an
-    // UNREGISTERED slug does not fall through to the permissive unknown-model
-    // default (which claims image support): the modality list gates whether an
-    // image is serialised into a request, so a blind model advertised as sighted
-    // sends a screenshot into a provider rejection and kills the turn. Text-only is
-    // the safe direction to be wrong in. Verify against OpenRouter before widening.
-    input: ["text"],
+    // OMNIMODAL INPUT — verified against OpenRouter (input_modalities
+    // ["text","image","audio","video"], 1.05M context). This entry claimed
+    // TEXT ONLY for months under a "verify before widening" hedge; the check
+    // the old comment asked for finally ran and it is text-only no longer.
+    // Native image input is what the QA hops pin this model for: captures pass
+    // through untouched instead of detouring through a vision description —
+    // and no modality lie means no provider 404 killing the run.
+    input: ["text", "image", "audio", "video"],
+    cost: { input: 1.4e-7, output: 2.8e-7, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 1_048_576,
     maxTokens: 32_000,
   }),
@@ -56,6 +58,37 @@ export const MODEL_CATALOG: Record<string, Model> = {
     input: ["text"],
     contextWindow: 262_144,
     maxTokens: 32_000,
+  }),
+  "poolside/laguna-xs-2.1": or("poolside/laguna-xs-2.1", "Poolside Laguna XS 2.1", {
+    // TEXT ONLY — verified against OpenRouter (`input_modalities: ["text"]`,
+    // context 262_144). The OpenWaggleMain driver. Registered after a field run
+    // died at its first `mobile look`: unregistered, the permissive default
+    // claimed image support, the screenshot rode the next request, and OpenRouter
+    // rejected the WHOLE request (404 "No endpoints found that support image
+    // input") — an app already launched on the simulator was abandoned mid-inspect
+    // because nobody navigated after the crash. Registered, the vision guard
+    // routes tool screenshots to the configured vision model's description
+    // instead, and the run keeps driving by the element tree.
+    input: ["text"],
+    contextWindow: 262_144,
+  }),
+  "poolside/laguna-s-2.1": or("poolside/laguna-s-2.1", "Poolside Laguna S 2.1", {
+    // TEXT ONLY — verified against OpenRouter (`input_modalities: ["text"]`,
+    // context 1_048_576). Same trap as laguna-xs above, one slug up: the
+    // reproduce hop pins this model, and until this entry the first screenshot
+    // there would kill the request the same way. Registered so the vision guard
+    // treats it as blind and describes captures instead of serialising them.
+    input: ["text"],
+    contextWindow: 1_048_576,
+  }),
+  "openai/gpt-5-nano": or("openai/gpt-5-nano", "GPT-5 Nano", {
+    // Verified against OpenRouter: input_modalities ["text","image","file"],
+    // 400k context. Native vision — the reason the inspect hop pins it: its
+    // currency is screenshots, which pass through untouched instead of being
+    // rejected (text-only driver) or detoured through a vision description.
+    input: ["text", "image", "file"],
+    cost: { input: 5e-8, output: 4e-7, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 400_000,
   }),
   "bytedance-seed/seed-2.0-mini": or("bytedance-seed/seed-2.0-mini", "Seed 2.0 Mini", {
     input: ["text", "image", "file"],

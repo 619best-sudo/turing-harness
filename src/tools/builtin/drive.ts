@@ -25,9 +25,17 @@
  * matched against the live accessibility snapshot (exact name → substring), or
  * a verbatim `ref=eN` from a previous look. Ambiguous matches list the
  * candidates instead of guessing; a miss lists the page's interactive elements.
+ *
+ * TWO BACKENDS, one tool. The primary is the harness's own browser session
+ * (see ../web-session.ts — `playwright-core` lazily, system Chrome, no MCP
+ * involved, `TURING_BROWSER_CDP` to reuse a running debugger). The legacy
+ * fallback is the Playwright-MCP façade this tool originally was, kept so a
+ * host with the MCP connected but without `playwright-core` installed keeps
+ * working. The action flow below is shared; only the primitives differ.
  */
 import type { AgentTool, ToolResult, ToolResultContent } from "../../types.js";
 import type { Registry } from "../../registry/registry.js";
+import { webSession, webSessionAvailable, type WebPage, type WebElement } from "../web-session.js";
 
 type DriveAction = "open" | "look" | "click" | "fill" | "select" | "press" | "shot" | "close";
 
@@ -46,11 +54,227 @@ const PARAMS = {
   key: { type: "string", description: "press: the key (Enter, Tab, Escape…)." },
 };
 
+/** The snapshot element shape both backends produce (`ref=eN` when known). */
+export interface SnapElement {
+  ref: string;
+  role: string;
+  name: string;
+  /**
+   * Viewport CSS-pixel bounds, present for elements enumerated by GEOMETRY
+   * (the in-page scan of name-less controls) and for synthetic coordinate
+   * targets. Absent for AX-tree elements, which act by role+name.
+   */
+  rect?: { x: number; y: number; width: number; height: number };
+}
+
+/** A "x,y" viewport-pixel coordinate, the web form of `mobile tap`'s raw input. */
+const POINT_TARGET_RE = /^\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*$/;
+
+/** The in-page scan that finds controls the accessibility tree cannot name.
+ * Runs in the page; returns plain JSON. */
+const UNLABELED_SCAN = () => {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const unlabeled: Array<{ role: string; x: number; y: number; width: number; height: number }> = [];
+  const nodes = document.querySelectorAll<HTMLElement>(
+    'button, a, input, select, textarea, [role], svg, img, [onclick], [tabindex]',
+  );
+  for (const el of nodes) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) continue;
+    if (r.width >= vw * 0.95 && r.height >= vh * 0.9) continue; // page wrappers
+    if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
+    const style = getComputedStyle(el);
+    if (style.visibility === "hidden" || style.display === "none") continue;
+    if (el.getAttribute("aria-hidden") === "true") continue;
+    const name = (
+      el.getAttribute("aria-label") ??
+      el.getAttribute("title") ??
+      el.getAttribute("alt") ??
+      el.innerText ??
+      ""
+    ).trim();
+    if (name) continue; // named controls come from the AX tree with better identity
+    const role =
+      el.getAttribute("role") ??
+      (el instanceof HTMLAnchorElement
+        ? "link"
+        : el instanceof HTMLButtonElement || el instanceof HTMLInputElement
+          ? "button"
+          : el instanceof HTMLSelectElement
+            ? "combobox"
+            : el instanceof HTMLTextAreaElement
+              ? "textbox"
+              : el instanceof SVGElement || el instanceof HTMLImageElement
+                ? "graphic"
+                : el.tagName.toLowerCase());
+    unlabeled.push({ role, x: r.x, y: r.y, width: r.width, height: r.height });
+  }
+  return { viewport: { width: vw, height: vh }, unlabeled };
+};
+
 // ---------------------------------------------------------------------------
-// Playwright-MCP tool resolution (same tolerance as activity_inspect: bare,
-// `mcp__server__`-prefixed, or any other prefixing scheme via suffix match).
+// Backend contract — the primitives the shared action flow is written against
 // ---------------------------------------------------------------------------
 
+interface DriveBackend {
+  readonly kind: "own" | "mcp";
+  open(url: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  snapshot(): Promise<{ elements: SnapElement[]; text: string }>;
+  /** The viewport, when known — bounds-checks coordinate clicks. */
+  viewport(): { width: number; height: number } | undefined;
+  click(el: SnapElement): Promise<{ ok: true } | { ok: false; message: string }>;
+  fill(el: SnapElement, text: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  select(el: SnapElement, value: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  press(key: string): Promise<{ ok: true } | { ok: false; message: string }>;
+  screenshot(): Promise<{ images: ToolResultContent[]; text: string }>;
+  close(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Primary backend: the harness's own browser (playwright-core, no MCP)
+// ---------------------------------------------------------------------------
+
+function ownBackend(page: WebPage, closeSession: () => Promise<void>): DriveBackend {
+  const settle = async () => {
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 3000 });
+    } catch {
+      // networkidle is best-effort; some pages never go idle
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  };
+  type Locator = ReturnType<ReturnType<WebPage["getByRole"]>["first"]>;
+  const act = async (el: SnapElement, fn: (locator: Locator) => Promise<void>) => {
+    try {
+      await fn(page.getByRole(el.role, { name: el.name, exact: true }).first());
+      await settle();
+      return { ok: true as const };
+    } catch (e) {
+      return { ok: false as const, message: (e as Error).message?.slice(0, 400) || "action failed" };
+    }
+  };
+  let lastElements: SnapElement[] = [];
+  let lastViewport: { width: number; height: number } | undefined;
+  return {
+    kind: "own",
+    viewport: () => lastViewport,
+    async open(url) {
+      try {
+        await page.goto(url, { timeout: 30_000, waitUntil: "domcontentloaded" });
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message?.slice(0, 400) || "navigation failed" };
+      }
+    },
+    async snapshot() {
+      try {
+        const tree = await page.accessibility.snapshot();
+        const named = flattenToWebElements(tree);
+        // THE GEOMETRY CHANNEL: name-less interactive controls the AX tree
+        // either drops or reports without an addressable name — icon buttons,
+        // bare SVG/anchor taps. The in-page scan enumerates them WITH viewport
+        // rects, so they become clickable by ref (exact centre) exactly like
+        // the mobile toolkit's unlabeled set. Without this they are invisible
+        // to every resolution path.
+        const scan: { viewport?: { width: number; height: number }; unlabeled?: Array<{ role: string; x: number; y: number; width: number; height: number }> } =
+          typeof page.evaluate === "function" ? ((await page.evaluate(UNLABELED_SCAN)) ?? {}) : {};
+        const scanned = scan.unlabeled ?? [];
+        const merged: SnapElement[] = named.map((e) => ({ ...e }));
+        for (const u of scanned) {
+          merged.push({
+            ref: `e${merged.length + 1}`,
+            role: u.role,
+            name: "(unlabeled)",
+            rect: { x: u.x, y: u.y, width: u.width, height: u.height },
+          });
+        }
+        lastElements = merged;
+        lastViewport = scan.viewport;
+        const text = merged.map((e) => `- ${e.role} "${e.name}" [ref=${e.ref}]${e.rect ? ` @ ${Math.round(e.rect.x)},${Math.round(e.rect.y)} ${Math.round(e.rect.width)}x${Math.round(e.rect.height)}` : ""}`).join("\n");
+        return { elements: merged.map((e) => ({ ...e })), text };
+      } catch (e) {
+        return { elements: [], text: (e as Error).message ?? "" };
+      }
+    },
+    async click(el) {
+      // Geometry-enumerated and coordinate targets act by position — the AX
+      // tree cannot name them, so getByRole has nothing to hold.
+      if (el.rect) {
+        if (!page.mouse) {
+          return { ok: false, message: "coordinate clicks need the harness's own browser (playwright-core)" };
+        }
+        try {
+          await page.mouse.click(
+            Math.round(el.rect.x + el.rect.width / 2),
+            Math.round(el.rect.y + el.rect.height / 2),
+          );
+          await settle();
+          return { ok: true };
+        } catch (e) {
+          return { ok: false, message: (e as Error).message ?? "click failed" };
+        }
+      }
+      return act(el, (loc) => loc.click({ timeout: 5000 }));
+    },
+    fill: (el, text) => act(el, (loc) => loc.fill(text, { timeout: 5000 })),
+    select: (el, value) =>
+      act(el, async (loc) => {
+        try {
+          await loc.selectOption({ label: value }, { timeout: 5000 });
+        } catch {
+          await loc.selectOption({ value }, { timeout: 5000 });
+        }
+      }),
+    async press(key) {
+      try {
+        await page.keyboard.press(key);
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message ?? "press failed" };
+      }
+    },
+    async screenshot() {
+      try {
+        const buf = await page.screenshot({ type: "png" });
+        return {
+          images: [{ type: "image", mimeType: "image/png", data: buf.toString("base64") } as ToolResultContent],
+          text: "",
+        };
+      } catch (e) {
+        return { images: [], text: (e as Error).message ?? "" };
+      }
+    },
+    async close() {
+      await closeSession();
+    },
+  };
+}
+
+/** AX tree → our numbered `eN` elements, in the shared SnapElement shape. */
+function flattenToWebElements(root: unknown): WebElement[] {
+  let n = 0;
+  const out: WebElement[] = [];
+  const walk = (node: unknown) => {
+    if (!node || typeof node !== "object") return;
+    const { role, name, children } = node as { role?: string; name?: string; children?: unknown[] };
+    if (typeof role === "string" && role && typeof name === "string" && name && role !== "StaticText" && role !== "generic") {
+      out.push({ ref: `e${++n}`, role, name });
+    }
+    if (Array.isArray(children)) for (const child of children) walk(child);
+  };
+  walk(root);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy fallback backend: the Playwright-MCP façade this tool used to be
+// ---------------------------------------------------------------------------
+
+// Playwright-MCP tool resolution (same tolerance as activity_inspect: bare,
+// `mcp__server__`-prefixed, or any other prefixing scheme via suffix match).
 const NAVIGATE_TOOLS = ["browser_navigate", "mcp__playwright__browser_navigate"];
 const SNAPSHOT_TOOLS = ["browser_snapshot", "mcp__playwright__browser_snapshot"];
 const CLICK_TOOLS = ["browser_click", "mcp__playwright__browser_click"];
@@ -86,18 +310,112 @@ function imagesOf(res: ToolResult): ToolResultContent[] {
   return (res.content ?? []).filter((b) => b.type === "image");
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot parsing + target resolution
-// ---------------------------------------------------------------------------
-
-interface SnapElement {
-  ref: string;
-  role: string;
-  name: string;
+function mcpBackend(registry: Registry | undefined, toolCallId: string, ctx: Parameters<AgentTool["execute"]>[2]): DriveBackend | undefined {
+  const navigate = findTool(registry, NAVIGATE_TOOLS);
+  const snapshot = findTool(registry, SNAPSHOT_TOOLS);
+  const click = findTool(registry, CLICK_TOOLS);
+  const type = findTool(registry, TYPE_TOOLS);
+  const select = findTool(registry, SELECT_TOOLS);
+  const press = findTool(registry, PRESS_TOOLS);
+  const screenshot = findTool(registry, SCREENSHOT_TOOLS);
+  const close = findTool(registry, CLOSE_TOOLS);
+  if (!navigate && !snapshot && !screenshot) return undefined;
+  const run = async (finder: { name: string; tool: AgentTool } | undefined, suffix: string, args: Record<string, unknown>) => {
+    if (!finder) throw new Error(`no ${suffix} browser tool available`);
+    return finder.tool.execute(`${toolCallId}-${suffix}-${Date.now()}`, args, ctx);
+  };
+  return {
+    kind: "mcp",
+    viewport: () => undefined,
+    async open(url) {
+      try {
+        const res = await run(navigate, "nav", { url });
+        if (res.isError) return { ok: false, message: textOf(res).slice(0, 400) };
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    async snapshot() {
+      if (!snapshot) return { elements: [], text: "" };
+      try {
+        const res = await snapshot.tool.execute(`${toolCallId}-snap-${Date.now()}`, {}, ctx);
+        const text = textOf(res);
+        return { elements: parseSnapshot(text), text };
+      } catch {
+        return { elements: [], text: "" };
+      }
+    },
+    async click(el) {
+      if (el.rect) {
+        return {
+          ok: false as const,
+          message:
+            "coordinate and unlabeled-geometry clicks need the harness's own browser (`playwright-core`); " +
+            "the Playwright-MCP façade can only click elements it can name",
+        };
+      }
+      try {
+        const res = await run(click, "click", { element: el.name, ref: el.ref });
+        if (res.isError) return { ok: false, message: textOf(res).slice(0, 400) };
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    async fill(el, text) {
+      try {
+        const res = await run(type, "type", { element: el.name, ref: el.ref, text });
+        if (res.isError) return { ok: false, message: textOf(res).slice(0, 400) };
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    async select(el, value) {
+      try {
+        const res = await run(select, "select", { element: el.name, ref: el.ref, values: [value] });
+        if (res.isError) return { ok: false, message: textOf(res).slice(0, 400) };
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    async press(key) {
+      try {
+        const res = await run(press, "press", { key });
+        if (res.isError) return { ok: false, message: textOf(res).slice(0, 300) };
+        await settle();
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e as Error).message };
+      }
+    },
+    async screenshot() {
+      if (!screenshot) return { images: [], text: "" };
+      try {
+        const res = await screenshot.tool.execute(`${toolCallId}-shot-${Date.now()}`, {}, ctx);
+        return { images: imagesOf(res), text: textOf(res) };
+      } catch (e) {
+        return { images: [], text: (e as Error).message };
+      }
+    },
+    async close() {
+      if (close) await close.tool.execute(`${toolCallId}-close`, {}, ctx);
+    },
+  };
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot parsing + target resolution (shared by both backends)
+// ---------------------------------------------------------------------------
+
 /**
- * Parse Playwright-MCP snapshot lines. The format is YAML-ish:
+ * Parse Playwright-MCP snapshot lines (the legacy backend). The format is YAML-ish:
  *   - button "Sign in" [ref=e12]
  *   - textbox "Email" [ref=e21]
  *   - heading "Welcome" [level=1] [ref=e5]
@@ -122,8 +440,10 @@ const INTERACTIVE = new Set([
   "tab", "option", "switch", "searchbox", "slider", "spinbutton", "listitem",
 ]);
 
-/** Short rendering of an element for listings. */
-const show = (e: SnapElement) => `${e.role} "${e.name}"${e.ref ? ` [ref=${e.ref}]` : ""}`;
+/** Short rendering of an element for listings (geometry appended when known). */
+const show = (e: SnapElement) =>
+  `${e.role} "${e.name}"${e.ref ? ` [ref=${e.ref}]` : ""}` +
+  (e.rect ? ` @ ${Math.round(e.rect.x)},${Math.round(e.rect.y)} ${Math.round(e.rect.width)}x${Math.round(e.rect.height)}` : "");
 
 /**
  * Resolve a `target` description against the parsed snapshot.
@@ -136,6 +456,17 @@ const show = (e: SnapElement) => `${e.role} "${e.name}"${e.ref ? ` [ref=${e.ref}
 export function resolveTarget(target: string, elements: SnapElement[]): { ok: true; element: SnapElement } | { ok: false; message: string } {
   const t = target.trim();
   if (!t) return { ok: false, message: "drive: `target` is required for this action." };
+
+  // An explicit "x,y" viewport point — the web form of `mobile tap`'s raw
+  // coordinate input, for canvas and custom-drawn surfaces the tree cannot
+  // enumerate. Acts through the geometry path (centre of a zero-size rect).
+  const pt = t.match(POINT_TARGET_RE);
+  if (pt) {
+    return {
+      ok: true,
+      element: { ref: "", role: "point", name: t, rect: { x: Number(pt[1]), y: Number(pt[2]), width: 0, height: 0 } },
+    };
+  }
 
   const refMatch = t.match(/^ref=(.+)$/);
   if (refMatch) {
@@ -215,7 +546,8 @@ export function createDriveTool(): AgentTool {
       "Drive a web page in ONE call per step. `look` returns the screenshot AND every element " +
       "(refs + names); `click`/`fill`/`select` take a plain DESCRIPTION, resolve it against the live " +
       "page, act, and return the post-action screenshot plus what changed; `open` navigates; `shot` " +
-      "is the final capture to hand to media_analysis. Prefer this over raw browser_* tools.",
+      "is the final capture to hand to media_analysis. Runs on the harness's own browser — no MCP " +
+      "required (set TURING_BROWSER_CDP to reuse a running one).",
     mutates: true,
     categorizers: ["activity_inspect"],
     parameters: { type: "object", properties: PARAMS, required: ["action"] },
@@ -224,24 +556,24 @@ export function createDriveTool(): AgentTool {
       if (!DRIVE_ACTIONS.includes(action)) {
         return err(`drive: unknown action "${action}". Expected one of: ${DRIVE_ACTIONS.join(", ")}.`);
       }
-      const registry = ctx.registry as Registry | undefined;
 
-      const navigate = findTool(registry, NAVIGATE_TOOLS);
-      const snapshot = findTool(registry, SNAPSHOT_TOOLS);
-      const click = findTool(registry, CLICK_TOOLS);
-      const type = findTool(registry, TYPE_TOOLS);
-      const select = findTool(registry, SELECT_TOOLS);
-      const press = findTool(registry, PRESS_TOOLS);
-      const screenshot = findTool(registry, SCREENSHOT_TOOLS);
-      const close = findTool(registry, CLOSE_TOOLS);
-
-      const anyBrowser = !!(navigate || snapshot || screenshot);
-      if (!anyBrowser) {
+      // Primary: our own session. Fallback: the legacy MCP façade.
+      let backend: DriveBackend | undefined;
+      if (await webSessionAvailable()) {
+        const session = await webSession();
+        if (session) backend = ownBackend(session.page, session.close);
+      }
+      if (!backend) {
+        const registry = ctx.registry as Registry | undefined;
+        backend = mcpBackend(registry, toolCallId, ctx);
+      }
+      if (!backend) {
         return err(
-          "drive: no browser MCP is connected. Attach Playwright (e.g. `session.addMcpServer({ id: " +
-            "\"playwright\", command: \"npx\", args: [\"-y\", \"@playwright/mcp@latest\"] })`) and retry. " +
-            "For a device/simulator use the `mobile` tool instead; for a one-shot page capture use " +
-            "`activity_inspect`.",
+          "drive: no browser available. The harness's own session needs `playwright-core` installed and " +
+            "a Chrome to launch (or TURING_BROWSER_CDP pointing at a running debugger). Alternatively attach " +
+            "the Playwright MCP (`session.addMcpServer({ id: \"playwright\", command: \"npx\", args: [\"-y\", " +
+            "\"@playwright/mcp@latest\"] })`). For a device/simulator use the `mobile` tool instead; for a " +
+            "one-shot page capture use `activity_inspect`.",
         );
       }
 
@@ -250,11 +582,9 @@ export function createDriveTool(): AgentTool {
         case "open": {
           const url = String(args?.url ?? "").trim();
           if (!url) return err("drive open: `url` is required.");
-          if (!navigate) return err("drive open: no browser_navigate tool available.");
-          const res = await navigate.tool.execute(`${toolCallId}-nav`, { url }, ctx);
-          if (res.isError) return err(`drive open: navigation failed — ${textOf(res).slice(0, 400)}`);
-          await settle();
-          const snap = await takeSnapshot();
+          const res = await backend.open(url);
+          if (!res.ok) return err(`drive open: navigation failed — ${res.message}`);
+          const snap = await backend.snapshot();
           return {
             output: [
               `**Opened** ${url}`,
@@ -266,14 +596,13 @@ export function createDriveTool(): AgentTool {
         }
 
         case "close": {
-          if (!close) return err("drive close: no browser_close tool available.");
-          await close.tool.execute(`${toolCallId}-close`, {}, ctx);
+          await backend.close();
           return { output: "Browser session closed." };
         }
 
         // ---- capture ------------------------------------------------------
         case "shot": {
-          const img = await takeScreenshot();
+          const img = await backend.screenshot();
           if (!img.images.length) {
             return err(`drive shot: no screenshot came back — ${img.text.slice(0, 300) || "empty result"}`);
           }
@@ -287,8 +616,8 @@ export function createDriveTool(): AgentTool {
         }
 
         case "look": {
-          const snap = await takeSnapshot();
-          const img = await takeScreenshot();
+          const snap = await backend.snapshot();
+          const img = await backend.screenshot();
           const lines: string[] = ["**Page** (screenshot attached + elements below):"];
           const interactive = snap.elements.filter((e) => INTERACTIVE.has(e.role) || e.ref);
           for (const e of interactive.slice(0, 40)) lines.push(`- ${show(e)}`);
@@ -306,88 +635,94 @@ export function createDriveTool(): AgentTool {
         case "fill":
         case "select": {
           const target = String(args?.target ?? "");
-          const before = await takeSnapshot();
-          const resolved = resolveTarget(target, before.elements);
-          if (!resolved.ok) return err(resolved.message);
 
-          let act: { finder?: { name: string; tool: AgentTool }; call: string; actArgs: Record<string, unknown> };
-          if (action === "click") {
-            act = { finder: click, call: "click", actArgs: { element: resolved.element.name, ref: resolved.element.ref } };
-          } else if (action === "fill") {
-            const text = String(args?.text ?? "");
-            if (!text) return err("drive fill: `text` is required.");
-            act = { finder: type, call: "type", actArgs: { element: resolved.element.name, ref: resolved.element.ref, text } };
-          } else {
-            const value = String(args?.value ?? "");
-            if (!value) return err("drive select: `value` is required.");
-            act = { finder: select, call: "select", actArgs: { element: resolved.element.name, ref: resolved.element.ref, values: [value] } };
-          }
-          if (!act.finder) return err(`drive ${action}: no browser_${act.call === "select" ? "select_option" : act.call} tool available.`);
+          // CLICK gets the mobile-tap treatment: a click that changed nothing
+          // is re-derived ONCE against a fresh snapshot (the same description,
+          // a NEW tree — the page may have settled late or the first resolve
+          // hit a stale node). fill/select stay single-shot; typing twice is
+          // worse than reporting.
+          const maxAttempts = action === "click" ? 2 : 1;
+          let lastMsg: string | undefined;
 
-          const actRes = await act.finder.tool.execute(`${toolCallId}-${act.call}`, act.actArgs, ctx);
-          if (actRes.isError) {
-            return err(`drive ${action} on ${show(resolved.element)} failed — ${textOf(actRes).slice(0, 400)}`);
-          }
-          await settle();
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const before = await backend.snapshot();
+            const resolved = resolveTarget(target, before.elements);
+            if (!resolved.ok) return err(resolved.message);
 
-          // Post-action state: what changed + the new pixels, in the SAME call.
-          const after = await takeSnapshot();
-          const img = await takeScreenshot();
-          const diff = diffNames(before.elements, after.elements);
-          const lines: string[] = [`**${action === "fill" ? "Typed into" : action === "select" ? "Selected in" : "Clicked"}** ${show(resolved.element)} — screenshot attached.`];
-          if (diff.added.length) lines.push(`Now on screen: ${diff.added.join(", ")}`);
-          if (diff.gone.length) lines.push(`Gone: ${diff.gone.join(", ")}`);
-          if (!diff.added.length && !diff.gone.length) {
-            lines.push("(no element changes detected — if this is unexpected, `drive {action:\"look\"}` and check).");
+            // Coordinate targets: bounds-check against the viewport so an
+            // out-of-range click fails loudly instead of silently.
+            if (resolved.element.role === "point") {
+              const vp = backend.viewport();
+              if (vp && (resolved.element.rect!.x > vp.width || resolved.element.rect!.y > vp.height)) {
+                return err(
+                  `drive click: (${resolved.element.rect!.x}, ${resolved.element.rect!.y}) is outside the ` +
+                    `${vp.width}x${vp.height} viewport — the click would be dropped silently.`,
+                );
+              }
+            }
+
+            let act: { run: () => Promise<{ ok: true } | { ok: false; message: string }>; label: string };
+            if (action === "click") {
+              act = { run: () => backend!.click(resolved.element), label: "clicked" };
+            } else if (action === "fill") {
+              const text = String(args?.text ?? "");
+              if (!text) return err("drive fill: `text` is required.");
+              act = { run: () => backend!.fill(resolved.element, text), label: "typed into" };
+            } else {
+              const value = String(args?.value ?? "");
+              if (!value) return err("drive select: `value` is required.");
+              act = { run: () => backend!.select(resolved.element, value), label: "selected in" };
+            }
+
+            const actRes = await act.run();
+            if (!actRes.ok) {
+              return err(`drive ${action} on ${show(resolved.element)} failed — ${actRes.message}`);
+            }
+
+            // Post-action state: what changed + the new pixels, in the SAME call.
+            const after = await backend.snapshot();
+            const img = await backend.screenshot();
+            const diff = diffNames(before.elements, after.elements);
+            const changed = diff.added.length > 0 || diff.gone.length > 0;
+            if (!changed && attempt + 1 < maxAttempts) {
+              lastMsg = `(no change after click 1 — re-deriving \"${target}\" against a fresh snapshot)`;
+              continue;
+            }
+            const lines: string[] = [`**${act.label[0].toUpperCase()}${act.label.slice(1)}** ${show(resolved.element)} — screenshot attached.`];
+            if (lastMsg) lines.push(lastMsg);
+            if (diff.added.length) lines.push(`Now on screen: ${diff.added.join(", ")}`);
+            if (diff.gone.length) lines.push(`Gone: ${diff.gone.join(", ")}`);
+            if (!diff.added.length && !diff.gone.length) {
+              lines.push("(no element changes detected — if this is unexpected, `drive {action:\"look\"}` and check).");
+            }
+            lines.push("", "Continue with the next step, or `drive {action:\"shot\"}` when ready to analyse.");
+            return {
+              output: lines.join("\n"),
+              ...(img.images.length ? { content: img.images } : {}),
+              details: {
+                action,
+                target: show(resolved.element),
+                added: diff.added,
+                gone: diff.gone,
+                captured: img.images.length ? 1 : 0,
+                attempts: attempt + 1,
+              },
+            };
           }
-          lines.push("", "Continue with the next step, or `drive {action:\"shot\"}` when ready to analyse.");
-          return {
-            output: lines.join("\n"),
-            ...(img.images.length ? { content: img.images } : {}),
-            details: {
-              action,
-              target: show(resolved.element),
-              added: diff.added,
-              gone: diff.gone,
-              captured: img.images.length ? 1 : 0,
-            },
-          };
+          return err(`drive ${action}: exhausted attempts.`);
         }
 
         case "press": {
           const key = String(args?.key ?? "").trim();
           if (!key) return err("drive press: `key` is required.");
-          if (!press) return err("drive press: no browser_press_key tool available.");
-          const res = await press.tool.execute(`${toolCallId}-press`, { key }, ctx);
-          if (res.isError) return err(`drive press ${key} failed — ${textOf(res).slice(0, 300)}`);
-          await settle();
-          const after = await takeSnapshot();
-          const img = await takeScreenshot();
+          const res = await backend.press(key);
+          if (!res.ok) return err(`drive press ${key} failed — ${res.message}`);
+          const after = await backend.snapshot();
+          const img = await backend.screenshot();
           return {
             output: [`**Pressed** ${key} — screenshot attached.`, "", summaryLines(after.elements)].join("\n"),
             ...(img.images.length ? { content: img.images } : {}),
           };
-        }
-      }
-
-      // helpers over the resolved finders (closures need the switch-scoped ones)
-      async function takeSnapshot(): Promise<{ elements: SnapElement[]; text: string }> {
-        if (!snapshot) return { elements: [], text: "" };
-        try {
-          const res = await snapshot.tool.execute(`${toolCallId}-snap-${Date.now()}`, {}, ctx);
-          const text = textOf(res);
-          return { elements: parseSnapshot(text), text };
-        } catch {
-          return { elements: [], text: "" };
-        }
-      }
-      async function takeScreenshot(): Promise<{ images: ToolResultContent[]; text: string }> {
-        if (!screenshot) return { images: [], text: "" };
-        try {
-          const res = await screenshot.tool.execute(`${toolCallId}-shot-${Date.now()}`, {}, ctx);
-          return { images: imagesOf(res), text: textOf(res) };
-        } catch (err) {
-          return { images: [], text: (err as Error).message };
         }
       }
     },

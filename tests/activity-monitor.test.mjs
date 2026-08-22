@@ -115,9 +115,12 @@ test("activity_trace_start returns a session and instructs the MODEL to instrume
   assert.ok(res.output.includes(traceMarker(traceId)), "the snippet names THIS session's unique marker");
   assert.match(res.output, /console\.log/, "the snippet uses the language's own print");
   assert.ok(res.output.includes(traceId));
-  // The instrumenting is explicitly the model's job now, via read/edit.
-  assert.match(res.output, /`read`.*`edit`/s);
+  // The instrumenting is explicitly the model's job now, via add_log.
+  assert.match(res.output, /`add_log`/);
   assert.match(res.output, /activity_collect/);
+  // And the launch+drive road is named: relaunch through this session, then walk.
+  assert.match(res.output, /re-issue `activity_trace_start` with `startCommand`/);
+  assert.match(res.output, /DRIVE the app to the reported state/);
   // No `files` argument: the tool never edits code itself any more.
   assert.equal(tools.get("activity_trace_start").parameters.properties.files, undefined);
 
@@ -1122,6 +1125,184 @@ test("add_log REFUSES anything that is not log-only", async () => {
   }
 });
 
+test("add_log's not-log-only refusal NAMES the line that did not survive", async () => {
+  // The field failure this replays (session f56143d4, Aug 22 2026): the model's
+  // newString REPLACED an existing app log line with its probe instead of adding
+  // around it. The refusal was correct but generic — the model misread it as
+  // "too many lines changed", tried `sed -i`, then a python heredoc, then asked
+  // the user, and the pass died. The refusal now carries the offending line.
+  const { tools, ctx, dir } = await setupInDir();
+  const { traceId } = await startTrace(tools, ctx, { language: "dart" });
+  const file = path.join(dir, "polling.dart");
+  await fs.writeFile(file, [
+    "void startPolling(ids) {",
+    "  if (ids.isEmpty) {",
+    "    clear();",
+    "    return;",
+    "  }",
+    "  if (timer == null) {",
+    "    timer = Timer.periodic(interval, poll);",
+    "    debugPrint('\u{1F504} EnrichmentPolling: viewport loop started');",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+
+  const res = await tools.get("add_log").execute("l", {
+    traceId, path: "polling.dart",
+    oldString: "  if (timer == null) {\n    timer = Timer.periodic(interval, poll);\n    debugPrint('\u{1F504} EnrichmentPolling: viewport loop started');\n  }",
+    // The probe REPLACES the app's own log line — the exact mistake from the run.
+    newString: `  if (timer == null) {\n    timer = Timer.periodic(interval, poll);\n    debugPrint('${traceMarker(traceId)} startPolling=timerStarted');\n  }`,
+  }, ctx);
+  assert.ok(res.isError, "replacing an existing log line must be refused");
+  assert.match(res.output, /not log-only/);
+  assert.ok(
+    res.output.includes("debugPrint('\u{1F504} EnrichmentPolling: viewport loop started');"),
+    "the refusal names the exact line that did not survive",
+  );
+  assert.match(res.output, /Put each back EXACTLY/, "and says what to do with it");
+});
+
+test("add_log recovers an anchor that differs only in whitespace", async () => {
+  // The other field spiral (session 54fcef43): anchor not found → `cat -A`,
+  // `od -c`, then a python heredoc. The tool now hands back the file's exact
+  // bytes at the matching location.
+  const { tools, ctx, dir } = await setupInDir();
+  const { traceId } = await startTrace(tools, ctx, { language: "dart" });
+  const file = path.join(dir, "screen.dart");
+  await fs.writeFile(file, [
+    "class Screen {",
+    "  void recompute() {",
+    "    final viewport = findRenderObject();",
+    "    if (viewport is! RenderBox) {",
+    "      return;",
+    "    }",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+
+  // Sent with WRONG indentation (4/6 spaces instead of 2/4).
+  const res = await tools.get("add_log").execute("l", {
+    traceId, path: "screen.dart",
+    oldString: "    void recompute() {\n      final viewport = findRenderObject();",
+    newString: `    void recompute() {\n    debugPrint("${traceMarker(traceId)} recompute called");\n      final viewport = findRenderObject();`,
+  }, ctx);
+  assert.ok(res.isError, "the verbatim anchor must not match");
+  assert.match(res.output, /differs in whitespace/i);
+  assert.match(res.output, /line 2/, "names where the block actually is");
+  assert.ok(
+    res.output.includes("  void recompute() {"),
+    "offers the file's exact bytes to re-send",
+  );
+
+  // And re-sending with the exact bytes goes through.
+  const retry = await tools.get("add_log").execute("l", {
+    traceId, path: "screen.dart",
+    oldString: "  void recompute() {\n    final viewport = findRenderObject();",
+    newString: `  void recompute() {\n    debugPrint("${traceMarker(traceId)} recompute called");\n    final viewport = findRenderObject();`,
+  }, ctx);
+  assert.equal(retry.isError, undefined, "the correct indentation anchors fine");
+  assert.ok(
+    (await fs.readFile(file, "utf8")).includes(`${traceMarker(traceId)} recompute called`),
+    "the probe landed",
+  );
+});
+
+test("add_log refuses a probe written in the wrong language's call", async () => {
+  // `console.log` in a `.dart` file compiles nowhere; the mistake used to surface
+  // minutes later as "the build for the run failed", with the probe to blame.
+  const { tools, ctx, dir } = await setupInDir();
+  const { traceId } = await startTrace(tools, ctx, { language: "dart" });
+  await fs.writeFile(path.join(dir, "svc.dart"), "void go() {\n  fetch();\n}\n");
+
+  const bad = await tools.get("add_log").execute("l", {
+    traceId, path: "svc.dart",
+    oldString: "  fetch();",
+    newString: `  fetch();\n  console.log("${traceMarker(traceId)} go");`,
+  }, ctx);
+  assert.ok(bad.isError, "console.log in dart must be refused");
+  assert.match(bad.output, /not a dart log call/);
+  assert.match(bad.output, /debugPrint|print\(/, "shows the language's own call");
+  assert.equal(await fs.readFile(path.join(dir, "svc.dart"), "utf8"), "void go() {\n  fetch();\n}\n", "file untouched");
+
+  const good = await tools.get("add_log").execute("l", {
+    traceId, path: "svc.dart",
+    oldString: "  fetch();",
+    newString: `  fetch();\n  debugPrint("${traceMarker(traceId)} go");`,
+  }, ctx);
+  assert.equal(good.isError, undefined, good.output);
+});
+
+test("the probe-call check covers native mobile and backend stacks, not just dart", async () => {
+  // The check is keyed on the SESSION's language, which detection derives from
+  // file extensions — so a kotlin android app, a swift iOS app and a rails
+  // backend get the same wrong-language protection the dart project gets.
+  const { tools, ctx, dir } = await setupInDir();
+  for (const c of [
+    { language: "kotlin", file: "VM.kt", source: "fun go() {\n  fetch()\n}\n", anchor: "  fetch()" },
+    { language: "swift", file: "VM.swift", source: "func go() {\n  fetch()\n}\n", anchor: "  fetch()" },
+    { language: "ruby", file: "vm.rb", source: "def go\n  fetch\nend\n", anchor: "  fetch" },
+    { language: "java", file: "VM.java", source: "class VM {\n  void go() { fetch(); }\n}\n", anchor: "    fetch();" },
+  ]) {
+    const { traceId } = await startTrace(tools, ctx, { language: c.language, force: true });
+    const file = path.join(dir, c.file);
+    await fs.writeFile(file, c.source);
+    const wrong = await tools.get("add_log").execute("l", {
+      traceId, path: c.file, oldString: c.anchor,
+      newString: `${c.anchor}\n  console.log("${traceMarker(traceId)} go");`,
+    }, ctx);
+    assert.ok(wrong.isError, `${c.language}: console.log must be refused`);
+    assert.match(wrong.output, new RegExp(`not a ${c.language} log call`), `${c.language}: names the language`);
+    await tools.get("activity_cleanup").execute("c", { traceId }, ctx);
+  }
+});
+
+test("activity_trace_start sweeps leftover probes from earlier runs", async () => {
+  // A run aborted by hand takes its cleanup down with it; the next run then
+  // reads the survivors as product code. Session start now strips pure probe
+  // lines deterministically, reports mixed ones, and leaves a LIVE session's
+  // probes alone.
+  const { __activeTracesForTest: sessions } = await import("../dist/tools/builtin/activity-monitor.js");
+  const saved = [...sessions.entries()];
+  sessions.clear();
+  const { tools, ctx, dir } = await setupInDir();
+  try {
+    // An OPEN session whose probe must survive the sweep.
+    const { res: liveRes, traceId: liveId } = await startTrace(tools, ctx, { language: "dart" });
+    const live = path.join(dir, "live.dart");
+    await fs.writeFile(live, `void go() {\n  debugPrint("${traceMarker(liveId)} go");\n}\n`);
+
+    const stale = path.join(dir, "stale.dart");
+    await fs.writeFile(stale, [
+      "void recompute() {",
+      `  debugPrint("TURING_TRACE_deadbeef recompute=early");`,
+      "  if (!mounted) return;",
+      `  if (x) { debugPrint("TURING_TRACE_deadbeef mixed=in_code"); }`,
+      "}",
+      "",
+    ].join("\n"));
+
+    const { res, traceId } = await startTrace(tools, ctx, { language: "dart", force: true });
+    assert.ok(res.output.includes("Swept 1 leftover probe line"), res.output);
+
+    const after = (await fs.readFile(stale, "utf8")).split("\n");
+    assert.ok(!after.some((l) => l.includes("TURING_TRACE_deadbeef recompute=early")), "pure leftover removed");
+    assert.ok(after.some((l) => l.includes("mixed=in_code")), "mixed line left in place");
+    assert.match(res.output, /mixed=in_code|line\(s\)/, "mixed leftovers are reported");
+    assert.ok(
+      (await fs.readFile(live, "utf8")).includes(`${traceMarker(liveId)} go`),
+      "a live session's probe is not swept",
+    );
+
+    await tools.get("activity_cleanup").execute("c", { traceId: liveId }, ctx);
+    await tools.get("activity_cleanup").execute("c", { traceId }, ctx);
+  } finally {
+    sessions.clear();
+    for (const [k, v] of saved) sessions.set(k, v);
+  }
+});
+
 test("add_log puts the helper AFTER a language's leading directives", async () => {
   // Dart rejects a declaration before its imports, so a helper at line 1 does not
   // compile — and that surfaces later as a trace that captured nothing, which reads
@@ -1144,7 +1325,7 @@ test("add_log puts the helper AFTER a language's leading directives", async () =
   const res = await tools.get("add_log").execute("l", {
     traceId, path: "provider.dart",
     oldString: "    final lead = await fetch();",
-    newString: `    final lead = await fetch();\n    console.log("${traceMarker(traceId)} reload fetched", {"id": lead.id});`,
+    newString: `    final lead = await fetch();\n    debugPrint("${traceMarker(traceId)} reload fetched \${lead.id}");`,
   }, ctx);
   assert.equal(res.isError, undefined, res.output);
 
@@ -1154,6 +1335,65 @@ test("add_log puts the helper AFTER a language's leading directives", async () =
     lines.some((l) => l.includes(`${traceMarker(traceId)} reload fetched`)),
     "the session-marker log line landed",
   );
+});
+
+test("re-issuing trace_start with startCommand attaches the launch to the OPEN session", async () => {
+  // The field failure: the pass launched at session open, placed probes AFTER
+  // the launch, and — with no way to rebuild through the trace — started a
+  // SECOND app via bash. The two fought over the device; the trace and the app
+  // both died. A re-issue with `startCommand` must now launch under the SAME
+  // session (same marker, the placed probes stay live) and REPLACE an earlier
+  // build rather than run beside it.
+  const { tools, ctx, dir } = await setupInDir();
+  await fs.writeFile(path.join(dir, "a.ts"), "const a = 1;\n");
+
+  // Open the session with NO startCommand; place a probe under its marker.
+  const open = await startTrace(tools, ctx, {});
+  const probe = await tools.get("add_log").execute("l", {
+    traceId: open.traceId, path: "a.ts",
+    oldString: "const a = 1;",
+    newString: `const a = 1;\nconsole.log("${traceMarker(open.traceId)} a");`,
+  }, ctx);
+  assert.equal(probe.isError, undefined, probe.output);
+
+  const port = 8300 + Math.floor(Math.random() * 400);
+  // "http.server" in the command makes readiness decide by the port; node is
+  // the test runtime, so the command needs no toolchain.
+  const cmd = `node -e "/*http.server*/ require('http').createServer((q,s)=>s.end('ok')).listen(${port})"`;
+  const attach = await tools.get("activity_trace_start").execute(
+    "t",
+    { language: "typescript", startCommand: cmd, port },
+    ctx,
+  );
+  assert.equal(attach.details.traceId, open.traceId, "the launch attaches to the OPEN session");
+  assert.equal(attach.details.attached, true);
+  assert.ok(attach.output.includes("Launching through the OPEN trace session"), "says what it did");
+  assert.match(attach.output, /DRIVE the app to the reported state/, "the next move is driving, not waiting");
+  assert.equal(attach.details.ready, true, `port readiness (got ${attach.output.slice(-400)})`);
+  const firstPid = attach.details.childPid;
+
+  // Re-attaching REPLACES the build: same session again, old child stopped.
+  const port2 = port + 1;
+  const cmd2 = `node -e "/*http.server*/ require('http').createServer((q,s)=>s.end('ok')).listen(${port2})"`;
+  const reattach = await tools.get("activity_trace_start").execute(
+    "t",
+    { language: "typescript", startCommand: cmd2, port: port2 },
+    ctx,
+  );
+  assert.equal(reattach.details.traceId, open.traceId, "still the same session");
+  assert.notEqual(reattach.details.childPid, firstPid, "a new process");
+  let oldGone = false;
+  for (let i = 0; i < 20 && !oldGone; i++) {
+    try {
+      process.kill(firstPid, 0);
+      await new Promise((r) => setTimeout(r, 100));
+    } catch {
+      oldGone = true;
+    }
+  }
+  assert.ok(oldGone, "the earlier build under the session was stopped, not left fighting the new one");
+
+  await tools.get("activity_cleanup").execute("c", { traceId: open.traceId }, ctx);
 });
 
 test("add_log needs an open trace, and says which when several are open", async () => {
@@ -1281,7 +1521,7 @@ test("the round trip is byte-exact even in a file full of blank lines", async ()
   await tools.get("add_log").execute("l", {
     traceId, path: "spaced.dart",
     oldString: "    final lead = await fetch();",
-    newString: `    final lead = await fetch();\n    console.log("${traceMarker(traceId)} fetched");`,
+    newString: `    final lead = await fetch();\n    debugPrint("${traceMarker(traceId)} fetched");`,
   }, ctx);
   assert.notEqual(await fs.readFile(file, "utf8"), original);
 

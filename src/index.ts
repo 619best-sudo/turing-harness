@@ -69,7 +69,18 @@ export {
   runCategorizerChain,
   type CategorizerChainInput,
   enforceNoShellAuthoring,
+  enforceNoDesktopOpen,
   enforceObserveFirst,
+  enforceQaHandshake,
+  nudgeAtWalls,
+  classifyQaMode,
+  qaModeFromClarifications,
+  recallQaMode,
+  type QaMode,
+  type QaModeBox,
+  type QaModeRecord,
+  type QaHandshakeRole,
+  isBuildOnlyCommand,
   isObservationCall,
   isObservationTool,
   isRuntimeCommand,
@@ -104,6 +115,8 @@ export {
 export {
   ClarifyGate,
   normalizeQuestion,
+  shellAuthoringTarget,
+  isMutationTool,
   type ClarifyDecision,
   type ClarifyGateOptions,
   type ClarifyReport,
@@ -147,7 +160,20 @@ export {
   listEvidence,
   writeEvidence,
 } from "./orchestrator/verify-artifacts.js";
-export { runToolLoop, type ToolLoopInput, type ToolLoopResult } from "./orchestrator/loop.js";
+export { runToolLoop, isOversizedRequestError, type ToolLoopInput, type ToolLoopResult } from "./orchestrator/loop.js";
+export {
+  downscaleForEmbed,
+  EMBED_MAX_EDGE,
+  EMBED_JPEG_QUALITY,
+  type EmbedCompressStat,
+} from "./image-embed.js";
+export {
+  setWebSessionOverride,
+  webSessionAvailable,
+  closeWebSession,
+  type WebSession,
+  type WebPage,
+} from "./tools/web-session.js";
 export {
   resolveToolAlias,
   suggestToolName,

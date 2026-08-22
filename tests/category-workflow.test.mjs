@@ -82,14 +82,20 @@ test("write_edit teaches handoff → inspiration → plan → execute → build+
   assert.match(p, /activity_inspect's job/);
 });
 
-test("activity_inspect teaches WHO DRIVES before the pipeline, and the hand-back", () => {
+test("activity_inspect asks WHO DOES THE QA before the pipeline, and teaches the hand-back", () => {
   const p = build("activity_inspect", INSPECT_TOOLS);
-  const whoDrives = p.indexOf("0. WHO DRIVES");
+  const whoDrives = p.indexOf("0. WHO DOES THE QA");
   const instrument = p.indexOf("1. INSTRUMENT");
   assert.ok(whoDrives >= 0, "step 0 present");
-  assert.ok(whoDrives < instrument, "who-drives comes before instrument");
-  assert.match(p, /user drives \/ you drive \/ QA is skipped/);
-  assert.match(p, /Never guess at auth/);
+  assert.ok(whoDrives < instrument, "the question comes before instrumenting");
+  // The three answers, and the fact that the gate enforces the question.
+  assert.match(p, /You verify it/);
+  assert.match(p, /I'll verify it myself/);
+  assert.match(p, /Skip QA/);
+  assert.match(p, /REFUSED until it has been answered/);
+  // Asked once, and then the pass RUNS — it does not keep asking permission.
+  assert.match(p, /Asked ONCE PER RUN/);
+  assert.match(p, /do NOT ask permission to/);
   assert.match(p, /hands back to write_edit WITH this evidence/);
 });
 

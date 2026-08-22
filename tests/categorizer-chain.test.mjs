@@ -50,7 +50,7 @@ const toolMsg = (calls, model) => ({
  * Records every user-facing opening message per categorizer for context-passing
  * assertions.
  */
-function graphBridge({ target, verdict = "pass", planApproval, writeModel } = {}) {
+function graphBridge({ target, verdict = "pass", planApproval, writeModel, stallWrite = false } = {}) {
   const llm = new OpenRouterBridge();
   llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text"] });
   const seen = { openings: [], routerReplies: [], turns: {}, summaryPrompt: "", doubtPrompts: [] };
@@ -115,6 +115,13 @@ function graphBridge({ target, verdict = "pass", planApproval, writeModel } = {}
       }
       if (n === 2) {
         yield { type: "done", message: toolMsg([["w1", "write", { path: target, content: "fixed\n" }]]) };
+        return;
+      }
+      if (stallWrite && n >= 3) {
+        // The field shape: after a SUCCESSFUL edit, the driver reaches for
+        // browser tools this pass does not hold. Every call fails; three
+        // turns of it stall the loop.
+        yield { type: "done", message: toolMsg([[`bad${n}`, "browser_navigate", { url: target }]]) };
         return;
       }
       if (n === 3) {
@@ -187,6 +194,43 @@ test("the chain walks read → write_edit → activity_inspect → summarise", a
   assert.equal(result.steps.length, 1);
   assert.equal(result.steps[0].isCompleted, true);
   assert.equal(result.planSet.plans[0].tasks[0].isCompleted, true);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("a stalled write hop does not kill the run — routing continues, the change still gets verified", async () => {
+  // From the field: the write hop landed both edits, then spent three turns
+  // calling browser tools it did not hold; the stall guard stopped the loop and
+  // the chain ABORTED on the error — FLOOR 0 never forced the inspect pass, and
+  // the run ended failed-and-unverified purely because its author dithered
+  // after finishing. A stall means "this hop stopped early", not "the run is
+  // broken": record it, drop the stalled driver's nominations, keep routing.
+  const { dir, target, seen, orch } = await graphSetup({ stallWrite: true });
+  const result = await orch.run("fix the service");
+
+  // The stall is honestly reported…
+  assert.match(result.error ?? "", /^loop stalled/);
+  // …but the write LANDED…
+  assert.equal(await fs.readFile(target, "utf8"), "fixed\n");
+  // …and the chain still walked into verification and summarised.
+  assert.ok(seen.turns.activity_inspect >= 1, "the inspect hop ran after the stall");
+  assert.equal(result.verified, true, "the inspect verdict still reaches the result");
+  assert.ok(result.summary, "a closing summary is still produced");
+  assert.ok(
+    orch.logStore.search({ anyTags: ["categorizer:hop-stalled"] }).length >= 1,
+    "the early stop is logged, not silent",
+  );
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("a fatal hop error still ends the run", async () => {
+  const { dir, seen, orch } = await graphSetup();
+  // Transport death mid-hop: nothing to continue WITH.
+  orch.llm.stream = async function* () {
+    throw new Error("OpenRouter stream failed (500)");
+  };
+  const result = await orch.run("fix the service");
+  assert.match(result.error ?? "", /stream failed \(500\)/);
+  assert.equal(seen.turns.activity_inspect ?? 0, 0, "no routing past a fatal error");
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -383,4 +427,93 @@ test("a custom setup with a deploy category joins the graph", async () => {
   const setup = createCategorizerSetup({ categories: createDefaultCategorizers() });
   const setupWithDeploy = createCategorizerSetup({ categories: [...createDefaultCategorizers(), deploy] });
   assert.equal(setupWithDeploy.categories.length, setup.categories.length + 1);
+});
+
+test("the read step's comprehension is handed to the next hop at hop START, not on re-read", async () => {
+  // The field failure: a later hop saw at most a 700-char digest of the read
+  // step's analyses; the FULL analysis entered its context only when it re-read
+  // the file — so the reproduce hop re-read everything the read pass had
+  // already covered. The opening message now carries the analyses for the
+  // files the read deliverable names, stamped as already-emitted for the hop.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "chain-comp-handoff-"));
+  const target = path.join(dir, "svc.ts");
+  await fs.writeFile(
+    target,
+    Array.from({ length: 60 }, (_, i) => `export function fn${i}(a, b) { return acquire(a) ? release(b, ${i}) : retry(a, b); }`).join("\n"),
+    "utf8",
+  );
+
+  const MAP_LINE = "3-58: fn0..fn57, acquire/release/retry helpers taking (a, b); state: none.";
+  const ANALYSIS = `PART 1 — nothing beyond the driver's reasoning.\nPART 2 — THE MAP\n${MAP_LINE}`;
+  const llm = new OpenRouterBridge();
+  llm.resolveModel = (slug) => ({ id: slug, openRouterSlug: slug, input: ["text"] });
+  const seen = { openings: [] };
+  let routerCalls = 0;
+  let readTurn = 0;
+  llm.complete = async (model, ctx) => {
+    const sys = ctx.systemPrompt ?? "";
+    if (/CATEGORIZER ROUTER/.test(sys)) {
+      routerCalls += 1;
+      const order = ["read", "write_edit", "summarise"];
+      return msg([{ type: "text", text: `CATEGORY: ${order[Math.min(routerCalls - 1, order.length - 1)]}` }]);
+    }
+    if (/judge how hard a source file/i.test(sys)) return msg([{ type: "text", text: "RATING: high | WHY: dense control flow" }]);
+    if (/stronger model in a two-stage read/.test(sys)) return msg([{ type: "text", text: ANALYSIS }]);
+    if (/closing summary/.test(sys)) return msg([{ type: "text", text: "Done." }]);
+    return msg([{ type: "text", text: "ok" }]);
+  };
+  llm.stream = async function* (model, ctx) {
+    const sys = ctx.systemPrompt ?? "";
+    const opening = ctx.messages?.[0]?.content;
+    if (typeof opening === "string") seen.openings.push({ sys, opening });
+    yield { type: "start", partial: msg([]) };
+    if (/READ categorizer/.test(sys)) {
+      readTurn += 1;
+      yield readTurn === 1
+        ? { type: "done", message: toolMsg([["r1", "read", { path: target }]]) }
+        : {
+            type: "done",
+            message: toolMsg([["d1", "deliver", {
+              files: [{ path: target, role: "target", lines: "3-58", snippet: "export function fn0" }],
+              codeSummary: "acquire/release helpers",
+            }]]),
+          };
+      return;
+    }
+    if (/WRITE\/EDIT categorizer/.test(sys)) {
+      yield {
+        type: "done",
+        message: toolMsg([["d2", "deliver", {
+          writes: [{ tool: "edit", path: target, summary: "tuned" }], notes: "done",
+        }]]),
+      };
+      return;
+    }
+    yield { type: "done", message: msg([{ type: "text", text: "ok" }]) };
+  };
+
+  // A real host passes a candidate pool so the staged read escalates to a
+  // STRONGER model; without one the tier fallback equals the reader and
+  // comprehension is skipped by design ("nothing to escalate TO").
+  const orch = new Orchestrator({
+    cwd: dir, llm,
+    registry: withBuiltins(),
+    permission: new PermissionGate("bypass"),
+    logStore: new LogStore(),
+    toolModelCandidates: ["test/weak", "test/strong"],
+  });
+  const result = await orch.run("tune the helpers");
+  assert.equal(result.success, true, `error=${result.error}`);
+
+  const byCat = {};
+  for (const o of seen.openings) {
+    if (/READ categorizer/.test(o.sys)) byCat.read = o.opening;
+    if (/WRITE\/EDIT categorizer/.test(o.sys)) byCat.write = o.opening;
+  }
+  assert.ok(byCat.read && !byCat.read.includes("WHOLE-FILE ANALYSES"), "the read hop itself starts fresh");
+  assert.match(byCat.write, /WHOLE-FILE ANALYSES YOU ALREADY HOLD/);
+  assert.ok(byCat.write.includes(MAP_LINE), "the full analysis text travels in the opening");
+  assert.match(byCat.write, /rated high/);
+  assert.match(byCat.write, /Do NOT read them again to understand/);
+  await fs.rm(dir, { recursive: true, force: true });
 });

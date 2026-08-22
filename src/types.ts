@@ -682,6 +682,13 @@ export interface AgentTool<
    */
   categorizers?: string[];
   /**
+   * The id of the provider this tool came from, stamped by the registry at
+   * registration. Lets consumers (e.g. the chain's QA-surface gating) identify
+   * a tool's ORIGIN — which MCP server, which builtin — instead of guessing
+   * from name prefixes.
+   */
+  providerId?: string;
+  /**
    * A terminal tool ENDS its loop once it executes successfully — the tool-call
    * turn completes (every call in the turn keeps its result), then the loop stops
    * instead of prompting another turn. This is how a categorizer's `deliver`

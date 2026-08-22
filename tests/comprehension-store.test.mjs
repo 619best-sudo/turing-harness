@@ -429,3 +429,122 @@ test("the read-completion nudge fires once the loop has read many distinct files
   assert.equal(result.error, undefined);
   await fs.rm(tmp, { recursive: true, force: true });
 });
+
+test("a QA hop that keeps reading after the nudge hits the read-spiral fence and stops named", async () => {
+  // The field run: the reproduce hop read 6 files, got the RUN IT nudge, read
+  // four MORE, never launched, never drove, never delivered — and ground to a
+  // derived fallback 18 minutes in. Past the fence note, exploration-only
+  // turns end the hop with the reason named.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "qa-read-spiral-"));
+  const files = [];
+  for (let i = 0; i < 14; i++) {
+    const f = path.join(tmp, `f${i}.js`);
+    await fs.writeFile(f, complexSource(), "utf8");
+    files.push(f);
+  }
+  const store = new ComprehensionStore();
+  const llm = new OpenRouterBridge();
+  llm.complete = async (model) => ({
+    role: "assistant",
+    content: [{ type: "text", text: "RATING: high | WHY: concurrency" }],
+    model: model.openRouterSlug ?? model.id, api: "openrouter", provider: "test",
+    usage: zeroUsage(), stopReason: "stop", timestamp: 0,
+  });
+  const completionNotes = [];
+  const fenceNotes = [];
+  let turn = 0;
+  llm.stream = async function* (model, ctx) {
+    yield { type: "start", partial: msg([]) };
+    turn += 1;
+    // Reads a NEW file every turn — the spiral the fence exists for.
+    yield {
+      type: "done",
+      message: msg(
+        [{ type: "toolCall", id: `r${turn}`, name: "read", arguments: { path: files[Math.min(turn - 1, files.length - 1)] } }],
+        "tool_use",
+      ),
+    };
+    for (const m of ctx.messages) {
+      const text = Array.isArray(m.content) ? m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") : "";
+      if (text.includes("distinct files this step")) completionNotes.push(text);
+      if (text.includes("reading is DONE for this hop")) fenceNotes.push(text);
+    }
+  };
+  const reg = new Registry();
+  registerBuiltins(reg, { logStore: new LogStore() });
+  const result = await runToolLoop({
+    task: "t", userMessage: "go", tools: reg.allTools(),
+    model: { id: "x", openRouterSlug: "x" }, llm,
+    permission: new PermissionGate("ask-all", async () => ({ allowed: true })),
+    logStore: new LogStore(), emit: () => {}, cwd: tmp,
+    toolModelCandidates: [CHEAP, STRONG], sharedComprehension: store,
+    label: "categorizer:activity_reproduce", phase: "activity_reproduce",
+  });
+  assert.match(String(result.error), /QA_READ_SPIRAL/, "the spiral is named, not a silent end");
+  assert.match(String(result.error), /10 files|kept reading/);
+  // The scans above see the whole cumulative context each turn, so a pushed
+  // note repeats in later scans — count DISTINCT texts, not occurrences.
+  assert.equal(new Set(completionNotes).size, 1, "the RUN IT nudge fired once");
+  assert.equal(new Set(fenceNotes).size, 1, "the fence note fired once");
+  assert.match(fenceNotes[0], /Exactly three exits/);
+  assert.match(fenceNotes[0], /reproduced: false/, "the honest exit is named");
+  await fs.rm(tmp, { recursive: true, force: true });
+});
+
+test("preComprehended seeding arms the re-visit advisor on a hop's FIRST re-read", async () => {
+  // The hop-start handover injects the read step's analyses into the next
+  // hop's opening message and passes their paths as `preComprehended`. Without
+  // the seeding, the advisor could only fire from a hop's SECOND read of a
+  // file (its own first read is what emits the analysis into the loop) — so
+  // the hop-start-injected files were exactly the ones it never covered.
+  const { dir, file } = await tmpFile("queue.js", complexSource());
+  const store = new ComprehensionStore();
+  const { llm } = makeBridge();
+  llm.stream = async function* () {
+    yield { type: "start", partial: msg([]) };
+    yield { type: "done", message: msg([{ type: "toolCall", id: "a1", name: "read", arguments: { path: file } }], "tool_use") };
+  };
+
+  // Loop A (the read hop): reads and comprehends the file for real.
+  await runToolLoop({
+    task: "t", userMessage: "go", tools: [readTool],
+    model: { id: "x", openRouterSlug: "x" }, llm,
+    permission: new PermissionGate("ask-all", async () => ({ allowed: true })),
+    logStore: new LogStore(), emit: () => {}, cwd: dir,
+    toolModelCandidates: [CHEAP, STRONG], sharedComprehension: store,
+    label: "categorizer:read", phase: "read",
+  });
+  assert.ok(store.recall(file)?.analysis, "loop A comprehended the file");
+
+  // Loop B (a later hop) whose model re-reads the file on its FIRST turn.
+  const seenNotes = [];
+  let turn = 0;
+  const llmB = new OpenRouterBridge();
+  llmB.stream = async function* (model, ctx) {
+    yield { type: "start", partial: msg([]) };
+    turn += 1;
+    if (turn === 1) {
+      yield { type: "done", message: msg([{ type: "toolCall", id: "r1", name: "read", arguments: { path: file } }], "tool_use") };
+    } else {
+      for (const m of ctx.messages) {
+        const text = Array.isArray(m.content) ? m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") : "";
+        if (text.includes("you already read") || text.includes("whole-file expert analysis")) seenNotes.push(text);
+      }
+      yield { type: "done", message: msg([{ type: "text", text: "done." }]) };
+    }
+  };
+  await runToolLoop({
+    task: "t", userMessage: "go", tools: [readTool],
+    model: { id: "x", openRouterSlug: "x" }, llm: llmB,
+    permission: new PermissionGate("ask-all", async () => ({ allowed: true })),
+    logStore: new LogStore(), emit: () => {}, cwd: dir,
+    toolModelCandidates: [CHEAP, STRONG], sharedComprehension: store,
+    label: "categorizer:activity_reproduce", phase: "activity_reproduce",
+    preComprehended: [file],
+  });
+  assert.ok(
+    seenNotes.some((t) => /already read .* in full|whole-file expert analysis/.test(t)),
+    "the advisor fires on the hop's first re-read of an injected file",
+  );
+  await fs.rm(dir, { recursive: true, force: true });
+});

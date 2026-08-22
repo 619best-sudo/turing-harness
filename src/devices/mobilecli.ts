@@ -478,12 +478,10 @@ async function parseRawUi(device: string): Promise<ParsedUi | undefined> {
  * avatar (72x40, unlabeled), and a vision estimate landing between them is
  * nearer to the row. Snapping to a full-width row taps its centre — the middle
  * of the screen — instead of the control the model asked for.
+ *
+ * (The implementation is the exported {@link isControlSized} next to the tap
+ * fusion; this comment is the field record that motivated it.)
  */
-function isControlSized(t: MobileCliTarget, screen: { width: number; height: number }): boolean {
-  return (
-    t.rect.width <= screen.width * 0.6 && t.rect.width * t.rect.height <= screen.width * screen.height * 0.15
-  );
-}
 
 export interface MobileCliElement {
   type: string;
@@ -698,6 +696,8 @@ export function screenSignature(elements: readonly MobileCliElement[]): string {
  */
 export type TapConfidence =
   | "corroborated" // vision landed inside the element the description matched
+  | "box-overlap" // the vision BOX overlaps this element the most — measured centre
+  | "box-in-wrapper" // the box overlaps only a big wrapper; the estimate point is tapped, clamped inside it
   | "vision-in-element" // vision landed inside SOME element; its rect gives the exact centre
   | "element-only" // no usable vision; the element tree answered
   | "vision-only" // nothing in the tree here (canvas, WebView, custom-drawn)
@@ -716,9 +716,17 @@ export interface TapResolution {
 export interface VisionChannel {
   /** Logical-point estimate, already converted from image pixels. */
   point?: { x: number; y: number };
+  /**
+   * Logical-rect estimate when the localizer answered with a BOUNDING BOX.
+   * Boxes are the preferred currency: they survive the localizer's measured
+   * vertical bias (a box 90pt low still overlaps the true control heavily,
+   * while a point 90pt low misses it), and they carry the SIZE that separates
+   * "the control" from "the wrapper around it" in the overlap fusion.
+   */
+  box?: { x: number; y: number; width: number; height: number };
   /** The raw image-pixel estimate, for the transcript. */
   imagePoint?: { x: number; y: number };
-  /** Why it is unavailable, when `point` is absent. */
+  /** Why it is unavailable, when `point`/`box` are absent. */
   unavailable?: string;
 }
 
@@ -726,10 +734,12 @@ export interface VisionChannel {
 export interface ElementChannel {
   /** The element whose label matched the description, if any. */
   matched?: MobileCliTarget;
-  /** Every on-screen element, for containment testing against the vision point. */
+  /** Every on-screen element, for containment and overlap testing. */
   all: readonly MobileCliTarget[];
   /** Why it is unavailable, when the tree could not be read. */
   unavailable?: string;
+  /** The screen, for bias-scaled tolerances and wrapper clamping. */
+  screen?: { width: number; height: number };
 }
 
 /** The innermost element containing a point — the smallest wins. */
@@ -744,6 +754,97 @@ function elementContaining(
     if (!best || r.width * r.height < best.rect.width * best.rect.height) best = t;
   }
   return best;
+}
+
+/** Intersection area of two rects (0 when disjoint). */
+function overlapArea(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+): number {
+  const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+/**
+ * Rank elements by how much of the SMALLER rect the vision box covers.
+ *
+ * The asymmetric normalizer is the whole trick. Raw intersection area favors
+ * big elements (a full-width row overlaps everything); dividing by the SMALLER
+ * area asks "is one of these essentially inside the other?", which is exactly
+ * the question when a box estimate must identify an unlabeled control. The
+ * measured vertical bias (resolveTap's header) shifts a box down by up to
+ * ~10% of the screen — overlap survives that; point containment does not.
+ */
+export function rankByOverlap(
+  box: { x: number; y: number; width: number; height: number },
+  elements: readonly MobileCliTarget[],
+): Array<{ el: MobileCliTarget; score: number }> {
+  const boxArea = Math.max(1, box.width * box.height);
+  return elements
+    .map((el) => {
+      const inter = overlapArea(box, el.rect);
+      const score = inter / Math.min(boxArea, Math.max(1, el.rect.width * el.rect.height));
+      return { el, score };
+    })
+    // Score desc; ties go to the SMALLER element — a wrapper that fully
+    // contains the box scores 1.0, and so does the control the box actually
+    // names; the control is the more specific answer to "what did vision mean".
+    .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.el.rect.width * a.el.rect.height - b.el.rect.width * b.el.rect.height));
+}
+
+/**
+ * Is this node a plausible CONTROL rather than a row/section/container?
+ * Exported for the fusion, which must never move a tap to a wrapper's centre.
+ */
+export function isControlSized(
+  t: { rect: { width: number; height: number } },
+  screen: { width: number; height: number },
+): boolean {
+  return (
+    t.rect.width <= screen.width * 0.6 && t.rect.width * t.rect.height <= screen.width * screen.height * 0.15
+  );
+}
+
+/** Clamp a point into a rect with a small inset, so it stays tappable. */
+function clampInto(
+  p: { x: number; y: number },
+  r: { x: number; y: number; width: number; height: number },
+): { x: number; y: number } {
+  const inset = Math.min(6, r.width / 4, r.height / 4);
+  return {
+    x: Math.round(Math.min(Math.max(p.x, r.x + inset), r.x + r.width - inset)),
+    y: Math.round(Math.min(Math.max(p.y, r.y + inset), r.y + r.height - inset)),
+  };
+}
+
+/**
+ * Bias-tolerant containment: the point itself, then the point walked UP in
+ * measured-bias steps.
+ *
+ * Why UP, in steps, and only into control-sized elements: the localizer's
+ * vertical error is one-directional in every measurement this codebase has
+ * (short by 47-90 logical pt on a phone screen — see resolveTap's header), so
+ * the true control sits ABOVE a missing estimate, not below it. The steps are
+ * small and ordered, so the closest recovery wins. Rows and wrappers are
+ * excluded as recovery targets because landing in one relocates the tap to its
+ * centre — the exact wrong-tap shape the wrapper guard exists to prevent.
+ */
+function containingWithBias(
+  point: { x: number; y: number },
+  all: readonly MobileCliTarget[],
+  screen: { width: number; height: number } | undefined,
+): { el: MobileCliTarget; shiftedBy: number } | undefined {
+  const direct = elementContaining(point, all);
+  if (direct) return { el: direct, shiftedBy: 0 };
+  if (!screen) return undefined;
+  const controlSized = all.filter((t) => isControlSized(t, screen));
+  for (const frac of [0.03, 0.06, 0.1]) {
+    const dy = Math.round(screen.height * frac);
+    const shifted = elementContaining({ x: point.x, y: point.y - dy }, controlSized);
+    if (shifted) return { el: shifted, shiftedBy: dy };
+  }
+  return undefined;
 }
 
 function describe(t: MobileCliTarget): string {
@@ -779,12 +880,15 @@ function describe(t: MobileCliTarget): string {
 export function resolveTap(vision: VisionChannel, elements: ElementChannel): TapResolution | undefined {
   const steps: string[] = [];
   const matched = elements.matched;
-  const visionPoint = vision.point;
+  const visionPoint = vision.point ?? (vision.box ? { x: vision.box.x + vision.box.width / 2, y: vision.box.y + vision.box.height / 2 } : undefined);
+  const screen = elements.screen;
 
   steps.push(
-    visionPoint
-      ? `- Vision: ${vision.imagePoint ? `image (${vision.imagePoint.x}, ${vision.imagePoint.y}) → ` : ""}logical (${visionPoint.x}, ${visionPoint.y})`
-      : `- Vision: unavailable — ${vision.unavailable ?? "no estimate"}`,
+    vision.box
+      ? `- Vision box (logical): ${Math.round(vision.box.width)}x${Math.round(vision.box.height)} at (${Math.round(vision.box.x)}, ${Math.round(vision.box.y)})`
+      : visionPoint
+        ? `- Vision: ${vision.imagePoint ? `image (${vision.imagePoint.x}, ${vision.imagePoint.y}) → ` : ""}logical (${visionPoint.x}, ${visionPoint.y})`
+        : `- Vision: unavailable — ${vision.unavailable ?? "no estimate"}`,
   );
   steps.push(
     matched
@@ -794,17 +898,18 @@ export function resolveTap(vision: VisionChannel, elements: ElementChannel): Tap
         : `- Elements: ${elements.all.length} on screen, none matched the description`,
   );
 
-  // Both channels answered. This is where the corroboration happens.
+  // Both channels answered by identity. This is where the corroboration happens.
   if (visionPoint && matched) {
     const r = matched.rect;
     const inside =
-      visionPoint.x >= r.x && visionPoint.x <= r.x + r.width && visionPoint.y >= r.y && visionPoint.y <= r.y + r.height;
+      (vision.box ? overlapArea(vision.box, r) > 0 : false) ||
+      (visionPoint.x >= r.x && visionPoint.x <= r.x + r.width && visionPoint.y >= r.y && visionPoint.y <= r.y + r.height);
     if (inside) {
       steps.push(`- Agreed: the vision estimate falls inside the matched element — tapping its exact centre.`);
       return { point: matched.center, confidence: "corroborated", steps, conflicted: false };
     }
     // They disagree. The label match is a MEASURED identity while the vision
-    // point is an estimate with a known vertical bias, so the element wins —
+    // estimate is an estimate with a known vertical bias, so the element wins —
     // but the conflict is reported rather than hidden, because the other
     // possibility is that the description matched the wrong label.
     const alt = elementContaining(visionPoint, elements.all);
@@ -816,26 +921,119 @@ export function resolveTap(vision: VisionChannel, elements: ElementChannel): Tap
     return { point: matched.center, confidence: "conflict", steps, conflicted: true };
   }
 
-  // Vision only. Either the tree is empty here, or nothing matched by label.
-  // Snap onto whatever element the estimate landed in — that converts a rough
-  // point into an exact centre without needing a label at all, which is how an
+  // ---- BOX fusion: overlap identifies the element, no label needed ----------
+  // The box is the preferred currency (see VisionChannel.box). Overlap ranks
+  // every element — labelled or not — by how much of the smaller rect the box
+  // covers. The box is also tried LIFTED by the localizer's measured vertical
+  // bias steps (3%/6%/10% of the screen, one-directional, always short): an
+  // 80pt-low box has ZERO overlap with a 44pt icon no matter the normaliser,
+  // while the lifted box sits on it exactly — same recovery the point path
+  // gets, applied before ranking instead of after it fails.
+  if (vision.box) {
+    const shifts = screen ? [0, 0.03, 0.06, 0.1].map((f) => Math.round(screen.height * f)) : [0];
+    let best: { el: MobileCliTarget; score: number } | undefined;
+    let next: { el: MobileCliTarget; score: number } | undefined;
+    let effectiveBox = vision.box;
+    for (const dy of shifts) {
+      const shifted = { ...vision.box, y: vision.box.y - dy };
+      const ranked = rankByOverlap(shifted, elements.all);
+      const [b, n] = ranked;
+      if (b && (!best || b.score > best.score)) {
+        best = b;
+        next = n;
+        effectiveBox = shifted;
+      }
+    }
+    const boxCenter = { x: effectiveBox.x + effectiveBox.width / 2, y: effectiveBox.y + effectiveBox.height / 2 };
+    // "Clear" means an unambiguous CONTROL. A wrapper scoring as high as the
+    // control does not make it ambiguous — any box inside a row's x-span
+    // overlaps the row completely, so wrapper containment is geometrically
+    // inevitable and carries no identity signal at all. Only a comparable
+    // CONTROL-class rival makes the answer genuinely ambiguous.
+    const clear =
+      !!best && best.score >= 0.35 && isControlSized(best.el, screen ?? { width: Infinity, height: Infinity }) &&
+      (!next || next.score < best.score * 0.75 || !isControlSized(next.el, screen ?? { width: Infinity, height: Infinity }));
+    if (best && best.score > 0 && screen) {
+      if (clear && isControlSized(best.el, screen)) {
+        steps.push(
+          `- Identified by overlap: the box${effectiveBox.y < vision.box.y ? ` (raised ${Math.round(vision.box.y - effectiveBox.y)}pt — the localizer's measured vertical bias)` : ""} ` +
+            `covers ${Math.round(best.score * 100)}% of ${describe(best.el)}${best.el.label ? "" : " (no label — identified by geometry alone)"} — tapping its exact centre.`,
+        );
+        return { point: best.el.center, confidence: "box-overlap", steps, conflicted: false };
+      }
+      if (best.score >= 0.35 && next && !isControlSized(best.el, screen) && isControlSized(next.el, screen) && next.score >= best.score * 0.5) {
+        // The top hit is a wrapper and a control-sized element sits just behind
+        // it: the wrapper's overlap is inflated by its size, not by identity.
+        // Prefer the control — the wrapper guard below explains why its own
+        // centre must never be tapped.
+        steps.push(
+          `- Identified by overlap: the box sits inside ${describe(best.el)} but covers ${Math.round(next.score * 100)}% of ` +
+            `${describe(next.el)} — the control wins over its container. Tapping the control's centre.`,
+        );
+        return { point: next.el.center, confidence: "box-overlap", steps, conflicted: false };
+      }
+      // Only a WRAPPER-class element overlaps (the control itself has no tree
+      // node). The wrapper's centre is meaningless — tapping it would move the
+      // point away from where the estimate pointed (a trailing icon in a row
+      // would become a tap on the row's middle). Clamp the estimate inside the
+      // wrapper instead: same tappable bounds, no relocation.
+      if (best.score >= 0.35 && !isControlSized(best.el, screen)) {
+        const p = clampInto(boxCenter, best.el.rect);
+        steps.push(
+          `- Overlap is a wrapper (${describe(best.el)}), not a control — tapping the estimate itself ` +
+            `(clamped inside the wrapper to (${p.x}, ${p.y})); the wrapper's centre is NOT the target.`,
+        );
+        return { point: p, confidence: "box-in-wrapper", steps, conflicted: false };
+      }
+    }
+    // No usable overlap: fall through to the point path.
+  }
+
+  // Vision only (point currency). Either the tree is empty here, or nothing
+  // matched by label. Snap onto whatever element the estimate identifies —
+  // directly, or through the measured vertical bias — which is how an
   // unlabeled avatar or a bare GestureDetector becomes reachable.
   if (visionPoint) {
-    const container = elementContaining(visionPoint, elements.all);
-    if (container) {
+    const biased = containingWithBias(visionPoint, elements.all, screen);
+    if (biased) {
+      const { el, shiftedBy } = biased;
+      if (screen && !isControlSized(el, screen)) {
+        // The smallest containing element is a wrapper: its centre is not the
+        // target (a trailing icon in a full-width row would become a tap on
+        // the row's middle). The estimate pointed somewhere real — keep it,
+        // clamped into the wrapper's tappable bounds.
+        const p = clampInto(visionPoint, el.rect);
+        steps.push(
+          `- Estimate lands in ${describe(el)} — a wrapper, not a control — so the estimate is tapped ` +
+            `(clamped to (${p.x}, ${p.y})); the wrapper's centre is NOT the target.`,
+        );
+        return { point: p, confidence: "box-in-wrapper", steps, conflicted: false };
+      }
       // IDENTIFICATION BY POSITION. The element has no usable label, so it
       // could never be found by description — but the estimate landed inside
-      // it, which identifies it just as well. Vision says WHICH, the rect says
-      // WHERE, and the exact centre beats the estimate that found it.
+      // it (possibly after the measured-bias correction), which identifies it
+      // just as well. Vision says WHICH, the rect says WHERE, and the exact
+      // centre beats the estimate that found it.
       steps.push(
-        `- Identified by position: the estimate lands inside ${describe(container)}` +
-          `${container.label ? "" : " (no label — identified only because the estimate is inside it)"}` +
-          ` — tapping its exact centre.`,
+        `- Identified by position: the estimate${shiftedBy ? ` (raised ${shiftedBy}pt — the localizer's measured vertical bias)` : ""} ` +
+          `lands inside ${describe(el)}${el.label ? "" : " (no label — identified only because the estimate is inside it)"} — tapping its exact centre.`,
       );
-      return { point: container.center, confidence: "vision-in-element", steps, conflicted: false };
+      return { point: el.center, confidence: "vision-in-element", steps, conflicted: false };
     }
-    const snapped = snapToTarget(visionPoint, elements.all);
+    const snapMax = screen ? Math.max(60, Math.round(screen.height * 0.1)) : 60;
+    const snapped = snapToTarget(visionPoint, elements.all, snapMax);
     if (snapped) {
+      if (screen && !isControlSized(snapped, screen)) {
+        // Same wrapper guard as the containment path: a proximity snap onto a
+        // row would tap the row's CENTRE — the middle of the screen — when the
+        // estimate pointed somewhere specific inside it. Clamp instead.
+        const p = clampInto(visionPoint, snapped.rect);
+        steps.push(
+          `- Nearest unlabeled node is a wrapper (${describe(snapped)}) — tapping the estimate itself ` +
+            `(clamped to (${p.x}, ${p.y})); the wrapper's centre is NOT the target.`,
+        );
+        return { point: p, confidence: "box-in-wrapper", steps, conflicted: false };
+      }
       steps.push(
         `- Identified by proximity: nearest unlabeled control is ${describe(snapped)} — tapping its exact centre.`,
       );

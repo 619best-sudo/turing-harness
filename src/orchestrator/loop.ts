@@ -57,7 +57,7 @@ import type { Registry } from "../registry/registry.js";
 import { isMalformedToolArgs, MALFORMED_TOOL_ARGS_KEY } from "../llm/bridge.js";
 import { PermissionGate } from "./permission.js";
 import { StallGuard, STEP_BUDGET_EXHAUSTED } from "./stall-guard.js";
-import { ClarifyGate, normalizeQuestion } from "./clarify-gate.js";
+import { ClarifyGate, normalizeQuestion, shellAuthoringTarget } from "./clarify-gate.js";
 import { ToolFallbackAdvisor, type FallbackAdvice } from "./tool-fallback.js";
 import { SearchLadderAdvisor, type SearchAdvice } from "./search-ladder.js";
 import {
@@ -246,6 +246,14 @@ export interface ToolLoopInput {
    */
   sharedComprehension?: import("../tools/builtin/comprehension.js").ComprehensionStore;
   /**
+   * Files whose whole-file analyses were ALREADY injected into this loop's
+   * opening message by the chain (the hop-start handover). Seeding
+   * `emittedInThisLoop` with them arms the re-visit advisor from turn one: the
+   * first re-read of such a file is already flagged as redundant, instead of
+   * arming only after the loop itself has emitted the analysis once.
+   */
+  preComprehended?: string[];
+  /**
    * The detected project category, threaded live so the post-Prepare correction
    * is seen here. Drives the non-UI skip: when `"backend"`, the
    * inspiration/design-skill reference ladder is bypassed (no UI to design) and
@@ -353,7 +361,11 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // Characters of history above which the loop summarises its older turns. Env
   // configurable so a host on a small-context model can lower it without a code
   // change; see `resolveCompactionThreshold`.
-  const compactThreshold = input.compactThresholdChars ?? resolveCompactionThreshold();
+  let compactThreshold = input.compactThresholdChars ?? resolveCompactionThreshold();
+  // Retries spent on a request the provider called too large. See the
+  // stream-error branch in the turn loop.
+  let oversizeRetries = 0;
+  const MAX_OVERSIZE_RETRIES = 2;
   const boundedSteps = Number.isFinite(maxSteps);
   const stallGuard = new StallGuard();
   // An unarmed gate by default: without the router's verdict there is nothing to
@@ -372,7 +384,7 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // (as of the end of the previous turn). Snapshot per turn into
   // `preTurnEmitted` so the re-visit advisor never nags the turn that FIRST
   // emitted an analysis.
-  const emittedInThisLoop = new Set<string>();
+  const emittedInThisLoop = new Set<string>(input.preComprehended ?? []);
   // Distinct files read this loop, and whether the "you have read enough —
   // deliver or edit now" nudge has already fired. The comprehension store makes
   // re-reads free, so the thing that still costs is opening NEW files: a driver
@@ -380,6 +392,21 @@ export async function runToolLoop(input: ToolLoopInput): Promise<ToolLoopResult>
   // diminishing returns, and nothing but this nudge tells it so.
   const loopReadFiles = new Set<string>();
   let readCompletionWarned = false;
+  // QA-hop read spiral, stage two. The completion nudge is advice; the field
+  // run it exists for read 4+ MORE files after it and never launched, never
+  // drove, never delivered — 18 minutes of a QA hop doing the read pass's job.
+  // Past the fence below, exploration-only turns end the hop with a named
+  // reason instead of grinding to a derived fallback.
+  let qaReadFenceNoted = false;
+  let qaExplorationTurns = 0;
+  // The window spiral: re-reading ONE file at many offsets never grows the
+  // distinct-file count, so the fence above stays silent while a field run
+  // read a single provider at EIGHT offsets before ever probing. Re-reads of
+  // an already-read file count separately — until the hop ACTS (probes, runs,
+  // drives), because the byte-exact anchor reads for `add_log` come after the
+  // decision and are legitimate.
+  let windowRereads = 0;
+  let sawHopAction = false;
   // When only this many steps remain, inject a system note telling the model to
   // stop calling tools and produce its summary. Graceful wind-down beats a hard
   // cut that leaves the run looking "complete" but unfinished.
@@ -506,6 +533,13 @@ function guessImageMime(p: string): string {
   // the loop finishes the turn (so every toolCall keeps its result — providers
   // reject a dangling call) and then stops instead of prompting another turn.
   let terminatedBy: string | undefined;
+  // Turns that ended in prose with nothing called, while a terminal `deliver`
+  // was still owed. Re-prompted rather than accepted, twice at most — see the
+  // no-tool-call branch in the turn loop.
+  let prematureFinishes = 0;
+  const MAX_PREMATURE_FINISH = 2;
+  /** Has this loop called any tool yet? (Distinguishes "trailed off" from "answered".) */
+  let madeToolCall = false;
 
   // Live UI-emission axes + reasoning effort + driver model (same semantics as
   // the old phase runner: a TOOL decision may flip them for subsequent turns).
@@ -663,6 +697,62 @@ function guessImageMime(p: string): string {
       liveModel = input.model;
 
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
+        // A REQUEST THAT WAS TOO BIG IS NOT A DEAD RUN.
+        //
+        // From the field: a verify hop got the app building on a simulator, then
+        // polled the build log three times, and the next request came back
+        // `OpenRouter stream failed (413): request entity too large`. That ended
+        // the hop, which ended the RUN — after the change had been written, the
+        // user had answered the QA handshake, and the app was actually starting.
+        // Every one of those was thrown away by a failure whose entire remedy is
+        // "send less".
+        //
+        // So: compact hard and retry the same turn. The pre-turn compactor only
+        // fires above its threshold, and 413 says the provider's real limit is
+        // BELOW wherever that threshold sits for this model, so the threshold
+        // comes down for the rest of the loop too. Bounded — after
+        // `MAX_OVERSIZE_RETRIES` the error stands and the run ends as it did
+        // before, with the reason named.
+        if (
+          assistant.stopReason === "error" &&
+          isOversizedRequestError(assistant.errorMessage) &&
+          oversizeRetries < MAX_OVERSIZE_RETRIES
+        ) {
+          oversizeRetries += 1;
+          // Drop the failed assistant turn — it carries no content, and leaving
+          // it in the history is one more message on the retry.
+          if (context.messages[context.messages.length - 1] === assistant) context.messages.pop();
+          const before = historySize(context.messages);
+          compactThreshold = Math.max(MIN_COMPACT_THRESHOLD, Math.floor(before * 0.5));
+          const compaction = await compactHistory({
+            messages: context.messages,
+            llm,
+            model: liveModel ?? input.model,
+            threshold: compactThreshold,
+            ...(signal ? { signal } : {}),
+          });
+          if (compaction.compacted) {
+            context.messages = compaction.messages;
+            usage = addUsage(usage, compaction.usage);
+          }
+          logStore.append({
+            tags: ["loop", "loop:oversized-request"],
+            level: "warn",
+            message:
+              `request rejected as too large (${before.toLocaleString("en-US")} chars of history); ` +
+              `compacted to ${historySize(context.messages).toLocaleString("en-US")} and retrying ` +
+              `(${oversizeRetries}/${MAX_OVERSIZE_RETRIES}, threshold now ${compactThreshold.toLocaleString("en-US")})`,
+            data: { phase: input.phase, ...(input.label ? { label: input.label } : {}) },
+          });
+          emit({ type: "turn_end", message: assistant, toolResults: [] });
+          // Nothing was compacted and nothing can be: retrying the same bytes
+          // would just fail the same way.
+          if (!compaction.compacted && historySize(context.messages) >= before) {
+            error = assistant.errorMessage ?? "request too large and nothing left to compact";
+            break;
+          }
+          continue;
+        }
         error = assistant.errorMessage ?? (assistant.stopReason === "aborted" ? "aborted" : undefined);
         emit({ type: "turn_end", message: assistant, toolResults: [] });
         break;
@@ -671,10 +761,65 @@ function guessImageMime(p: string): string {
 
       const toolCalls = assistant.content.filter((c) => c.type === "toolCall");
       if (toolCalls.length === 0) {
+        // A turn with no tool calls normally means the work is done. In a
+        // CATEGORIZER hop it can also mean the driver never started: the hop
+        // holds a `deliver` tool it must finish through, so prose with nothing
+        // called is a hop that ended before it began.
+        //
+        // From the field, and the reason this exists: FLOOR 0 correctly routed a
+        // finished write pass into `activity_inspect`, the hop opened with 62
+        // tools — and five seconds later it "ended without calling deliver".
+        // Zero tool calls. Every gate in the QA pass keys off a tool call, so
+        // none of them fired: not the handshake that asks the user who does the
+        // QA, not observe-first, not the freshness check. A guard that can only
+        // speak when spoken to cannot bind a model that says nothing.
+        //
+        // So: one re-prompt, naming what the hop still owes, then the loop
+        // continues. Bounded and cheap — after `MAX_PREMATURE_FINISH` it ends as
+        // before and the chain derives its fallback deliverable, which is an
+        // honest empty answer rather than an invented one.
+        const terminalTool = [...toolByName.values()].find((t) => t.terminal)?.name;
+        const isQa = input.phase === "activity_reproduce" || input.phase === "activity_inspect";
+        // Prose IS the answer on the conversational path — one turn, no tools, no
+        // loop, by design. So this only fires where prose cannot be the answer: a
+        // QA hop (whose entire job is evidence about running software), or any hop
+        // that already started calling tools and then trailed off mid-work.
+        const owesDeliver = terminalTool != null && !terminatedBy && (isQa || madeToolCall);
+        if (owesDeliver && prematureFinishes < MAX_PREMATURE_FINISH) {
+          prematureFinishes += 1;
+          const note = isQa
+            ? "NOTE: you ended the turn with prose and called nothing, and this categorizer's work has " +
+              "not started. Do STEP 0 now: ONE `ask_user_question` asking the user who runs the " +
+              "software — you do it / they do it themselves / skip this pass — naming the surface you " +
+              "would run and what you would look at, so one click settles it. Their answer decides what " +
+              "happens next: you drive it, or you ask them for the capture/log and judge that, or you " +
+              "`deliver` the honest empty result saying it was skipped at their request. Analysis in " +
+              "prose is not any of those three, and it is not what this categorizer is for."
+            : "NOTE: you ended the turn with prose and called nothing, but this categorizer finishes " +
+              `through \`${terminalTool}\` — a text reply is not a handoff, and the chain cannot pass ` +
+              "prose to the next step. Either take the next action the task needs, or call " +
+              `\`${terminalTool}\` now with what you actually have (an honest partial result is a real ` +
+              "answer; an invented one is not).";
+          context.messages.push({
+            role: "user",
+            content: [{ type: "text", text: note }],
+            timestamp: Date.now(),
+          });
+          stallGuard.grantGrace();
+          logStore.append({
+            tags: ["loop", "loop:premature-finish"],
+            level: "warn",
+            message: `hop ended with prose and no tool call before delivering — re-prompted (${prematureFinishes}/${MAX_PREMATURE_FINISH})`,
+            data: { phase: input.phase, ...(input.label ? { label: input.label } : {}) },
+          });
+          emit({ type: "turn_end", message: assistant, toolResults: [] });
+          continue;
+        }
         emit({ type: "turn_end", message: assistant, toolResults: [] });
         break;
       }
 
+      madeToolCall = true;
       const toolResults: Message[] = [];
       for (const call of toolCalls) {
         if (call.type !== "toolCall") continue;
@@ -1035,7 +1180,13 @@ function guessImageMime(p: string): string {
           continue;
         }
         if (!tool) {
-          const missing = makeToolResult(call.id, call.name, unknownToolMessage(call.name, toolByName.keys()), true);
+          const missing = makeToolResult(
+            call.id,
+            call.name,
+            unknownToolMessage(call.name, toolByName.keys()) +
+              surfaceMismatchNote(call.name, input.phase, toolByName.has("drive")),
+            true,
+          );
           context.messages.push(missing);
           toolResults.push(missing);
           logStore.append({
@@ -1098,7 +1249,7 @@ function guessImageMime(p: string): string {
         //      `callImageCount > 0` is the explicit skip of this block.
         //   2. no image, but `inspiration_generator` is registered — auto-invoke
         //      it on the model's behalf. The model is told to call it in the
-        //      prompt, but prompt advice does not bind (see `reproduction-gate.ts`
+        //      prompt, but prompt advice does not bind (see `enforceObserveFirst`
         //      for the same lesson): a rule the model can silently skip is a
         //      suggestion, and the observed failure was UI writes authoring blind
         //      because the model never called the tool. Invoking it here
@@ -1631,6 +1782,42 @@ function guessImageMime(p: string): string {
 
         // ---- success-only handover capture ----
         if (!resultMsg.isError) {
+          // A FILE CHANGED THROUGH THE SHELL IS STILL A CHANGED FILE.
+          //
+          // `writtenPaths` drives everything downstream: the verify floor that
+          // refuses to summarise unlooked-at work, the freshness gate, the
+          // probe strip, the run's own report of what it did. It was fed only by
+          // `write`/`edit`, so a mutation made any other way was invisible —
+          // and a run proved it: the read hop rewrote a Dart source file with a
+          // `python3 -c` script, and the run ended "0 written", unverified, in
+          // the read hop, with the user's code already changed.
+          //
+          // The gates that refuse shell authoring are the first answer and they
+          // all stand down eventually (deliberately — a gate that can wedge a
+          // run is worse than the run). So this is the backstop: whatever the
+          // gates allowed through is at least ON THE RECORD, and the run treats
+          // it as the change it is.
+          const shellAuthored = shellAuthoringTarget(call.name, call.arguments as Record<string, unknown> | undefined);
+          if (shellAuthored) {
+            const abs = path.isAbsolute(shellAuthored.path)
+              ? shellAuthored.path
+              : path.join(cwd, shellAuthored.path);
+            invalidateReadCache(readCache, cwd, abs);
+            ATTACHED_FILE_CONTENTS.delete(normalizeToolPath(cwd, abs));
+            if (!WRITTEN_WITH.has(abs)) {
+              writtenPaths.push(abs);
+              WRITTEN_WITH.add(abs);
+              if (writtenPaths.length > 50) writtenPaths.splice(0, writtenPaths.length - 50);
+              logStore.append({
+                tags: ["loop", "loop:shell-write", "mutation"],
+                level: "warn",
+                message:
+                  `${call.name} changed ${abs} (${shellAuthored.form}) — counted as a write so the run ` +
+                  "verifies it; file changes belong in `write`/`edit`",
+                data: { path: abs, form: shellAuthored.form, ...(input.label ? { label: input.label } : {}) },
+              });
+            }
+          }
           let absPath: string | undefined;
           if (typeof argPath === "string" && argPath.trim()) {
             absPath = path.isAbsolute(argPath) ? argPath : path.join(cwd, argPath);
@@ -1716,9 +1903,18 @@ function guessImageMime(p: string): string {
         // rejects the entire request, killing a browser session on its first
         // screenshot. So a blind model gets a vision model's description instead,
         // and the work continues.
+        //
+        // The DISK gets the full-resolution capture (persistToolImages, below —
+        // it is what media_analysis and the final report read); the CONVERSATION
+        // gets a bounded derivative of it. From the field: a 1206×2622 simulator
+        // screenshot is 1.2-2MB of PNG, ~1.6-2.7MB of base64, and the 1MB-bounded
+        // chat proxy rejected the very next request (413 "request entity too
+        // large") — two runs died on their first capture with the app already
+        // launched. Vision tokens also scale with pixels, so every turn the
+        // original stayed in history re-paid for it. See image-embed.ts.
         const images = resultMsg.content.filter((c) => c.type === "image");
         if (images.length) {
-          // Persist the captures to files and name the paths to the model, so it
+          // Persist the ORIGINALS to files and name the paths to the model, so it
           // can pass them to media_analysis and so the history need not carry the
           // base64 once pruned (the path text is a sibling of the image block and
           // survives pruning). See persistToolImages / buildToolMediaMessage.
@@ -1728,9 +1924,18 @@ function guessImageMime(p: string): string {
             call.id,
             cwd,
           );
+          const embeddable = await downscaleForEmbed(images as ImageContent[], {
+            log: (stat) =>
+              logStore.append({
+                tags: ["loop", "media", "media:compressed"],
+                level: "info",
+                message: `embedded ${stat.after}B JPEG (≤${stat.width}×${stat.height}) of a ${stat.before}B capture`,
+                data: { ...stat, tool: call.name },
+              }),
+          });
           const mediaMsg = await buildToolMediaMessage({
             toolName: call.name,
-            images: images as ImageContent[],
+            images: embeddable,
             model: liveModel,
             llm,
             visionModel: input.visionModel,
@@ -1817,6 +2022,11 @@ function guessImageMime(p: string): string {
       //     to wrap up: deliver what it has (read/investigation) or make the
       //     change (write_edit). A nudge, not a stop — it can still read one
       //     specific file it names.
+      // A QA hop is told to RUN it, never to "make the change": it holds no
+      // write/edit, and on the run this fixes the generic wording landed in
+      // `activity_reproduce` — which then went and authored a fix through a
+      // `python3` heredoc instead of launching the app.
+      const qaHop = input.phase === "activity_reproduce" || input.phase === "activity_inspect";
       if (input.sharedComprehension) {
         const store = input.sharedComprehension;
         // Fold THIS turn's emissions into `emittedInThisLoop` — the NEXT turn's
@@ -1827,6 +2037,7 @@ function guessImageMime(p: string): string {
           const rawPath = (call.arguments as { path?: unknown } | undefined)?.path;
           if (typeof rawPath !== "string" || !rawPath.trim()) continue;
           const file = normalizeToolPath(cwd, rawPath);
+          if (qaHop && !sawHopAction && loopReadFiles.has(file)) windowRereads += 1;
           loopReadFiles.add(file);
           const entry = store.recall(file);
           if (entry?.emittedInLoop === input.label) emittedInThisLoop.add(file);
@@ -1873,11 +2084,6 @@ function guessImageMime(p: string): string {
         }
         if (!readCompletionWarned && loopReadFiles.size >= READ_COMPLETION_THRESHOLD) {
           readCompletionWarned = true;
-          // A QA hop is told to RUN it, never to "make the change": it holds no
-          // write/edit, and on the run this fixes the generic wording landed in
-          // `activity_reproduce` — which then went and authored a fix through a
-          // `python3` heredoc instead of launching the app.
-          const qaHop = input.phase === "activity_reproduce" || input.phase === "activity_inspect";
           const note = qaHop
             ? `NOTE: you have read ${loopReadFiles.size} distinct files this step, and reading is not ` +
               `this categorizer's job — RUN IT. Launch the surface (\`drive\`/\`mobile\`), or the ` +
@@ -1901,6 +2107,82 @@ function guessImageMime(p: string): string {
               (input.phase === "activity_reproduce" || input.phase === "activity_inspect" ? "RUN it" : "deliver or edit"),
             data: { files: loopReadFiles.size, ...(input.label ? { label: input.label } : {}) },
           });
+        }
+      }
+
+      // QA read-spiral fence: the completion nudge above is advice, and a field
+      // run took the advice as optional — four MORE files after it, no launch,
+      // no drive, no deliver, and an 18-minute hop that ended in a derived
+      // fallback. Three extra distinct files past the nudge earns one final
+      // note naming the three real exits; after that, two consecutive turns
+      // that neither run, drive, ask, nor deliver end the hop with the reason
+      // named, so the chain's fallback deliverable says what actually happened
+      // instead of the model's last dangling thought.
+      // Permissive on purpose — anything that runs, drives, asks, instruments
+      // or finishes counts as acting; a false positive only buys the model a
+      // turn, while a false negative would kill a live investigation.
+      const turnActed = turnCalls.some(
+        (c) =>
+          /^(?:deliver|mobile|drive|activity_|browser_|ask_user|add_log|remove_log)/.test(c.name) ||
+          (c.name === "bash" &&
+            typeof (c.arguments as { command?: unknown } | undefined)?.command === "string" &&
+            /\b(?:run|test|serve|start|attach|curl|log|install)\b/i.test(
+              (c.arguments as { command: string }).command,
+            )),
+      );
+      if (turnActed) sawHopAction = true;
+      if (qaHop && readCompletionWarned && !qaReadFenceNoted && (loopReadFiles.size >= READ_COMPLETION_THRESHOLD + 3 || windowRereads >= 4)) {
+        qaReadFenceNoted = true;
+        context.messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                `NOTE: reading is DONE for this hop — ${loopReadFiles.size} files opened and nothing has run. ` +
+                `More source will not reproduce anything. Exactly three exits exist now:\n` +
+                `  1. RUN IT — \`activity_trace_start { startCommand }\` (probe first if the defect is a value ` +
+                `that never arrives), then \`mobile\`/\`drive\` to the symptom, then \`activity_collect\`;\n` +
+                `  2. a WALL you actually met (login/OTP/permission) — \`ask_user_question\` at it;\n` +
+                `  3. \`deliver\` an honest \`reproduced: false\` with what you established.\n` +
+                `Turns that only keep reading will end this hop.`,
+            },
+          ],
+          timestamp: Date.now(),
+        });
+        stallGuard.grantGrace();
+        logStore.append({
+          tags: ["loop", "loop:qa-read-fence"],
+          level: "warn",
+          message: `QA hop read ${loopReadFiles.size} files without running anything; final note issued`,
+          data: { files: loopReadFiles.size, ...(input.label ? { label: input.label } : {}) },
+        });
+      }
+      if (qaHop && qaReadFenceNoted) {
+        // Permissive on purpose — anything that runs, drives, asks or finishes
+        // resets the spiral counter; a false positive only buys the model a
+        // turn, while a false negative would kill a live investigation.
+        const acted = turnCalls.some(
+          (c) =>
+            /^(?:deliver|mobile|drive|activity_|browser_|ask_user)/.test(c.name) ||
+            (c.name === "bash" &&
+              typeof (c.arguments as { command?: unknown } | undefined)?.command === "string" &&
+              /\b(?:run|test|serve|start|attach|curl|log|install)\b/i.test(
+                (c.arguments as { command: string }).command,
+              )),
+        );
+        qaExplorationTurns = acted ? 0 : qaExplorationTurns + 1;
+        if (turnCalls.length > 0 && qaExplorationTurns >= 2) {
+          error =
+            `QA_READ_SPIRAL: the hop opened ${loopReadFiles.size} files and kept reading after being told to ` +
+            `run it — reading is how the READ pass works, not how a defect is reproduced`;
+          logStore.append({
+            tags: ["loop", "loop:qa-read-spiral"],
+            level: "warn",
+            message: error,
+            data: { files: loopReadFiles.size, ...(input.label ? { label: input.label } : {}) },
+          });
+          break;
         }
       }
 
@@ -2435,6 +2717,7 @@ async function persistToolImages(
 
 export { imagePixelDimensions } from "../image-dims.js";
 import { imagePixelDimensions, sniffImageFormat } from "../image-dims.js";
+import { downscaleForEmbed } from "../image-embed.js";
 
 /** A persisted capture: its path and, when readable, its pixel dimensions. */
 interface SavedImage {
@@ -2664,6 +2947,32 @@ const MAX_TOOL_RESULT_CHARS = 24_000;
  * helper `__t` on its own) are vanishingly rare and only cost one extra verify
  * round that finds nothing to strip.
  */
+
+/** Floor for the retry-shrunk compaction threshold — below this there is no run left. */
+const MIN_COMPACT_THRESHOLD = 40_000;
+
+/**
+ * Does this stream error mean "the request was too big", as opposed to something
+ * a retry cannot fix?
+ *
+ * Providers spell it several ways and at two layers: HTTP 413 with "request
+ * entity too large" (the body was rejected before the model saw it) and the
+ * model's own context-window complaint ("maximum context length", "too many
+ * tokens"). Both have the same remedy — send less — and neither is worth losing
+ * a run over. Deliberately narrow: a 400 for a malformed tool call, a 401, a
+ * 429 or a provider outage are NOT this, and retrying them with a smaller
+ * history would just burn the budget more slowly.
+ */
+export function isOversizedRequestError(message: string | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  if (/\b413\b/.test(m)) return true;
+  return (
+    /request entity too large|payload too large|body (?:is )?too large|too large to process/.test(m) ||
+    /(?:maximum|max)\s+context\s+length|context[_ ]length[_ ]exceeded|context window (?:is )?(?:too small|exceeded)/.test(m) ||
+    /too many (?:input )?tokens|prompt is too long|input is too long/.test(m)
+  );
+}
 
 /**
  * Bound one tool result before it becomes a message.
@@ -2898,3 +3207,48 @@ class DOMExceptionLike extends Error {
 
 // Silence the unused-import linter for Complexity (re-exported for callers).
 export type { Complexity };
+
+// ---------------------------------------------------------------------------
+// Unknown-tool coaching for QA-surface names
+// ---------------------------------------------------------------------------
+
+/**
+ * Names a model reaches for when it wants to SEE or DRIVE running software —
+ * the vocabulary of browser/device automation, whether or not such tools are
+ * registered in this loop.
+ */
+const QA_SURFACE_NAME_RE = /^(browser_|playwright|chrome_|devtools_|puppeteer_|selenium_|mobile_|device_|simulator_|take_screenshot|screenshot$)/i;
+
+/**
+ * When a model reaches for a QA-surface tool that this loop does not hold, the
+ * bare "Unknown tool" list is not enough — from a field run: after a successful
+ * edit, the write pass tried `bash({})`, then `playwright(...)`, then
+ * `browser_navigate(...)`, three failed turns, and the stall guard killed the
+ * run before the chain could hand the verification to the pass that DOES hold
+ * the browser. Two directions of coaching:
+ *
+ *  - a WORK pass holding no automation tools: the capability is real, it just
+ *    belongs to the NEXT pass — finish with `deliver` and the chain routes it;
+ *  - a QA pass holding `drive` but not raw `browser_*`: same intent, right
+ *    pass, wrong spelling — name the one-call form.
+ */
+function surfaceMismatchNote(requested: string, phase: string | undefined, hasDrive: boolean): string {
+  if (!QA_SURFACE_NAME_RE.test(requested)) return "";
+  const isQa = phase === "activity_inspect" || phase === "activity_reproduce";
+  if (isQa && hasDrive) {
+    return (
+      "\n\nThis pass drives the browser through `drive`, not raw browser tools — one call per step: " +
+      '`drive {action:"open", url:"…"}` to navigate, `drive {action:"look"}` to see the page ' +
+      '(screenshot + elements), `drive {action:"click", target:"Sign in"}` to act by description.'
+    );
+  }
+  if (!isQa) {
+    return (
+      "\n\nYou are reaching for browser/device automation, which this pass does not hold ON PURPOSE: " +
+      "verifying running software is the NEXT pass's job (activity_inspect). Finish THIS pass — make the " +
+      "change and `deliver` — and the chain will route verification with the right tools. Retrying " +
+      "automation names here will only fail again."
+    );
+  }
+  return "";
+}

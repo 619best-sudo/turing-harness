@@ -112,9 +112,22 @@ test("the default setup is the five categories with the standard graph", () => {
   assert.ok(byId.write_edit.tools.includes("create_plan"));
   assert.ok(byId.write_edit.tools.includes("inspiration_generator"));
 
-  // Per-categorizer model slots are open (unset ⇒ role-slot default).
+  // Per-categorizer model slots are open (unset ⇒ role-slot default), except the
+  // two QA hops, which drive real software (devices, browsers, builds, trace
+  // probes) and pin a driver other than the perform slot's default. The inspect
+  // hop learned this the hard way — on the extra-small driver it answered a
+  // correctly-routed verify hop with prose, called nothing, and every gate in
+  // the pass (all of which key off a tool call) stayed silent. It later pinned
+  // laguna-s, which is TEXT-ONLY: the first screenshot got the whole request
+  // rejected ("No endpoints found that support image input") and the run died
+  // mid-inspect. Both hops now pin mimo-v2.5, which reads images natively
+  // (verified against OpenRouter: ["text","image","audio","video"]).
   for (const c of DEFAULT_CATEGORIZER_SETUP.categories) {
-    assert.equal(c.model, undefined);
+    if (c.id === "activity_reproduce" || c.id === "activity_inspect") {
+      assert.equal(c.model, "xiaomi/mimo-v2.5", `${c.id} pins a vision-capable driver`);
+    } else {
+      assert.equal(c.model, undefined);
+    }
   }
 });
 

@@ -55,9 +55,16 @@ const RATE_SYSTEM = [
 function comprehendSystem(category: ComplexityCategory | undefined): string {
   return [
     "You are the stronger model in a two-stage read. A weaker model has the raw file already,",
-    "so do NOT summarize or restate the code. Contribute ONLY what it is likely to get wrong:",
-    "the invariants that must hold, the non-obvious control flow and coupling, the parts that look",
-    "safe to change but are not, and the specific traps for the stated task.",
+    "but raw bytes are not understanding: your job is to leave behind a MENTAL MODEL of the file",
+    "so complete that later work — a different window of it, a different categorizer that never",
+    "saw it read — can reason about any part of it from YOUR text alone, without re-reading.",
+    "Your output has two parts, in this order:",
+    "",
+    "PART 1 — FINDINGS (task-led, disjoint). What bears on the stated task: where in this file it",
+    "lives (by line), and what would make an edit there go wrong — the invariants that must hold,",
+    "the non-obvious control flow and coupling, the parts that look safe to change but are not,",
+    "the specific traps. If the task names a specific thing, locate that thing — a reader who",
+    "still has to search for it got nothing from you.",
     "",
     // The driver's own reasoning is part of the analyst's input (ComprehendFileInput.
     // driverReasoning). Without being told what it already covered, the analyst
@@ -65,59 +72,70 @@ function comprehendSystem(category: ComplexityCategory | undefined): string {
     // passes over the obvious, and the driver still misses the gaps. The contract
     // below is what makes the escalation COMPENSATE the driver instead of doubling it.
     "THE WEAKER MODEL IS ALSO REASONING ABOUT THIS FILE AS IT READS. Under 'DRIVER'S REASONING'",
-    "below is what it has already worked out about THIS task. Do NOT restate any of it, do NOT",
-    "improve its phrasing, do NOT re-derive the points it already made. Your output must be",
+    "below is what it has already worked out about THIS task. In PART 1 do NOT restate any of it,",
+    "do NOT improve its phrasing, do NOT re-derive the points it already made. PART 1 must be",
     "DISJOINT from its reasoning: the things it got wrong, missed, or cannot see from this file",
-    "alone. If the driver's reasoning already covers everything this file contributes to the",
-    "task, say so in one line ('nothing beyond the driver's reasoning') and stop — an accurate",
-    "one-line close is a better result than a confident review it already has.",
+    "alone. If the driver's reasoning already covers everything the task needs from this file, say",
+    "so in one line ('nothing beyond the driver's reasoning') and move to PART 2.",
+    "",
+    "PART 2 — THE MAP (the durable mental model, task-independent). A walkthrough of the WHOLE",
+    "file, section by section, IN ORDER, each with its EXACT line range and enough detail that a",
+    "reader can answer 'what is happening at lines N-M and why' from the map alone:",
+    "  - every function/class/block: what it does, the state it reads and writes, who calls it",
+    "    (within this file), and what it returns on each distinct path;",
+    "  - the state that persists across them (fields, singletons, caches, streams): where it is",
+    "    set, where it is consumed, and the order things must happen in;",
+    "  - the async/timer/callback skeleton: what fires when, what awaits what, what is",
+    "    fire-and-forget;",
+    "  - the seams to other files: exports consumed elsewhere, imports whose behaviour matters.",
+    "The map restates the FILE, never the driver's reasoning — completeness is the point here.",
+    "This is the part later hops rely on: write it for a reader who will NOT re-read the file.",
     "",
     // Mirrors `systemFor` on the authoring side: interface work gets the interface
     // risks, not the logic enumeration.
     category === "ui" || category === "svg" ? UI_RISK_FOR_COMPREHENSION : CODE_RISK_FOR_COMPREHENSION,
     "",
-    "LEAD WITH THE TASK. When a TASK is given, your FIRST lines must be what bears on THAT change: where in",
-    "this file it lives (by line), and what would make an edit there go wrong. If the task names a specific",
-    "thing, locate that thing — a reader who still has to search for it got nothing from you. Everything else",
-    "is secondary and belongs after it, or nowhere. An accurate audit of code the task does not touch is a",
-    "cost, not a contribution: the reader has to work out that none of it applies to what they asked.",
+    "LEAD WITH THE TASK. PART 1 comes first, and its first lines must be what bears on THAT change.",
+    "An accurate audit of code the task does not touch is a cost, not a contribution: the reader",
+    "has to work out that none of it applies to what they asked.",
     "",
     // The rule above created its own failure mode. Told to lead with the task and
-    // given none, a model does not say so — it picks a plausible feature out of
-    // the file and writes a confident analysis of a change nobody requested. That
+    // given none, a model does not say so — it picks a plausible feature out of the
+    // file and writes a confident analysis of a change nobody requested. That
     // analysis is then appended to the reader's context under a banner calling it
     // authoritative, and the reader goes and works on the invented task.
     "NEVER INVENT THE TASK. If no TASK line appears below, you do not know what is being changed, and you must",
     "not guess one from the file's contents. Do not write a 'TASK:' line of your own, do not open with 'the",
     "user wants to…', and do not pick a feature out of the file and analyse a change to it. With no task,",
-    "report only what is true of the file as it stands — the invariants and the genuinely fragile parts — and",
-    "say nothing about what an edit would do. A confident analysis of a change nobody asked for is the single",
-    "most expensive thing you can return: the reader believes it and acts on it.",
+    "skip PART 1 entirely and report only what is true of the file as it stands — and say nothing about",
+    "what an edit would do. A confident analysis of a change nobody asked for is the single most expensive",
+    "thing you can return: the reader believes it and acts on it.",
     "",
     // The analyst is a chat model; its planning text reaches the caller verbatim
     // unless it is told not to emit any, and a reader cannot tell a model
     // thinking aloud from a model reporting a finding.
     "OUTPUT THE ANALYSIS ONLY. No thinking aloud, no 'let me…', no 'wait, actually…', no restating the task",
     "back to yourself, no closing summary of what you just wrote. The first character of your reply is the",
-    "first character of the analysis.",
+    "first character of PART 1 (or of the map, when there is no task).",
     "",
-    "THE LIST ABOVE IS A SEARCH ORDER, NOT AN OUTLINE. Do not emit a heading per item and do not fill one in",
-    "to be thorough — \"no loops exist in this file\" is not a finding, it is a heading with nothing behind it,",
-    "and it costs the reader the same attention as a real one. Report only what you actually found, in as few",
-    "words as it takes. Three real risks beat seven sections.",
+    "NO EMPTY SECTIONS. PART 1 reports only what you actually found — \"no loops exist in this file\" is not",
+    "a finding, it is a heading with nothing behind it, and it costs the reader the same attention as a",
+    "real one. Three real risks beat seven sections. PART 2, by contrast, is complete by design: a range",
+    "missing from the map is a range the next reader will re-read the file for.",
     "",
-    "PRESENT-TENSE RISKS ONLY. Report what is wrong, fragile or surprising about the code AS IT STANDS, and",
-    "what the stated change would collide with. Do NOT enumerate what would break if someone later removed a",
-    "guard, renamed an export, changed a library's signature or deleted an import that nobody proposed",
-    "touching — that is true of all code and distinguishes nothing. If a risk only exists under a",
-    "hypothetical future edit, leave it out.",
+    "PRESENT-TENSE RISKS ONLY (PART 1). Report what is wrong, fragile or surprising about the code AS IT",
+    "STANDS, and what the stated change would collide with. Do NOT enumerate what would break if someone",
+    "later removed a guard, renamed an export, changed a library's signature or deleted an import that",
+    "nobody proposed touching — that is true of all code and distinguishes nothing. If a risk only exists",
+    "under a hypothetical future edit, leave it out.",
     "",
     "Name only the risks that are REAL in this file — a file with no async and no callers does not need",
     "paragraphs about await and blast radius. Where you cannot see something the reader needs (a caller in",
     "another file, the installed version of a library), say so explicitly and name what they should check.",
-    "CITE EXACT LINE NUMBERS from the numbered source you were given — the reader is looking at those same",
-    "numbers. Never write an approximate or guessed line (\"~150\"); if you are unsure, quote the line's text",
-    "instead. No fences, no preamble.",
+    "CITE EXACT LINE NUMBERS AND RANGES from the numbered source you were given — in BOTH parts, and in the",
+    "map for every section. The reader is looking at those same numbers, and a later reader may hold ONLY",
+    "your map for a range they were handed. Never write an approximate or guessed line (\"~150\"); if you",
+    "are unsure, quote the line's text instead. No fences, no preamble.",
   ].join("\n");
 }
 
@@ -128,19 +146,27 @@ function comprehendSystem(category: ComplexityCategory | undefined): string {
  * stage 1 judged the file beyond the reading model — so the file that most needs
  * explaining was being held to the same budget as the borderline one, and the
  * analysis that came back for a genuinely hard file was truncated exactly where it
- * got interesting. Length follows difficulty: `high` gets room to walk the file,
- * `medium` stays terse because terse is usually enough there.
+ * got interesting.
+ *
+ * The budget grew when the contract gained PART 2 (the map): the analysis is no
+ * longer a risk note the reader supplements by re-reading, it is the mental model
+ * later hops work from — a 250-word ceiling produced a map too thin to answer
+ * "what is happening at lines N-M" without the file, which is the whole reason
+ * the map exists. Length still follows difficulty, and the ceiling is still a
+ * ceiling, not a target.
  */
 const NARRATION_BUDGET: Record<ComplexityRating, string> = {
   low: "Use terse bullets, at most 150 words.",
-  medium: "Use terse bullets, at most 250 words.",
+  medium:
+    "PART 1: terse bullets, at most 200 words. PART 2 (the map): at most 600 words total — " +
+    "one to three lines per section, dense but complete over the file's line ranges.",
   high:
-    "Take the room the FINDINGS need — up to about 700 words, and well under it when there is less to say. " +
-    "This file was rated hard, so explain the parts that are genuinely hard: the invariants, the order " +
-    "things must happen in, and what breaks if they do not. A truncated analysis of a hard file is worse " +
-    "than none, because it reads as if the file were simple — but so is a padded one, which buries the two " +
-    "findings that mattered in five that did not. The budget is a ceiling for a file full of real risk, " +
-    "not a target to reach.",
+    "Take the room the model needs. PART 1: up to about 500 words of findings. PART 2 (the map): up to " +
+    "about 1600 words — this file was rated hard, so walk it properly: every section with its exact line " +
+    "range, the persistent state and its ordering, the async skeleton, the seams. A truncated map of a " +
+    "hard file is worse than none, because the next reader trusts it for a range it never covered — but " +
+    "so is a padded one, which buries the ranges that mattered in prose that did not. The budgets are " +
+    "ceilings for a file full of real content, not targets to reach.",
 };
 
 /**

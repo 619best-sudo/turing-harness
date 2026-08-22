@@ -36,11 +36,23 @@ enforcement behind them.
 
 ## The sequence
 
-Eight steps, in order, stated in [`QA_SEQUENCE`](../src/phases/prompts.ts) and
-carried by both the loop system prompt and the staged verify messages. The order
+Eight steps, in order, stated in [`QA_SEQUENCE`](../src/categorizer/guidance.ts)
+and carried by the categorizer prompts (`write_edit` and the QA hops). The order
 is load-bearing: a step that runs before its predecessor verifies the wrong
 thing — old code, a dead screen, a file nobody served — while looking exactly
 like a real check.
+
+Before step 1 there is **step 0: who runs the software**. One
+`ask_user_question` with three answers — the agent does it, the **user** does it
+themselves, or this pass is **skipped** — and every tool that builds, runs,
+drives, captures or instruments is refused until it has been answered
+([`enforceQaHandshake`](../src/categorizer/chain.ts)). **Both QA hops ask it**,
+about their own work: `activity_reproduce` asks who makes the reported defect
+happen, `activity_inspect` asks who checks the change that was just made. It is
+asked **once per run per pass** — the repair loop re-enters the verify hop after
+every FAIL, and the answer given the first time stands. It is also the ONLY
+question that comes before running: with it in hand the pass builds and drives
+without asking permission again, and stops only at a wall it has actually met.
 
 | # | Step | Tool | Why it is not optional |
 |---|------|------|------------------------|
@@ -89,11 +101,18 @@ The exception is **reproduction**: before the first write, driving the app is
 required on a bug-fix run — that is how you learn which code is on the failing
 path. See [debugging](./debugging.md).
 
+**And the verify pass is entered, not hoped for.** A chain run reaches it because
+FLOOR 0 puts it there: written files that nothing has looked at cannot be
+summarised (see refusal 0 below). Whether QA then actually happens is the user's
+call, asked inside the hop — which is the only place it can be asked, because
+only there is there a change to describe and a surface to name.
+
 ## The staged spine and the repair loop
 
-Each verify round targets ONE stage, picked by
-[`orchestrator/verify-stages.ts`](../src/orchestrator/verify-stages.ts) from the
-outstanding gaps:
+Each verify round targets ONE stage, picked from the outstanding gaps by the
+verify machinery (the QA hops' wrappers in
+[`categorizer/chain.ts`](../src/categorizer/chain.ts), with per-run evidence
+dirs from [`orchestrator/verify-artifacts.ts`](../src/orchestrator/verify-artifacts.ts)):
 
 - **instrument** — `add_log` probes on the changed lines, FIRST — probes are
   source edits and must be in the binary before it launches. The launch then
@@ -139,8 +158,144 @@ the same FAIL forever. A rebuild is for broken code, not for the app working.
 
 ## The refusals
 
-Implemented in [`orchestrator/qa-gate.ts`](../src/orchestrator/qa-gate.ts), one
-run-scoped instance threaded into every loop.
+Implemented as the QA-hop wrappers in [`categorizer/chain.ts`](../src/categorizer/chain.ts)
+(`enforceNoShellAuthoring`, `enforceObserveFirst`) plus the device-target checks,
+each applied per categorizer hop.
+
+### 0. The handshake — the user says who runs the software, before anything runs
+
+The run this whole page exists for at least *tried* to verify something. A later
+one did not: an ordinary development task changed a dialog title in two Flutter
+files and stopped, and its report could only say the files "were written to but
+does not indicate what the new title value is or whether any verification was
+performed". `ask_user_question` was never called once in the run.
+
+Two things were missing, and they are separate:
+
+- **the hop was never entered.** `activity_inspect` is `write_edit`'s only child,
+  and the bug-fix floors in [`route-policy`](../src/categorizer/route-policy.ts)
+  all stand down as soon as a run has written something — which is every
+  development task. FLOOR 0 now covers it: while a hop that WROTE files is more
+  recent than the last hop that inspected them, `summarise` is not available, and
+  the driver nominating it does not get it either. Keyed off hop index, so the
+  repair loop's second write owes a second look. `verify: false` still turns the
+  whole thing off.
+- **nobody asked.** Running someone else's app can need a login, a seeded
+  account, a device they are holding — or nothing at all, because they are
+  watching the simulator themselves and would rather just tell you. Only they
+  know which, so the hop opens by asking, and everything that builds, runs,
+  drives, captures or instruments is refused until they answer. Reading and
+  grepping stay open: orienting first is fine, starting the app before asking is
+  not.
+
+**Both QA hops ask it**, because both of them run the user's software — the
+question is the same shape about different work:
+
+| | `activity_reproduce` asks | `activity_inspect` asks |
+|---|---|---|
+| the question | who makes the reported defect happen | who checks the change that was just made |
+| the agent does it | run, instrument, drive to the reported state | build, run, drive, inspect, verdict |
+| **they** do it | driving tools stay shut; ask for the exact steps to walk and `requestAttachments` for the capture or log (naming which log lines matter, for an INVISIBLE defect), then work from what they send | driving tools stay shut; ask for the exact check with `requestAttachments`, judge what comes back, cite it in the verdict |
+| **skip** | nothing runs; `deliver` `reproduced: false` with the symptom AS REPORTED, the suspects reading gave, and what only a run could have settled | nothing runs; `deliver` with no verdict and findings saying QA was skipped at their request, and what would have been checked |
+
+The two answers are tracked **separately** ([`recallQaMode`](../src/categorizer/chain.ts)):
+a "you drive" / "I drive" answer carries across the passes, because who has their
+hands on the device is a fact about the run rather than about the step — but a
+**skip never crosses**. "Skip the reproduction, I know what's broken" is a
+judgement about that step's value, and reading it as permission to ship the fix
+unverified is exactly the silence this gate exists to break.
+
+Both delegated modes also stand the observe-first `deliver` refusals down — "you
+observed nothing" is a finding about a hop that gave up, not about one following
+an instruction. With one exception that matters: a **skipped** reproduction still
+cannot claim `reproduced: true`, because nobody witnessed anything and the fixer
+needs to know it is holding a hypothesis. When the **user** drove, they are the
+witness and the claim is theirs to make.
+
+The refusal for the question itself stands down after `maxBlocks` like every
+other rule, and `deliver` is never gated by it, so no answer can wedge a run.
+
+#### The driver that calls nothing
+
+Every rule on this page is a tool wrapper, so every one of them is mute until the
+model calls a tool. A field run found the gap: FLOOR 0 routed a finished write
+pass into `activity_inspect` exactly as intended, the hop opened with 62 tools —
+and five seconds later it "ended without calling deliver". Zero tool calls. The
+handshake never fired, observe-first never fired, the freshness check never
+fired, and the run reported five written files with no verification behind them.
+Two fixes, because it had two causes:
+
+- **the loop accepted prose as an ending.** A turn with no tool calls normally
+  means the work is done; in a categorizer hop it can equally mean the driver
+  never started, since the hop must finish through its terminal `deliver`. So a
+  text-only turn with `deliver` still owed now gets ONE re-prompt naming what the
+  hop owes — step 0 for a QA hop, "deliver what you have" otherwise — twice at
+  most, after which the loop ends as before and the chain derives its honest
+  fallback deliverable.
+- **the driver was too small.** `activity_inspect` left its model slot open and
+  resolved to the extra-small tier; it now pins the same driver
+  `activity_reproduce` does, for the same stated reason — this hop runs builds,
+  drives devices and browsers, places probes and commits a verdict.
+
+#### The request that was too big
+
+The next run got much further — handshake asked, answered "You verify it", app
+building on the simulator — and then died on
+`OpenRouter stream failed (413): request entity too large`. A stream error ended
+the hop, which ended the run: a written change, a user's answer and a live build
+thrown away by a failure whose entire remedy is "send less".
+
+- **Surviving it.** A stream error that means *oversized* — HTTP 413, or the
+  model's own context-length complaint — now compacts the history hard and
+  retries the same turn (twice at most), and drops the loop's compaction
+  threshold for the rest of the hop, since the provider just proved its real
+  limit is below it. Every other failure (401, 429, a malformed-call 400, a
+  transport drop) stays fatal: retrying those with a smaller history only burns
+  the budget more slowly. See `isOversizedRequestError`.
+- **Not causing it.** What inflated the history was polling: the hop launched
+  `flutter run` in the background correctly, then read its log with `tail -30`,
+  `sleep 30 && tail -50`, `sleep 60 && tail -80`. Three build logs in the
+  transcript. `bash` now refuses the `sleep` + `tail`/`cat` combination and
+  points at the primitive that already exists — re-issue the launch command with
+  `waitMs` and the call ATTACHES to the process already running and returns on an
+  outcome (ready / failed / exited / settled), one result instead of a growing
+  pile. Narrow on purpose: a bare `sleep`, a single `tail -n 20`, and `grep` of a
+  log all still work.
+
+#### The change nobody recorded
+
+The next run went further off the map: it ended in the **read** hop, reporting
+`0 written` — with the user's Dart file already modified. It had run this, through
+`bash_readonly`, a tool whose own description promises "Blocks file writes":
+
+```
+python3 -c "
+with open('…/profile_screen.dart', 'r') as f: content = f.read()
+new_content = content.replace("title: 'Delete account?',", "title: 'Delete Your Account',")
+with open('…/profile_screen.dart', 'w') as f: f.write(new_content)"
+```
+
+Three independent things had to be wrong, and the third is the one that turned a
+policy slip into a silently unverified change:
+
+1. **`bash_readonly` was shell-shaped.** Its block list covered redirection,
+   `tee`, `rm`/`mv`/`cp`/`mkdir` — and an interpreter is none of those.
+   `detectShellAuthoring` had understood that exact command all along; it was
+   never asked. It is asked now.
+2. **The chain's authoring guard was applied by hop ID** — the two QA hops — so
+   the read hop was never covered. It now follows the *capability*: any
+   categorizer that was not given `write`/`edit` cannot author through any shell
+   surface (`bash`, `bash_readonly`, an MCP spelling), and the refusal names the
+   exit — describe the change and nominate `write_edit`.
+3. **Nothing recorded it.** `writtenPaths` was fed only by `write`/`edit`, and it
+   is what the verify floor, the freshness gate, the probe strip and the run's own
+   report all read. A shell-written file appeared nowhere, so FLOOR 0 stayed
+   inert and a run that had already changed the code ended in the read hop with
+   no build, no capture and no verdict. Now a successful shell call whose command
+   authors a project file records that path as a write and logs it under
+   `loop:shell-write`. Every gate above can stand down (deliberately — a gate
+   that wedges a run is worse than the run); this one cannot, so whatever gets
+   through is at least verified.
 
 ### 1. Scope — QA is the verify pass's job
 
@@ -174,7 +329,8 @@ started outside the run, so "stale" there would be a guess; the real web failure
 (a guessed URL nothing answers) is already caught by `activity_inspect`'s own
 navigation-failure detection.
 
-A **probe-only** edit — one that adds or removes `__t()` calls and nothing else —
+A **probe-only** edit — one that adds or removes marker-prefixed log lines
+(`TURING_TRACE_<suffix> …`) and nothing else —
 opens no debt. Holding a capture hostage to rebuilding for instrumentation would
 make the instrument → build → run → inspect spine impossible to walk.
 
@@ -304,12 +460,24 @@ tap tool for so long.
 
 ### 6. Stuck — a wall is a question, not a puzzle
 
-After enough capture/drive calls with no write, no deploy and no question, a
-nudge is injected naming `ask_user_question`, what the wall usually is, and the
-three shapes an answer can take (a value, an attachment, or the user doing that
-one step). A nudge rather than a refusal — the model may be three taps from the
-target; what it needs is the reminder, not a stop. Fires once per streak; asking,
-writing or deploying resets it.
+Two driving calls in a row that do not move the screen (an error, an
+element-not-found, a timeout), or a long streak with nothing to show for it, and
+[`nudgeAtWalls`](../src/categorizer/chain.ts) appends a reminder to the tool
+result the model is already reading: name `ask_user_question`, what the wall
+usually is, and the three shapes an answer can take — they type the VALUE, they
+ATTACH the file, or they DO that one step themselves and tell you to continue,
+and you pick the run back up from the state they leave it in. A bypass counts
+too (a seeded account, a dev flag, a deep link past the gate).
+
+A nudge rather than a refusal, deliberately: the model may be three taps from the
+target, and a heuristic must never stop a pass that is making progress. It fires
+once per streak and resets the moment a call lands or a question is asked, and it
+is capped so advice never becomes the transcript.
+
+This is also why the automation itself never waits on a UI: the pass starts the
+app and drives, and a wall becomes a question at the moment it is actually met —
+not a pre-emptive "can I?" before the run, and not a silent stall at a login
+screen.
 
 ### None of them can deadlock
 
@@ -317,6 +485,7 @@ Each rule stands down after `maxBlocks` refusals (default 2, counted separately
 per rule; the device-id correction gets `maxBlocks × 3` because it is mechanical). A model that cannot satisfy one proceeds with the warning on the log
 under the `qa-gate` tag. A gate that could wedge a run would be worse than no
 gate.
+
 
 ## Which reference image a capture is graded against
 

@@ -372,8 +372,9 @@ test("a tool image is described by the vision model for a blind run model", asyn
   await runWith({
     llm,
     tools: [screenshot],
-    // Text-only, exactly like the app's default model.
-    model: resolveModel("xiaomi/mimo-v2.5"),
+    // Text-only, exactly like the app's driver. (Was mimo-v2.5 until a live
+    // OpenRouter check showed it reads images — see the catalog entry.)
+    model: resolveModel("poolside/laguna-xs-2.1"),
     visionModel: "anthropic/claude-sonnet-4.5",
     emit: (e) => {
       if (e.type === "turn_end") toolResults.push(...(e.toolResults ?? []));

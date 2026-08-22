@@ -4,24 +4,32 @@ Reading code tells you what it *should* do. When the complaint is "nothing
 happens", "the value is wrong" or "it works locally", the bug lives in the gap
 between should and does — and no amount of re-reading closes it.
 
-`DEBUGGING_LOOP` (in [prompts.ts](../src/phases/prompts.ts), carried by the loop,
-PERFORM and PERFECT) is the method. The `activity_*` tools are what it uses.
+`DEBUGGING_LOOP` (in [guidance.ts](../src/categorizer/guidance.ts), carried by
+the categorizer prompts) is the method. The `activity_*` tools are what it uses.
 
 ## 1. Who runs the system — settle it first
 
-Before instrumenting anything. If the app is already up, use it. If not,
-[ask](./asking-the-user.md) whether the agent should start it or the user will:
-they may have a dev server, seeded data, a device, or credentials nobody can
-reproduce, and racing them to a port wastes both attempts. If they hand it over,
+Before instrumenting anything, and in the reproduce/verify hops this is
+**enforced**: one `ask_user_question` — the agent does it, the user does it
+themselves, or this pass is skipped — and everything that launches, drives,
+captures or instruments is refused until it is answered (see
+[the handshake](./qa-sequence.md#0-the-handshake--the-user-says-who-runs-the-software-before-anything-runs)).
+If the app is already up, use it. If not, [ask](./asking-the-user.md) whether the
+agent should start it or the user will: they may have a dev server, seeded data,
+a device, or credentials nobody can reproduce, and racing them to a port wastes
+both attempts. If they hand it over,
 `activity_trace_start` with `startCommand` (+ `port` to free it) pipes the server's
-own output into the trace file, so server logs and `__t()` lines land in **one**
-timeline.
+own output into the trace file, so server logs and probe lines land in **one**
+timeline. `startCommand` is the only road probe output has to the trace file —
+an app launched any other way (an installed build via `mobile launch`, a plain
+`bash` run) prints where `activity_collect` never reads.
 
 ## 2. Instrument where code actually breaks
 
 `activity_trace_start` opens the session; **`add_log` puts the logging in.** It takes
 `edit`'s shape — `oldString` is the exact text to anchor on, `newString` is that text
-with your `__t("message", { value })` line added — because that is how you already
+with your probe line added (the file's own `print`/`console.log`, starting with the
+session's `TURING_TRACE_<suffix>` marker) — because that is how you already
 think about placing something at a point in code, and because writing the line
 yourself is the value: you choose the message and the values that decide the branch.
 
@@ -29,18 +37,18 @@ It is deliberately **not** an `edit`. Nothing re-authors it (an authoring model
 rewrites a `newString`, and a log handed to one comes back as a fix), it never counts
 as a code change (so it owes the verify gate nothing and is not gated on having
 observed the bug), and it **cannot** change code — every anchor line must survive
-byte-identical or the call is refused. The `__t()` helper is added the first time a
-file is logged, where the language allows a declaration, which is not line 1 in Dart
-or Go.
+byte-identical or the call is refused (and the refusal NAMES the lines that did not
+survive, plus the file's exact bytes when the anchor differs only in whitespace).
+No helper is injected and no import is added: the marker-prefixed line is both the
+message and the marker.
 
 Then RUN the flow — a log records nothing until the code executes — and
 `activity_collect`.
 
 Each `add_log` returns a **`logId`**. `remove_log` takes that one out (`logId: "log-3"`)
 when a log turns out to be at the wrong point and is only noise in every later
-collect, or all of them (`all: true`, optionally narrowed to one `path`). The helper
-goes when the last log in a file goes and stays while any remains — a surviving
-`__t()` call with no helper throws the moment that path runs. `activity_cleanup` clears
+collect, or all of them (`all: true`, optionally narrowed to one `path`).
+`activity_cleanup` clears
 them too, as part of ending the session. Removal matches the exact lines that were
 written, so the file is restored byte-for-byte.
 
@@ -56,7 +64,7 @@ uses: every branch of a conditional including the implicit else, what a function
 the boundary where another module takes over, and what a library actually returned.
 
 Then log the flow **end to end** — entry, each hop, exit. That is what tells you
-*where the trail stops*: the last `__t()` that printed localises the break faster
+*where the trail stops*: the last probe that printed localises the break faster
 than any single clever log, and a trace that only covers your suspicion cannot tell
 you your suspicion was wrong.
 
@@ -133,7 +141,7 @@ The part that gets skipped:
   null there because …".
 - Re-run the **same** flow. If you can't, ask the user to try again — saying exactly
   what to do and what they should see.
-- **Fixed** → remove every `__t()` and probe marker, `activity_cleanup` the session,
+- **Fixed** → remove every probe (`activity_cleanup` the session),
   and report what was wrong, why the fix addresses it, and what evidence proved it.
   Instrumentation is scaffolding; leaving it behind ships a mess.
 - **Not fixed** → **revert that change** before trying the next one. Stacked
@@ -164,7 +172,7 @@ When behaviour is internal and can't be observed from outside — a handler that
 never be reached, state that goes wrong mid-flow, a value arriving malformed, a
 screen that renders with the wrong data — the answer is not to read harder. It is
 sections 3 through 6 of this page, run on code you just wrote instead of code that
-just failed: `activity_trace_start`, `__t()` at the real decision points, exercise
+just failed: `activity_trace_start` (with `startCommand`), `add_log` at the real decision points, exercise
 the flow, `activity_collect`, `activity_study`. One instrumented pass settles what
 three rounds of staring at the source cannot.
 

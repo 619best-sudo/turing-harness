@@ -123,6 +123,15 @@ again.
 - **Runtime debugging.** A trace only produces data if the flow actually runs. If
   the agent cannot trigger it, that is exactly when to ask the user to exercise the
   app — naming the precise steps needed.
+- **Who does the QA.** The one question the harness *requires*: the verify hop
+  opens with it (the agent verifies / the user verifies / skip), and everything
+  that builds, runs, drives, captures or instruments is refused until it is
+  answered. Asked once per run, and then the pass runs without asking permission
+  again. See [the QA sequence](./qa-sequence.md#0-the-handshake--the-user-says-who-does-the-qa-before-anything-runs).
+- **A wall met while driving.** A login, an OTP, a value only they have, a file to
+  upload. Ask *at* the wall, naming the screen: they type the value, attach the
+  file, or do that one step themselves and hand the run back. A driving streak
+  that stops moving the screen gets nudged toward exactly this.
 
 ## Plumbing
 

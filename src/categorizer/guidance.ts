@@ -653,6 +653,14 @@ export const INSPIRATION_REUSE = [
  * only prose that has held.
  */
 export const QA_SEQUENCE = [
+  "  0. WHO DOES THE QA — the verify pass OPENS with one `ask_user_question` offering three answers: the",
+  "     agent verifies it (build, run, drive, verdict — the default), the USER verifies it themselves (you",
+  "     then ask for the exact check and judge the screenshot/log they send back), or QA is SKIPPED",
+  "     (deliver unverified and say so). In the verify categorizer this is ENFORCED — everything that",
+  "     builds, runs, drives, captures or instruments is refused until it has been answered — and it is",
+  "     asked ONCE per run. It is also the ONLY question that comes before running: with the answer in",
+  "     hand you build and drive without asking permission again, and you stop only at a wall you have",
+  "     actually met.",
   "THE QA SEQUENCE — eight steps, IN THIS ORDER. Do not improvise around it, and do not start it until the",
   "code has stopped changing. Every step exists because skipping it produced a confident wrong answer, and",
   "the order is load-bearing: a step that runs before its predecessor verifies the WRONG thing — old code,",
@@ -722,6 +730,58 @@ export const QA_SEQUENCE = [
   "    - FIXING a reported visual bug → compare against the BROKEN capture you took before editing.",
   "    - NEITHER → `expected` alone: state what you built (the copy, the values, the structure) and let it",
   "      be judged claim by claim.",
+].join("\n");
+
+/**
+ * The reproduce spine, as SEVEN numbered steps in fixed order — the counterpart
+ * of `QA_SEQUENCE` for the pass that runs BEFORE a fix exists.
+ *
+ * Same reason this exists as a short ordered list: the prose in the
+ * activity_reproduce prompt is complete and a disoriented model followed none
+ * of it — six field runs against one Flutter bug produced six empty trace
+ * files, because every one launched the app OUTSIDE the trace (`mobile launch`
+ * of an installed build, a plain `flutter run` in bash) and probe output went
+ * where `activity_collect` never reads. The step that fixes that is 3.
+ */
+export const REPRO_SEQUENCE = [
+  "  0. WHO MAKES IT HAPPEN — the reproduce pass opens with one `ask_user_question` offering three",
+  "     answers: the agent reproduces it (run, instrument, drive — the default), the USER reproduces it",
+  "     on their own machine (you then ask for the exact steps and the capture/log and work from that),",
+  "     or it is SKIPPED and the fixer is handed `reproduced: false` with the suspects reading gave.",
+  "     ENFORCED: everything that launches, drives, captures or instruments is refused until it is",
+  "     answered, and it is asked ONCE. It is also the ONLY question that comes before running — after",
+  "     it you launch and drive without asking again, and stop only at a wall you have actually met.",
+  "THE REPRO SEQUENCE — seven steps, IN THIS ORDER. The defect has not been seen yet; every step",
+  "exists to change that, and skipping one produced runs that read code for ten minutes, launched",
+  "nothing that could carry evidence, and reported a hypothesis as a reproduction.",
+  "  1. CLASSIFY  — VISIBLE (wrong text/layout/crash → a capture is the evidence) or INVISIBLE",
+  "                 (a value that never arrives → a screenshot of a normal-looking screen proves",
+  "                 NOTHING; probes are the only evidence there is).",
+  "  2. RUNNABLE  — find THIS project's own RUN command from its manifest/README/CI — the command",
+  "                 that STARTS it: the device run, the dev server, the service entrypoint, or the ONE",
+  "                 test that hits the reported path. Whatever the stack — mobile, web or backend.",
+  "                 A build-only command produces an artifact, not a run.",
+  "  3. PROBE     — `activity_trace_start` (NO `startCommand` yet) opens the session and hands you its",
+  "                 marker, then `add_log` places ONE log-only line at each DECIDING branch, in the code",
+  "                 the launch is about to build. Probes must be compiled in — placing them after the",
+  "                 launch costs the whole build.",
+  "  4. LAUNCH    — re-issue `activity_trace_start { startCommand: \"<the run command>\" }`: the launch",
+  "                 attaches to the SAME session (same marker — your probes are live) and replaces any",
+  "                 earlier build under it. `startCommand` is the only road probe output has to the",
+  "                 trace file; an app launched any other way (an installed build via `mobile launch`, a",
+  "                 second run through `bash` beside the first) prints where `activity_collect` never",
+  "                 reads, and two apps fight over the device. NOT READY on a cold build means KEEP the",
+  "                 session and poll `activity_collect { waitMs }`; a re-issue while building REPLACES",
+  "                 the build, it does not hurry it. Re-issue only on FAILED TO START.",
+  "  5. DRIVE     — LAUNCHING IS NOT REPRODUCING: an app idling on its first screen exercises none of",
+  "                 the reported flow. Walk it to the reported state — `mobile {look}` then `tap`/`type`",
+  "                 on a device, `drive` in a browser, the endpoint/test through `bash` with no UI.",
+  "                 Do NOT relaunch the app outside the trace (an installed-build launch replaces the",
+  "                 traced process and silences the probes).",
+  "  6. COLLECT   — `activity_collect { traceId, waitMs }`, then `activity_study`: where the trail",
+  "                 STOPS is the reproduction; the first wrong value names the suspect.",
+  "  7. CLEANUP   — `activity_cleanup { traceId }` strips the probes and stops what the trace",
+  "                 started, THEN `deliver`. `reproduced: true` only if you SAW it happen.",
 ].join("\n");
 
 export const VERIFY_WHAT_YOU_WROTE = [
@@ -1196,6 +1256,16 @@ export const DRIVING_AUTOMATION = [
   "    by anything.",
   "    Other actions: `swipe` (scroll — `to` takes up/down/left/right), `type`, `press`, `open` (deep link),",
   "    `launch`/`terminate`/`install`/`apps`, `devices`.",
+  "  BLOCKED IN THE UI — a login or auth screen, an OTP/2FA, a biometric or permission prompt, a",
+  "    paywall, an account selector, a form field whose value only the user knows, a file to upload:",
+  "    STOP driving and call `ask_user_question` AT THE WALL, naming the screen you are on and the",
+  "    one thing you need. The user can answer with the value, ATTACH the file, do that one step",
+  "    themselves while you wait and tell you to continue, or hand you a bypass (a seeded account, a",
+  "    dev flag, a deep link past the gate). Asking once is correct; guessing credentials, silently",
+  "    rerouting to \"I'll test it another way\", or delivering a not-run verdict at a wall you never",
+  "    mentioned to anyone is not. And do not pre-judge the wall from the source (\"it uses auth, so",
+  "    it can't run\") — reading shows a login exists SOMEWHERE, not that your run will meet it:",
+  "    cached sessions, dev bypasses and seeded devices are real. Run it, meet the real wall, then ask.",
   "    NUDGING IS GUESSING, AND IT IS REFUSED: never re-tap a few pixels from a missed coordinate, and never",
   "    tap a coordinate you have not derived from a capture THIS step — the harness refuses coordinate taps",
   "    that no position analysis has backed since the last tap. One no-op tap → re-derive from a fresh",
@@ -1245,9 +1315,15 @@ export const DRIVE_TOOL = [
   '    4. `drive { action: "shot" }`          — the final capture',
   "    5. hand the capture to `media_analysis` (lens:\"qa\" with `expected`) / study the logs → verdict",
   "  RULES:",
-  "  - `target` is a description or a verbatim ref from `look`. NEVER a guessed CSS selector.",
+  "  - `target` is a description, a verbatim ref from `look`, or exact `x,y` viewport pixels for",
+  "    canvas/custom-drawn surfaces (bounds-checked; out-of-range fails loudly).",
+  "  - NEVER a guessed CSS selector.",
+  "  - `look` also lists UNLABELED controls (icon buttons, bare graphics) with refs and positions —",
+  "    they cannot be matched by description, so click them BY REF.",
   "  - An ambiguous or missed target returns the page's element list — pick from it and re-issue;",
   "    do not nudge or retry blind.",
+  "  - A click that changes nothing is re-derived once against a fresh snapshot automatically; if",
+  "    the result still says no change, believe it and `look`.",
   "  - The click/fill/select result already carries the post-action screenshot: do NOT follow it",
   "    with `look` just to see what happened.",
   "  - For a device/simulator use `mobile` (same fused shape); for a one-shot page + console",
@@ -1292,6 +1368,10 @@ export const GUIDANCE = {
   assets: { text: ASSETS_AND_SVG, applies: (has) => has("assets_generator") },
   inspiration: { text: INSPIRATION_REUSE, applies: (has) => has("inspiration_generator") },
   verify: { text: VERIFY_WHAT_YOU_WROTE, applies: ALWAYS },
+  reproOrder: {
+    text: REPRO_SEQUENCE,
+    applies: (has) => has("activity_trace_start") && has("add_log") && !has("edit"),
+  },
   build: { text: BUILD_TYPECHECK_COMMANDS, applies: (has) => has("bash") },
   learning: { text: PROJECT_LEARNING, applies: (has) => has("project_memory") },
 } satisfies Record<string, GuidanceBlock>;

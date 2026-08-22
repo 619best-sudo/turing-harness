@@ -341,7 +341,12 @@ test("the rater and comprehension prompts carry the risk sites to the model", as
   assert.match(raterSystem, /SYNC VS ASYNC/, "the rater is told what makes a file hard");
   assert.match(raterSystem, /RATING: <low\|medium\|high>/, "and still answers in one parseable line");
   assert.match(comprehendSystem, /OTHER FILES THAT DEPEND ON THIS/, "the analysis is aimed at the risk sites");
-  assert.match(comprehendSystem, /do NOT summarize or restate the code/, "without restating the file");
+  // The contract changed from "never restate the file" to a two-part output:
+  // findings PLUS a durable whole-file map — the map deliberately restates
+  // the FILE (never the driver's reasoning) so later hops can answer any
+  // line range from the analysis alone.
+  assert.match(comprehendSystem, /PART 2 — THE MAP/, "the durable map is asked for");
+  assert.match(comprehendSystem, /The map restates the FILE, never the driver's reasoning/, "without restating the driver");
 
   await fs.rm(dir, { recursive: true, force: true });
 });

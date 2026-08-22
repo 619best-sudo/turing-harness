@@ -143,12 +143,28 @@ test("a keyword-free tool inside a QA server is scoped by the server it belongs 
   // — which is exactly why the cohort has to decide.
   assert.deepEqual(categorizeTool(tool("get_network_request", "Get one network request by id")), ["read"]);
 
-  const reg = new Registry();
+  // auto mode (the legacy heuristic scoping): the cohort rule applies at add().
+  const reg = new Registry({ externalMcpScoping: "auto" });
   reg.add({ id: "mcp:chrome", kind: "mcp", source: "external", name: "chrome-devtools", tools: QA_SERVER });
   const inspect = reg.getToolsForCategorizer("activity_inspect").map((t) => t.name).sort();
   assert.deepEqual(inspect, QA_SERVER.map((t) => t.name).sort(), "the whole server is one QA surface");
   assert.deepEqual(reg.getToolsForCategorizer("read").map((t) => t.name), []);
   assert.deepEqual(reg.getToolsForCategorizer("write_edit").map((t) => t.name), []);
+
+  // selection mode (the default): connected is NOT selected — nothing reaches
+  // any hop until the server is named. This is the leak these tests were
+  // written about, closed from the other end: the server that put 61 tools
+  // into a QA hop now puts in zero unless asked.
+  const reg2 = new Registry();
+  reg2.add({ id: "mcp:chrome", kind: "mcp", source: "external", name: "chrome-devtools", tools: QA_SERVER });
+  assert.deepEqual(reg2.getToolsForCategorizer("activity_inspect").map((t) => t.name), [], "unselected reaches no hop");
+  const applied = reg2.selectExternalMcps(["chrome-devtools"], ["conversation", "read", "write_edit", "activity_inspect"]);
+  assert.deepEqual(applied.selected, ["mcp:chrome"], "suffix matching resolves the UI name");
+  assert.deepEqual(
+    reg2.getToolsForCategorizer("activity_inspect").map((t) => t.name).sort(),
+    QA_SERVER.map((t) => t.name).sort(),
+    "a selected server reaches every category",
+  );
 });
 
 test("one QA tool does not drag a general-purpose server into QA", () => {
@@ -160,7 +176,7 @@ test("one QA tool does not drag a general-purpose server into QA", () => {
     tool("render_screenshot", "Render the document to a screenshot"),
   ];
   assert.equal(isInspectSurface(mixed), false);
-  const reg = new Registry();
+  const reg = new Registry({ externalMcpScoping: "auto" });
   reg.add({ id: "mcp:docs", kind: "mcp", source: "external", name: "docs", tools: mixed });
   // Each tool keeps the scope its own name and blurb earn it.
   assert.deepEqual(reg.getToolsForCategorizer("activity_inspect").map((t) => t.name), ["render_screenshot"]);

@@ -154,8 +154,10 @@ test("the non-streaming call retries transient failures too", async () => {
  *
  * `browser_take_screenshot` produces an image content block. Serialising it for
  * a text-only model makes the provider reject the ENTIRE request, so a browser
- * session loses every turn of work that preceded the screenshot. The catalog
- * claimed the default model accepted images; OpenRouter says it is text-only.
+ * session loses every turn of work that preceded the screenshot. Originally
+ * pinned to xiaomi/mimo-v2.5, which turned out to be a stale claim — a live
+ * OpenRouter check (input_modalities ["text","image","audio","video"]) widened
+ * it, so this test moved to hy3, which really is text-only.
  */
 test("an image is replaced with a note for a text-only model", async () => {
   const { contextToRequest, resolveModel } = await import("../dist/index.js");
@@ -174,7 +176,7 @@ test("an image is replaced with a note for a text-only model", async () => {
     tools: [],
   };
 
-  const textOnly = resolveModel("xiaomi/mimo-v2.5");
+  const textOnly = resolveModel("tencent/hy3");
   assert.deepEqual(textOnly.input, ["text"], "catalog must reflect the real modalities");
 
   const req = contextToRequest(textOnly, context);
@@ -188,6 +190,92 @@ test("an image is replaced with a note for a text-only model", async () => {
     parts.map((p) => p.text ?? "").join(" "),
     /image omitted/,
     "the model should be told an image existed",
+  );
+});
+
+/**
+ * The poolside drivers are text-only too — same trap, third and fourth slugs.
+ *
+ * mimo and hy3 are registered above; the poolside laguna variants became
+ * OpenWaggleMain models later and nobody re-made the check, so the permissive
+ * unknown-slug default claimed image support again. A field run (inspect hop,
+ * app already launched on the iOS simulator) called `mobile look` once, the
+ * screenshot rode the next request, and OpenRouter rejected the whole request
+ * with 404 "No endpoints found that support image input" — killing the run
+ * before it navigated anywhere. laguna-xs is the work-loop driver; laguna-s is
+ * pinned by the reproduce hop. This pins both registrations so the next driver
+ * swap that forgets the catalog fails HERE, not in the field.
+ */
+test("both poolside drivers are registered text-only, so screenshots degrade instead of killing the run", async () => {
+  const { contextToRequest, resolveModel } = await import("../dist/index.js");
+
+  const context = {
+    systemPrompt: "s",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is on screen?" },
+          { type: "image", mimeType: "image/png", data: "aGk=" },
+        ],
+      },
+    ],
+    tools: [],
+  };
+
+  for (const slug of ["poolside/laguna-xs-2.1", "poolside/laguna-s-2.1"]) {
+    const driver = resolveModel(slug);
+    assert.deepEqual(
+      driver.input,
+      ["text"],
+      `${slug}: catalog must reflect the real modalities (OpenRouter: input_modalities ['text'])`,
+    );
+
+    const req = contextToRequest(driver, context);
+    const parts = req.messages.at(-1).content;
+    assert.equal(
+      parts.some((p) => p.type === "image_url"),
+      false,
+      `${slug}: no image may be sent to a text-only model`,
+    );
+    assert.match(
+      parts.map((p) => p.text ?? "").join(" "),
+      /image omitted/,
+      `${slug}: the driver should be told an image existed`,
+    );
+  }
+});
+
+/**
+ * Both QA hops pin mimo-v2.5 BECAUSE it sees. A text-only QA driver dies on its
+ * first capture (see the poolside test above) or works second-hand off
+ * descriptions; mimo takes the screenshot natively. Pin its modalities so a
+ * catalog edit cannot quietly blind the two hops whose job is to look — this
+ * entry spent months wrongly claiming text-only under a "verify before
+ * widening" hedge that nobody ran.
+ */
+test("mimo-v2.5 is registered omnimodal for the QA hops", async () => {
+  const { contextToRequest, resolveModel } = await import("../dist/index.js");
+
+  const mimo = resolveModel("xiaomi/mimo-v2.5");
+  assert.deepEqual(
+    mimo.input,
+    ["text", "image", "audio", "video"],
+    "verified against OpenRouter",
+  );
+
+  const context = {
+    systemPrompt: "s",
+    messages: [
+      { role: "user", content: [{ type: "image", mimeType: "image/png", data: "aGk=" }] },
+    ],
+    tools: [],
+  };
+  const req = contextToRequest(mimo, context);
+  assert.equal(
+    req.messages.at(-1).content.some((p) => p.type === "image_url"),
+    true,
+    "the QA hops' captures must reach the model as images",
   );
 });
 

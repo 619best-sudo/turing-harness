@@ -45,7 +45,7 @@ import type { LogStore } from "../../logging/logger.js";
 import type { Registry } from "../../registry/registry.js";
 // The one definition of "this change only adds or removes logging". Shared with the
 // reproduce gate so the tool cannot accept a form the gate would call a fix.
-import { probeOnlyReplacement } from "./coding.js";
+import { probeOnlyReplacementDetailed } from "./coding.js";
 import { hasLocalDevice, localDeviceTools } from "../../devices/local-devices.js";
 import {
   elementCenter,
@@ -70,7 +70,7 @@ import {
 } from "../../devices/mobilecli.js";
 import { resolveShellEnvironment } from "../../exec/shell-env.js";
 import { resolveProjectToolchain } from "../../exec/toolchain.js";
-import { ANY_MARKER_RE, PROBE_MARKER_RE, TRACE_MARKER_PREFIX, traceMarker } from "../../probe-marker.js";
+import { ANY_MARKER_RE, PROBE_MARKER_RE, PURE_PROBE_LINE_RE, TRACE_MARKER_PREFIX, traceMarker } from "../../probe-marker.js";
 import { imagePixelDimensions, sniffImageFormat } from "../../image-dims.js";
 
 export interface ActivityMonitorConfig {
@@ -350,6 +350,90 @@ async function findProbeMarkerFiles(cwd: string): Promise<string[]> {
   return found;
 }
 
+/**
+ * What a leftover-probe sweep did to one file.
+ */
+interface ProbeSweepFile {
+  /** cwd-relative path. */
+  file: string;
+  /** Pure probe lines removed. */
+  removed: number;
+  /** 1-based lines that MIX a foreign marker with code — left in place, reported. */
+  mixed: number[];
+}
+
+/**
+ * Source extensions a probe can live in. The sweep only ever removes lines from
+ * THESE: the trace session's own `.log` files live in `os.tmpdir()` and are FULL
+ * of marker lines (they are the collected output — removing "probes" from them
+ * would delete the evidence), and a sweep that walked the system temp dir from
+ * a cwd sitting there (tests do this) would be both slow and nondeterministic.
+ */
+const SWEEP_SOURCE_EXT = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+  ".py", ".dart", ".go", ".rs", ".java", ".kt", ".kts", ".swift",
+  ".rb", ".php", ".cs", ".cpp", ".cc", ".c", ".h", ".hpp", ".scala",
+]);
+
+/**
+ * Remove whole-line probes left behind by EARLIER runs, so this one starts from
+ * a clean tree.
+ *
+ * The scenario, from the field: a run aborted by hand takes its own cleanup down
+ * with it, its probes stay in the source, and the NEXT run reads them as product
+ * code and reasons around them — or worse, collects their foreign markers as
+ * noise. The chain strips what it knows about at run end; this sweep covers the
+ * gap at run START, deterministically and model-free (same rule as the
+ * chain-end strip: a line that is NOTHING but a probe is removed, a line that
+ * MIXES a probe with code is a judgement call and is only reported).
+ *
+ * Probes belonging to a session that is still OPEN are left alone — another
+ * live trace may be about to collect them.
+ */
+async function sweepForeignProbes(cwd: string): Promise<ProbeSweepFile[]> {
+  // A cwd AT the system temp root is a test fixture, not a project — and the
+  // walk from there would be bounded only by the file cap.
+  if (path.resolve(cwd) === path.resolve(os.tmpdir())) return [];
+  const openMarkers = new Set([...activeTraces.values()].map((t) => traceMarker(t.traceId)));
+  const out: ProbeSweepFile[] = [];
+  for (const rel of await findProbeMarkerFiles(cwd)) {
+    if (!SWEEP_SOURCE_EXT.has(path.extname(rel).toLowerCase())) continue;
+    const full = path.join(cwd, rel);
+    let content: string;
+    try {
+      content = await fs.readFile(full, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = content.split("\n");
+    const kept: string[] = [];
+    const mixed: number[] = [];
+    let removed = 0;
+    for (const [index, line] of lines.entries()) {
+      if (!PROBE_MARKER_RE.test(line) || !PURE_PROBE_LINE_RE.test(line)) {
+        if (PROBE_MARKER_RE.test(line) && !PURE_PROBE_LINE_RE.test(line)) mixed.push(index + 1);
+        kept.push(line);
+        continue;
+      }
+      const marker = line.match(ANY_MARKER_RE)?.[0];
+      if (marker && openMarkers.has(marker)) {
+        kept.push(line); // a live session's probe — not ours to take
+        continue;
+      }
+      removed += 1;
+    }
+    if (removed > 0) {
+      try {
+        await fs.writeFile(full, kept.join("\n"), "utf8");
+      } catch {
+        continue; // unreadable/unwritable — the report simply omits it
+      }
+    }
+    if (removed > 0 || mixed.length > 0) out.push({ file: rel, removed, mixed });
+  }
+  return out;
+}
+
 function traceFilePath(traceId: string): string {
   return path.join(os.tmpdir(), `${traceId}.log`);
 }
@@ -367,6 +451,12 @@ function printByExample(marker: string): Record<string, { call: string; example:
     dart: { call: "print", example: `print("${marker} screen=profile loaded=" + loaded.toString());` },
     go: { call: "fmt.Println", example: `fmt.Println("${marker}", "screen=profile", "loaded=", loaded)` },
     rust: { call: "println!", example: `println!("${marker} screen=profile loaded={:?}", loaded);` },
+    kotlin: { call: "println", example: `println("${marker} screen=profile loaded=" + loaded.toString())` },
+    swift: { call: "print", example: `print("${marker} screen=profile loaded=", loaded)` },
+    java: { call: "System.out.println", example: `System.out.println("${marker} screen=profile loaded=" + loaded);` },
+    ruby: { call: "puts", example: `puts "${marker} screen=profile loaded=#{loaded}"` },
+    csharp: { call: "Console.WriteLine", example: `Console.WriteLine("${marker} screen=profile loaded=" + loaded);` },
+    php: { call: "echo", example: `echo "${marker} screen=profile loaded=", $loaded, PHP_EOL;` },
     default: { call: "print / console.log", example: `<print>("${marker} [<time>] <what this point is> <values>")` },
   };
 }
@@ -394,6 +484,66 @@ function loggingSnippet(language: string, traceId: string, traceFile: string, _c
     `// activity_collect returns every line that contains ${marker}.`,
     "",
   ].join("\n");
+}
+
+/**
+ * The log-call forms a probe line may use, per language — every language
+ * `EXTENSION_LANGUAGES` can detect, so a mobile (kotlin/swift), backend
+ * (ruby/php/csharp) or JVM (java) project gets the same protection dart does.
+ * A probe written in the WRONG language's call (`console.log` in a `.dart`
+ * file) compiles nowhere — the build breaks minutes after the probe was
+ * placed, and the pass discovers it only when the run it was for fails to
+ * start. Checked against the ADDED lines only; an unknown language passes
+ * unchecked rather than being refused on a guess.
+ */
+const PROBE_CALL_RE_BY_LANGUAGE: Record<string, RegExp> = {
+  dart: /^\s*(?:await\s+)?(?:debugPrint|print)\s*\(/,
+  typescript: /^\s*(?:await\s+)?console\.(?:log|debug|info|warn|error)\s*\(/,
+  javascript: /^\s*(?:await\s+)?console\.(?:log|debug|info|warn|error)\s*\(/,
+  python: /^\s*(?:await\s+)?(?:print|logger\.(?:debug|info|warning|error)|logging\.(?:debug|info|warning|error))\s*\(/,
+  go: /^\s*(?:fmt\.Print\w*|log\.(?:Print|Printf|Println)|slog\.\w+)\s*\(/,
+  rust: /^\s*(?:println!|print!|eprintln!|eprint!|log::\w+!)\s*\(/,
+  kotlin: /^\s*(?:println|print)\s*\(|^\s*(?:Log\.[diewvf]|logger\.\w+|Timber\.\w+)\s*\(/,
+  swift: /^\s*(?:print|NSLog|debugPrint|os_log)\s*\(/,
+  java: /^\s*(?:System\.(?:out|err)\.print\w*|Log\.[diewvf]|logger\.\w+)\s*\(/,
+  ruby: /^\s*(?:puts|print|p|pp)\b|^\s*(?:logger|Rails\.logger)\.\w+\s*\(/,
+  csharp: /^\s*(?:Console\.(?:Write|WriteLine)|Debug\.(?:Write|WriteLine|Print)|Trace\.\w+|[Ll]ogger\??\.\w+)\s*\(/,
+  php: /^\s*(?:echo|print|print_r|var_dump|error_log)\b|^\s*(?:Log::\w+|logger\(\s*\)?\s*->\s*\w+)\b/,
+};
+
+/**
+ * Locate an anchor that does not exist verbatim, but does exist modulo
+ * whitespace — the failure mode of a model that re-typed the anchor from a
+ * summary or mis-remembered the indentation. Matching ignores leading
+ * whitespace and trailing whitespace per line, but requires the WHOLE block to
+ * match consecutively, so a multi-line anchor stays specific. Returns the
+ * region's EXACT bytes from the file (what `oldString` must be re-sent as) and
+ * its 1-based start line. This exists because the alternative — "not found,
+ * read the file" — produced a field run of `cat -A` / `od -c` archaeology
+ * followed by a `python3` heredoc edit.
+ */
+function locateAnchorLoose(
+  text: string,
+  oldString: string,
+): { exact: string; startLine: number } | undefined {
+  const norm = (l: string) => l.trim();
+  const fileLines = text.split("\n");
+  const want = oldString.split("\n").map(norm).filter((l) => l.length > 0);
+  if (want.length === 0) return undefined;
+  for (let i = 0; i + want.length <= fileLines.length; i += 1) {
+    let ok = true;
+    for (let j = 0; j < want.length; j += 1) {
+      if (norm(fileLines[i + j]!) !== want[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    // Skip leading blank lines the caller may or may not have included: take
+    // the matched span as-is, exact bytes, joined the way the file is.
+    return { exact: fileLines.slice(i, i + want.length).join("\n"), startLine: i + 1 };
+  }
+  return undefined;
 }
 
 /**
@@ -1079,8 +1229,10 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       "`activity_collect` with the traceId. Only lines carrying this session's marker are collected; a line with " +
       "any other marker — the bare family prefix, a legacy probe, or another session's — is a leftover from an " +
       "earlier run. Pass " +
-      "`startCommand` to have the dev server started for you with its stdout piped into the trace file (the marker " +
-      "lines are collected from there, so trace the code through a `startCommand` run).",
+      "`startCommand` — the project's RUN command (`npm run dev`, `flutter run -d <device>`, `python app.py`) — " +
+      "to have the app started for you with its stdout piped into the trace file. That pipe is the only road a " +
+      "probe's output has to `activity_collect`: an app launched any other way (an installed build via " +
+      "`mobile launch`, a plain `bash` run) prints where the trace never reads.",
     // Mutating: with `startCommand` it kills a port and spawns a server.
     mutates: true,
     categorizers: ["activity_inspect"],
@@ -1089,12 +1241,15 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
       properties: {
         language: {
           type: "string",
-          description: "Language for the snippet: typescript, javascript, python, go, rust. Detected when omitted.",
+          description:
+            "Language for the snippet: typescript, javascript, python, go, rust, dart, kotlin, swift, java, ruby, csharp, php. Detected when omitted.",
         },
         hint: { type: "string", description: "What is being traced — recorded on the session for context." },
         startCommand: {
           type: "string",
-          description: "Dev server command to start, e.g. 'npm run dev'. Its stdout/stderr pipe into the trace file.",
+          description:
+            "The project's RUN command — 'npm run dev', 'flutter run -d <device> …', 'python app.py'. Its " +
+            "stdout/stderr pipe into the trace file; launch the app here, not outside the trace.",
         },
         port: { type: "number", description: "Port to free before starting `startCommand`, e.g. 3000." },
         force: {
@@ -1338,6 +1493,152 @@ export function createActivityMonitorTools(config: ActivityMonitorConfig): Agent
  * files from inside the tool. Those edits bypassed the transcript AND the
  * permission gate, which is why that behavior is gone rather than ported.)
  */
+/**
+ * Start (or re-start) the run command under an existing trace session: kill
+ * anything the `port` arg names, spawn the command detached in the user's own
+ * shell environment with its stdout/stderr piped into the session's trace
+ * file, and wait for readiness by the command's shape.
+ *
+ * Shared by the fresh-session path and the attach path (re-issuing
+ * `activity_trace_start` with a `startCommand` to launch through an OPEN
+ * session — the "probes landed after the launch, rebuild through the trace"
+ * move), so the two can never drift apart.
+ */
+async function startSessionChild(
+  session: TraceSession,
+  startCommand: string,
+  args: Record<string, unknown>,
+  ctx: Parameters<AgentTool["execute"]>[2],
+): Promise<{ output: string; details: Record<string, unknown> }> {
+  const traceFile = session.traceFile;
+  const output: string[] = [];
+  const details: Record<string, unknown> = {};
+  const port = args.port ? Number(args.port) : undefined;
+  if (port) {
+    const killed = await killPort(port);
+    if (killed.length > 0) {
+      output.push(`- Killed ${killed.length} process(es) on port ${port}: ${killed.join(", ")}`);
+      details.killedPids = killed;
+    }
+  }
+
+  try {
+    await fs.writeFile(
+      traceFile,
+      `# Trace ${session.traceId} started at ${new Date().toISOString()}\n# Command: ${startCommand}\n\n`,
+      "utf8",
+    );
+
+    // The dev/app server starts in the user's own shell environment, with the
+    // project's pinned toolchain resolved — otherwise `startCommand` fails
+    // with `command not found` for exactly the reasons `bash` used to.
+    const { shellEnv, resolvedCommand } = await prepareStartCommand(startCommand, ctx.cwd);
+    const child = spawn(resolvedCommand, [], {
+      cwd: ctx.cwd,
+      shell: shellEnv.shell,
+      env: shellEnv.env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    session.childPid = child.pid;
+    session.childProcess = child;
+
+    const appendToFile = async (data: Buffer) => {
+      try {
+        await fs.appendFile(traceFile, data.toString());
+      } catch {
+        /* best-effort */
+      }
+    };
+    child.stdout?.on("data", (d: Buffer) => void appendToFile(d));
+    child.stderr?.on("data", (d: Buffer) => void appendToFile(d));
+    child.on("error", (err) => {
+      void fs.appendFile(traceFile, `\n[ERROR] spawn failed: ${err.message}\n`);
+    });
+    child.on("exit", (code) => {
+      void fs.appendFile(traceFile, `\n\n# Process exited with code ${code} at ${new Date().toISOString()}\n`);
+    });
+
+    // Wait for the app to actually be READY, not a fixed 2.5s. A cold first
+    // build (Flutter/Expo/Next) takes minutes; returning "ready" while it is
+    // still compiling caused runs to capture a stale / not-yet-running app.
+    // Readiness is decided by the COMMAND SHAPE: a web/dev-server command is
+    // ready when its port accepts connections; a mobile/device command (which
+    // has no port) is ready when its output shows a launch marker. Either way,
+    // an early exit or a fatal error means it failed, so we stop waiting
+    // instead of blocking the whole deadline on a dead process.
+    const isWeb = WEB_RUN_RE.test(startCommand);
+    ctx.progress?.({
+      stage: "start",
+      message: `starting \`${startCommand}\` (waiting for ${isWeb ? "the port to accept connections" : "the app to launch on the device"})`,
+    });
+    const waited = await waitForAppReady({
+      traceFile,
+      port,
+      isWeb,
+      // A cold mobile build (a first run compiled onto a device) routinely
+      // exceeds 3 minutes; web/dev-server starts are the fast case.
+      deadlineMs: isWeb ? 180_000 : 420_000,
+      onPoll: (n) => {
+        if (Math.floor(n.waitedMs / 15000) !== Math.floor((n.waitedMs - 1500) / 15000)) {
+          ctx.progress?.({
+            stage: "start",
+            message:
+              n.state === "ready"
+                ? `${isWeb ? "port" : "app"} ready after ${Math.round(n.waitedMs / 1000)}s`
+                : n.state === "failed"
+                  ? `start failed after ${Math.round(n.waitedMs / 1000)}s — see the startup output`
+                  : `still building/starting (${Math.round(n.waitedMs / 1000)}s)`,
+          });
+        }
+      },
+    });
+    const ready = waited.ready;
+    const readyWaitedMs = waited.waitedMs;
+    const readyReason = waited.reason;
+
+    let initialOutput = "";
+    try {
+      initialOutput = await fs.readFile(traceFile, "utf8");
+    } catch {
+      /* file not ready yet */
+    }
+
+    const readinessLine = ready
+      ? readyReason === "port"
+        ? `**Ready** — port ${port} is accepting connections (after ${Math.round(readyWaitedMs / 1000)}s). The build is up; you can inspect.`
+        : `**Ready** — the app launched (after ${Math.round(readyWaitedMs / 1000)}s). You can inspect.`
+      : readyReason === "failed" || readyReason === "exited"
+        ? `**FAILED TO START** (after ${Math.round(readyWaitedMs / 1000)}s) — the process exited or printed an error. Do NOT inspect; read the startup output below, fix the command (wrong device / wrong flag / port conflict / missing dependency), and re-issue.`
+        : `**NOT READY YET** (after ${Math.round(readyWaitedMs / 1000)}s) — still building/starting, and the ` +
+          `session is ALIVE and collecting. Do NOT re-issue \`activity_trace_start\` while it builds — a ` +
+          `re-issue REPLACES this build (kills it, starts over); it does not hurry it. Do NOT inspect yet ` +
+          `either — capturing now inspects a stale or not-yet-running app. Poll \`activity_collect ` +
+          `{ traceId, waitMs: 30000 }\` until this shows Ready; a cold build takes minutes, and slow is ` +
+          `not failed. Re-issue only after FAILED TO START, with the command fixed (wrong device / wrong ` +
+          `flag / port conflict / missing dependency).`;
+
+    output.push(
+      "",
+      "",
+      `**Started** \`${startCommand}\` (PID ${child.pid ?? "unknown"}); stdout/stderr pipe into the trace file.`,
+      readinessLine,
+      initialOutput.trim() ? `\n**Startup output:**\n\`\`\`\n${initialOutput.slice(-2000)}\n\`\`\`` : "",
+    );
+    details.autoStarted = true;
+    details.childPid = child.pid;
+    details.ready = ready;
+    details.readyReason = readyReason;
+    if (port) {
+      details.port = port;
+    }
+  } catch (err) {
+    output.push(`**Could not start \`${startCommand}\`:** ${(err as Error).message}`);
+    details.autoError = (err as Error).message;
+  }
+  return { output: output.join("\n"), details };
+}
+
 async function traceStartAction(
   args: Record<string, unknown>,
   ctx: Parameters<AgentTool["execute"]>[2],
@@ -1366,6 +1667,59 @@ async function traceStartAction(
   // Reuse only when it would behave identically: same project, same language, and no
   // `startCommand` (which asks for a server this session never started). `force`
   // opts out for a session that is genuinely unusable.
+  if (startCommand && !args.force) {
+    // Re-issuing with a `startCommand` LAUNCHES (or re-launches) through the
+    // OPEN session for this project — the one whose marker the placed probes
+    // already carry. The field failure this exists for: the pass launched at
+    // session open, placed its probes AFTER the launch, and then had no way to
+    // rebuild through the trace — so it started a SECOND app beside the first
+    // via `bash`, the two fought over the device, and both the trace and the
+    // app died. A running build cannot hot-reload new probes in (its stdin is
+    // ignored), so a re-launch replaces it: the old child is killed exactly
+    // the way `activity_cleanup` kills it, and the new one starts under the
+    // SAME traceId — the probes already in source keep their marker.
+    const attachable = [...activeTraces.values()]
+      .filter((t) => t.cwd === ctx.cwd && (!args.language || t.language === language))
+      .sort((a, b) => Number(b.instrumentedFiles.size > 0) - Number(a.instrumentedFiles.size > 0))[0];
+    if (attachable) {
+      if (attachable.childPid) {
+        try {
+          process.kill(-attachable.childPid, "SIGTERM"); // kill process group
+        } catch {
+          try {
+            process.kill(attachable.childPid, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }
+        attachable.childPid = undefined;
+        attachable.childProcess = undefined;
+      }
+      attachable.runMode = "auto";
+      const launched = await startSessionChild(attachable, startCommand, args, ctx);
+      ctxLog(ctx, "info", ["activity_monitor", "trace", "attach"], `launching through open trace ${attachable.traceId}`);
+      return {
+        output:
+          `**Launching through the OPEN trace session** \`${attachable.traceId}\` — same session, same marker ` +
+          `(\`${traceMarker(attachable.traceId)}\`), so the probes already in the source are live in this build. ` +
+          `Any earlier build under this session was stopped first; nothing else was touched.\n\n` +
+          `Now DRIVE the app to the reported state (\`mobile\` on a device, \`drive\` in a browser) and ` +
+          `\`activity_collect { traceId: "${attachable.traceId}" }\` — launching is not reproducing; the ` +
+          `symptom lives in a flow you have to walk to.\n\n` +
+          launched.output,
+        details: {
+          traceId: attachable.traceId,
+          traceFile: attachable.traceFile,
+          language: attachable.language,
+          runMode: attachable.runMode,
+          attached: true,
+          ...(attachable.collectorUrl ? { collectorUrl: attachable.collectorUrl } : {}),
+          ...launched.details,
+        },
+      };
+    }
+  }
+
   if (!args.force && !startCommand) {
     const reusable = [...activeTraces.values()].find(
       (t) => t.instrumentedFiles.size === 0 && t.cwd === ctx.cwd && t.language === language,
@@ -1380,8 +1734,9 @@ async function traceStartAction(
           `- Language: ${reusable.language}`,
           "",
           `Add the logging now with \`add_log\`: anchor on the exact line (\`oldString\`) and pass it back with ` +
-            `your \`${traceMarker(reusable.traceId)} ...\` added (\`newString\`). Then RUN the flow and call ` +
-            `\`activity_collect\` with traceId \`${reusable.traceId}\`.`,
+            `your \`${traceMarker(reusable.traceId)} ...\` added (\`newString\`). Then LAUNCH through this ` +
+            `session — re-issue \`activity_trace_start\` with \`startCommand\` (the run command) — drive the ` +
+            `app to the symptom, and \`activity_collect\` with traceId \`${reusable.traceId}\`.`,
           "",
           `**Logging snippet** (already inserted for you by \`add_log\`; here for reference):`,
           "```" + reusable.language,
@@ -1418,6 +1773,13 @@ async function traceStartAction(
   }
 
   const snippet = loggingSnippet(language, traceId, traceFile, collector?.url);
+
+  // A fresh session starts from a clean tree: probes an earlier (aborted or
+  // crashed) run left behind would be read as product code, or collected as
+  // foreign-marker noise. Pure leftover probe lines go now, deterministically;
+  // anything entangled with code is reported below instead of touched.
+  const swept = await sweepForeignProbes(ctx.cwd);
+
   const details: Record<string, unknown> = {
     traceId,
     traceFile,
@@ -1443,126 +1805,25 @@ async function traceStartAction(
     .filter(Boolean)
     .join("\n");
 
+  if (swept.length > 0) {
+    const removed = swept.reduce((n, s) => n + s.removed, 0);
+    const mixedNotes = swept.filter((s) => s.mixed.length > 0);
+    output +=
+      `\n\n**Swept ${removed} leftover probe line(s) from earlier runs** (they would have been read as ` +
+      `product code, or collected as foreign-marker noise):\n` +
+      swept.map((s) => `- \`${s.file}\`: ${s.removed} removed`).join("\n") +
+      (mixedNotes.length > 0
+        ? `\nLines that MIX a leftover marker with real code were LEFT IN PLACE — take those out by hand ` +
+          `(\`edit\`) if they are in your way:\n` +
+          mixedNotes.map((s) => `- \`${s.file}\` line(s) ${s.mixed.join(", ")}`).join("\n")
+        : "");
+    details.sweptProbes = swept;
+  }
+
   if (startCommand) {
-    const port = args.port ? Number(args.port) : undefined;
-    if (port) {
-      const killed = await killPort(port);
-      if (killed.length > 0) {
-        output += `\n\n- Killed ${killed.length} process(es) on port ${port}: ${killed.join(", ")}`;
-        details.killedPids = killed;
-      }
-    }
-
-    try {
-      await fs.writeFile(
-        traceFile,
-        `# Trace ${traceId} started at ${new Date().toISOString()}\n# Command: ${startCommand}\n\n`,
-        "utf8",
-      );
-
-      // The dev/app server starts in the user's own shell environment, with the
-      // project's pinned toolchain resolved — otherwise `startCommand` fails
-      // with `command not found` for exactly the reasons `bash` used to.
-      const { shellEnv, resolvedCommand } = await prepareStartCommand(startCommand, ctx.cwd);
-      const child = spawn(resolvedCommand, [], {
-        cwd: ctx.cwd,
-        shell: shellEnv.shell,
-        env: shellEnv.env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      session.childPid = child.pid;
-      session.childProcess = child;
-
-      const appendToFile = async (data: Buffer) => {
-        try {
-          await fs.appendFile(traceFile, data.toString());
-        } catch {
-          /* best-effort */
-        }
-      };
-      child.stdout?.on("data", (d: Buffer) => void appendToFile(d));
-      child.stderr?.on("data", (d: Buffer) => void appendToFile(d));
-      child.on("error", (err) => {
-        void fs.appendFile(traceFile, `\n[ERROR] spawn failed: ${err.message}\n`);
-      });
-      child.on("exit", (code) => {
-        void fs.appendFile(traceFile, `\n\n# Process exited with code ${code} at ${new Date().toISOString()}\n`);
-      });
-
-      // Wait for the app to actually be READY, not a fixed 2.5s. A cold first
-      // build (Flutter/Expo/Next) takes minutes; returning "ready" while it is
-      // still compiling caused runs to capture a stale / not-yet-running app.
-      // Readiness is decided by the COMMAND SHAPE: a web/dev-server command is
-      // ready when its port accepts connections; a mobile/device command (which
-      // has no port) is ready when its output shows a launch marker. Either way,
-      // an early exit or a fatal error means it failed, so we stop waiting
-      // instead of blocking the whole deadline on a dead process. A `flutter run
-      // -d <simulator>` was previously given a port it never opens and timed out
-      // falsely; the command shape now prevents that.
-      const isWeb = WEB_RUN_RE.test(startCommand);
-      ctx.progress?.({
-        stage: "start",
-        message: `starting \`${startCommand}\` (waiting for ${isWeb ? "the port to accept connections" : "the app to launch on the device"})`,
-      });
-      const waited = await waitForAppReady({
-        traceFile,
-        port,
-        isWeb,
-        deadlineMs: 180_000,
-        onPoll: (n) => {
-          if (Math.floor(n.waitedMs / 15000) !== Math.floor((n.waitedMs - 1500) / 15000)) {
-            ctx.progress?.({
-              stage: "start",
-              message:
-                n.state === "ready"
-                  ? `${isWeb ? "port" : "app"} ready after ${Math.round(n.waitedMs / 1000)}s`
-                  : n.state === "failed"
-                    ? `start failed after ${Math.round(n.waitedMs / 1000)}s — see the startup output`
-                    : `still building/starting (${Math.round(n.waitedMs / 1000)}s)`,
-            });
-          }
-        },
-      });
-      const ready = waited.ready;
-      const readyWaitedMs = waited.waitedMs;
-      const readyReason = waited.reason;
-
-      let initialOutput = "";
-      try {
-        initialOutput = await fs.readFile(traceFile, "utf8");
-      } catch {
-        /* file not ready yet */
-      }
-
-      const readinessLine = ready
-        ? readyReason === "port"
-          ? `**Ready** — port ${port} is accepting connections (after ${Math.round(readyWaitedMs / 1000)}s). The build is up; you can inspect.`
-          : `**Ready** — the app launched (after ${Math.round(readyWaitedMs / 1000)}s). You can inspect.`
-        : readyReason === "failed" || readyReason === "exited"
-          ? `**FAILED TO START** (after ${Math.round(readyWaitedMs / 1000)}s) — the process exited or printed an error. Do NOT inspect; read the startup output below, fix the command (wrong device / missing flavor / port conflict / missing dependency), and re-issue.`
-          : `**NOT READY YET** (after ${Math.round(readyWaitedMs / 1000)}s) — still building/starting. Do NOT inspect yet — capturing now inspects a stale or not-yet-running app. Re-issue \`activity_trace_start\` or poll \`activity_collect\` until this shows Ready.`;
-
-      output += [
-        "",
-        "",
-        `**Started** \`${startCommand}\` (PID ${child.pid ?? "unknown"}); stdout/stderr pipe into the trace file.`,
-        readinessLine,
-        initialOutput.trim() ? `\n**Startup output:**\n\`\`\`\n${initialOutput.slice(-2000)}\n\`\`\`` : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-      details.autoStarted = true;
-      details.childPid = child.pid;
-      details.ready = ready;
-      details.readyReason = readyReason;
-      if (port) {
-        details.port = port;
-      }
-    } catch (err) {
-      output += `\n\n**Could not start \`${startCommand}\`:** ${(err as Error).message}`;
-      details.autoError = (err as Error).message;
-    }
+    const launched = await startSessionChild(session, startCommand, args, ctx);
+    output += launched.output;
+    Object.assign(details, launched.details);
   } else {
     // Make sure the file exists so `collect` reports "no lines yet" rather than
     // "no such trace".
@@ -1577,12 +1838,15 @@ async function traceStartAction(
     "",
     "",
     "**Next steps (yours, not this tool's):**",
-    `1. \`read\` the files involved, then \`edit\` them to insert \`TURING_TRACE ...\` calls at the flow points that matter — `,
-    `   function entries/exits (with args and return values), if/else branches, loop iterations, API calls,`,
-    `   state mutations, catch blocks. Be selective; noise makes the trace unreadable.`,
+    `1. Place the probes with \`add_log\` at the flow points that matter — function entries/exits (with args `,
+    `   and return values), if/else branches, loop iterations, API calls, state mutations, catch blocks.`,
+    `   Be selective; noise makes the trace unreadable.`,
     startCommand
-      ? `2. Exercise the flow against the running server.`
-      : `2. Run the flow — traces go to the console AND \`${traceFile}\`.`,
+      ? `2. DRIVE the app to the reported state`
+      : `2. LAUNCH through this session — re-issue \`activity_trace_start\` with \`startCommand\` (the run ` +
+        `command; its stdout pipes into \`${traceFile}\`) — then DRIVE the app to the reported state`,
+    `   (\`mobile\` on a device, \`drive\` in a browser, the endpoint/job through \`bash\` with no UI).`,
+    `   Launching is not reproducing: the symptom lives in a flow you have to walk to.`,
     `3. \`activity_collect\` with traceId \`${traceId}\` to read the output back (add \`waitMs\` to wait for it).`,
     `4. \`activity_study\` with the same traceId to reason over it, then \`activity_cleanup\` when done.`,
   ].join("\n");
@@ -1727,27 +1991,43 @@ async function addLogAction(
   // Log-only, judged by the same rule the reproduce gate uses. A replacement that
   // rewrites or drops a line is a code change wearing a log, and it is refused here
   // so the tool cannot be used to sidestep the gate.
-  const kind = probeOnlyReplacement(oldString, newString);
+  const detailed = probeOnlyReplacementDetailed(oldString, newString);
+  const kind = detailed.kind;
   if (!kind) {
+    // The offending lines, verbatim: a refusal that says only "not log-only"
+    // leaves the caller guessing WHICH line broke the rule — a field run read
+    // it as "too many lines changed", fell back to a shell edit, and lost the
+    // pass to the shell guard. Naming the line closes the loop in one round.
+    const lost = detailed.lostLines.slice(0, 3);
+    const lostBlock = lost.length
+      ? "\n\nTHE LINE(S) THAT BROKE IT — from your `oldString`, they do not survive verbatim in " +
+        "your `newString` (rewritten, reformatted or dropped):\n" +
+        lost.map((l) => `    ${l}`).join("\n") +
+        (detailed.lostLines.length > lost.length
+          ? `\n    … and ${detailed.lostLines.length - lost.length} more`
+          : "") +
+        "\nPut each back EXACTLY as it was, and add your probe lines AROUND them — never in place of them.\n"
+      : "";
     return {
       output:
         `add_log: this replacement is not log-only, so nothing was written to ${file}. It must ADD (or remove) ` +
         `\`TURING_TRACE ...\` lines and leave every other line exactly as it was — the anchor's own lines have to ` +
         `survive verbatim in \`newString\`. Rewriting, reformatting or deleting a line of code here is a FIX, ` +
-        `and a fix goes through \`edit\` (where it is authored, recorded, and gated on having observed the bug).\n\n` +
+        `and a fix goes through \`edit\` (where it is authored, recorded, and gated on having observed the bug).` +
+        lostBlock +
         // The case that sends a model off to write probes by hand, and the answer
         // to it. A brace-less early return (`if (x) return;`) cannot be logged
         // INSIDE without adding braces — which is a code change, so this refuses
         // it, and a refusal with no way forward is how one run ended up editing
         // the file through a `python3` heredoc instead.
-        `IF THE LINE YOU WANT TO LOG INSIDE HAS NO BRACES — \`if (x) return;\`, \`for (…) doThing();\` — do not ` +
+        `\nIF THE LINE YOU WANT TO LOG INSIDE HAS NO BRACES — \`if (x) return;\`, \`for (…) doThing();\` — do not ` +
         `add them. Log the DECISION instead, on a new line directly ABOVE it, printing the values that decide ` +
         `which way it goes:\n` +
-        `    print("TURING_TRACE… recompute enrichingIds=$a last=$b");   // <- the added line\n` +
-        `    if (setEquals(a, b)) return;                                // <- untouched\n` +
+        `    print("TURING_TRACE… recompute ids=", ids, "last=", last);  // <- the added line (YOUR language's print)\n` +
+        `    if (ids == last) return;                                    // <- untouched\n` +
         `That tells you whether the branch was taken AND why, costs no code change, and comes back out cleanly.`,
       isError: true,
-      details: { path: file, rejected: "not-log-only" },
+      details: { path: file, rejected: "not-log-only", lostLines: detailed.lostLines.slice(0, 8) },
     };
   }
 
@@ -1771,6 +2051,34 @@ async function addLogAction(
     };
   }
 
+  // The probe must be a call the file's language can compile. A `console.log`
+  // in a `.dart` file is discovered only when the build for the run fails —
+  // minutes later, with the probe to blame and the pass nowhere. Refused here,
+  // in the language's own terms, with the right form to use instead.
+  const callForms = PROBE_CALL_RE_BY_LANGUAGE[session.language];
+  if (kind === "insert" && callForms) {
+    const addedLines = newString
+      .split("\n")
+      .filter((l) => !oldString.split("\n").some((o) => o.trimEnd() === l.trimEnd()))
+      .filter((l) => PROBE_MARKER_RE.test(l))
+      .filter((l) => !/^\s*(?:\/\/|#|--)/.test(l)); // comments are stripped as probes; calls are what compiles
+    const offender = addedLines.find((l) => !callForms.test(l));
+    if (offender) {
+      const example = (printByExample(sessionMarker)[session.language] ?? printByExample(sessionMarker).default)
+        .example;
+      return {
+        output:
+          `add_log: this line is not a ${session.language} log call, so it would not compile in ${file}:\n` +
+          `    ${offender.trim()}\n` +
+          `Write the probe in the file's own logging call instead — for ${session.language}, e.g.:\n` +
+          `    ${example}\n` +
+          `(keep the \`TURING_TRACE_<suffix>\` marker at the start of the message; only the call around it changes).`,
+        isError: true,
+        details: { path: file, rejected: "wrong-language", language: session.language },
+      };
+    }
+  }
+
   let text: string;
   try {
     text = await fs.readFile(file, "utf8");
@@ -1779,6 +2087,25 @@ async function addLogAction(
   }
   const occurrences = text.split(oldString).length - 1;
   if (occurrences === 0) {
+    // Whitespace archaeology is the failure this prevents: the model KNOWS the
+    // code is there, the anchor simply differs in indentation or trailing
+    // spaces, and "read the file and anchor verbatim" turns into `cat -A`,
+    // `od -c` and eventually a shell edit. Offer the exact bytes instead.
+    const loose = locateAnchorLoose(text, oldString);
+    if (loose) {
+      return {
+        output:
+          `add_log: oldString not found VERBATIM in ${file} — it differs in whitespace (indentation, ` +
+          `trailing spaces). The same lines exist at line ${loose.startLine}; the file's exact bytes there are:\n` +
+          "```\n" +
+          `${loose.exact}\n` +
+          "```\n" +
+          `Re-issue with THAT as \`oldString\` (paste it exactly — including its indentation), and your ` +
+          `\`newString\` as those same lines plus your marker line(s).`,
+        isError: true,
+        details: { path: file, rejected: "anchor-whitespace", startLine: loose.startLine },
+      };
+    }
     return {
       output: `add_log: oldString not found in ${file}. Read the file and anchor on text that exists verbatim.`,
       isError: true,
@@ -2813,7 +3140,7 @@ async function inspectAction(
       traceId,
       hasBrowser: true,
       screenshotCaptured: screenshotImages.length > 0,
-      // `captured` — the reproduce gate's contract (see ReproductionGate.observe).
+      // `captured` — the observe-first gate's contract (see `enforceObserveFirst`).
       // An observation is a screenshot the model can actually SEE, console output,
       // or server-side trace lines. Page text alone is not counted: the tool's own
       // NOTE above says a missing screenshot is not a pass, and the gate must not
@@ -3088,6 +3415,66 @@ function boxPrompt(element: string, dims: { width: number; height: number }): st
 }
 
 /**
+ * Parse a bounding-box answer into the RAW rect (image pixels), for callers
+ * that fuse on the box rather than its centre. Same contract and the same
+ * two-channel reconciliation as {@link parseBox}; "none"/undefined semantics
+ * are identical so the callers treat the shapes alike.
+ */
+function parseBoxRect(
+  text: string,
+  dims?: { width: number; height: number },
+): { x: number; y: number; width: number; height: number; via?: string; note?: string } | "none" | undefined {
+  if (/\bBOX\s*:\s*none\b/i.test(text)) return "none";
+  const m = text.match(/\bBOX\s*:\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)/i);
+  if (!m) return undefined;
+  const pixels = { x: Number(m[1]), y: Number(m[2]), width: Number(m[3]), height: Number(m[4]) };
+  const fb = text.match(
+    /\bFRACBOX\s*:\s*(\d*\.?\d+)\s*,\s*(\d*\.?\d+)\s*,\s*(\d*\.?\d+)\s*,\s*(\d*\.?\d+)/i,
+  );
+  if (!dims || !fb) return pixels;
+  const reconciled = reconcileBox(pixels, fb, dims);
+  return reconciled;
+}
+
+/**
+ * Box-form of {@link reconcileLocalization}: the fractional box wins on a tall
+ * screenshot, with the same aspect-collapse detection and note. Applied to the
+ * rect's corners so the reconciliation's per-axis reasoning is preserved.
+ */
+function reconcileBox(
+  pixels: { x: number; y: number; width: number; height: number },
+  fb: RegExpMatchArray,
+  dims: { width: number; height: number },
+): { x: number; y: number; width: number; height: number; via: string; note?: string } {
+  const fx = Number(fb[1]);
+  const fy = Number(fb[2]);
+  const fw = Number(fb[3]);
+  const fh = Number(fb[4]);
+  const inRange = (v: number) => Number.isFinite(v) && v >= 0 && v <= 1;
+  if (!inRange(fx) || !inRange(fy) || !inRange(fw) || !inRange(fh)) {
+    return { ...pixels, via: "pixels (no usable fraction)" };
+  }
+  const fromFrac = {
+    x: Math.round(fx * dims.width),
+    y: Math.round(fy * dims.height),
+    width: Math.round(fw * dims.width),
+    height: Math.round(fh * dims.height),
+  };
+  const centerY = pixels.y + pixels.height / 2;
+  const fromFracCenterY = fromFrac.y + fromFrac.height / 2;
+  const dy = Math.abs(fromFracCenterY - centerY);
+  const collapsed = Math.round(fy * dims.width + (fh * dims.width) / 2);
+  const aspect = dims.height / dims.width;
+  const note =
+    aspect > 1.2 && Math.abs(centerY - collapsed) <= Math.max(12, dims.height * 0.01) && dy > dims.height * 0.02
+      ? `the pixel box's Y is the fraction scaled by WIDTH, not HEIGHT — aspect-ratio collapse (x${aspect.toFixed(2)}); used the fraction`
+      : dy > dims.height * 0.02
+        ? `pixel box centre Y (${Math.round(centerY)}) and fraction Y (${Math.round(fromFracCenterY)}) disagree by ${Math.round(dy)}px; used the fraction`
+        : undefined;
+  return { ...fromFrac, via: "fraction", ...(note ? { note } : {}) };
+}
+
+/**
  * Parse the bounding-box answer into a tap center (image pixels).
  *
  * Same two-channel reconciliation as {@link parsePos} — the fractional box is
@@ -3110,6 +3497,52 @@ function parseBox(
     { fx: Number(fb[1]) + Number(fb[3]) / 2, fy: Number(fb[2]) + Number(fb[4]) / 2 },
     dims,
   );
+}
+
+/**
+ * The thresholded pixel diff the tap verifier trusts when the element tree is
+ * blind to a change (canvas redraws, image swaps, unlabeled state). Both
+ * captures are downscaled to 256px wide grayscale, the status-bar (top 6%) and
+ * home-indicator (bottom 3%) strips are cropped away, and the verdict is
+ * CHANGED only when more than 1.5% of pixels differ by more than 8/255 — clock
+ * ticks and antialiasing stay noise, a navigation does not. Returns undefined
+ * when the diff cannot run: an unavailable tiebreak never invents a verdict.
+ */
+export async function thresholdedPixelDiff(
+  aBase64: string | undefined,
+  bBase64: string | undefined,
+): Promise<boolean | undefined> {
+  if (!aBase64 || !bBase64) return undefined;
+  try {
+    const { Jimp } = await import("jimp");
+    const load = async (b64: string) => {
+      const j = await Jimp.fromBuffer(Buffer.from(b64, "base64"));
+      j.resize({ w: 256 });
+      j.greyscale();
+      return j;
+    };
+    const ja = await load(aBase64);
+    const jb = await load(bBase64);
+    const h = Math.min(ja.bitmap.height, jb.bitmap.height);
+    const top = Math.round(h * 0.06);
+    const bottom = Math.round(h * 0.03);
+    const da = ja.bitmap.data;
+    const db = jb.bitmap.data;
+    const w = Math.min(ja.bitmap.width, jb.bitmap.width);
+    let diff = 0;
+    let total = 0;
+    for (let y = top; y < h - bottom; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        total++;
+        if (Math.abs(da[i]! - db[i]!) > 8) diff++;
+      }
+    }
+    if (!total) return undefined;
+    return diff / total > 0.015;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -3203,18 +3636,43 @@ export async function tapVisualAction(
    * when it actually reported something — an app whose views never reach the
    * accessibility tree signs as "" on every screen, and "" === "" would call
    * every tap a miss.
+   *
+   * TREE-BLIND UPGRADE: a tree that says "unchanged" is not the last word —
+   * canvas redraws, image swaps and unlabeled state changes never reach it,
+   * and believing the tree there re-taps a toggle that already flipped (the
+   * second tap reverts it). So when the tree says unchanged, a THRESHOLDED
+   * pixel diff gets the deciding vote: both captures are downscaled to a
+   * common width, the status bar and home-indicator strips are cropped away,
+   * and only a meaningful fraction of genuinely-different pixels (>1.5%)
+   * counts as change. Below that, clock ticks and antialiasing noise stay
+   * noise. The diff is async, so it is computed by the caller (`pixelsChanged`)
+   * and threaded in as a tiebreak.
    */
   const changedBy = (
     beforeSig: string | undefined,
     afterSig: string | undefined,
     beforePix: string | undefined,
     afterPix: string | undefined,
+    pixelDiff?: boolean,
   ): { changed: boolean; via: string } => {
     const treeUsable =
       beforeSig !== undefined && afterSig !== undefined && (beforeSig !== "" || afterSig !== "");
-    if (treeUsable) return { changed: beforeSig !== afterSig, via: "element tree" };
+    if (treeUsable && beforeSig !== afterSig) return { changed: true, via: "element tree" };
+    if (treeUsable && pixelDiff === true) return { changed: true, via: "pixels (tree blind)" };
+    if (treeUsable) return { changed: false, via: "element tree" };
     return { changed: !!beforePix && !!afterPix && beforePix !== afterPix, via: "pixels" };
   };
+
+  /**
+   * The thresholded pixel diff {@link changedBy} trusts when the tree is
+   * blind. Downscales both captures to 256px wide (grayscale), crops the top
+   * 6% (status bar) and bottom 3% (home indicator), and reports whether more
+   * than 1.5% of pixels differ by more than 8/255. Returns undefined when the
+   * diff cannot run (no jimp, unreadable image) — an unavailable tiebreak
+   * never invents a verdict, it just leaves the tree's.
+   */
+  const pixelsChanged = (a: { data: string; mime: string } | undefined, b: { data: string; mime: string } | undefined) =>
+    thresholdedPixelDiff(a?.data, b?.data);
 
   /**
    * The element tree for the CURRENT screen, fetched once and used for both
@@ -3309,15 +3767,27 @@ export async function tapVisualAction(
       tmpFile = path.join(os.tmpdir(), `turing-tap-${randomBytes(6).toString("hex")}${ext}`);
       try {
         await fs.writeFile(tmpFile, Buffer.from(before.data, "base64"));
-        // The retry asks a DIFFERENT question (bounding box -> centre): asking
-        // the same question of the same screen returns the same wrong answer.
-        const useBox = attempt > 0;
+        // BOX-FIRST (see the parse below). The retry asks the complementary
+        // question (centre point instead of box): asking the same question of
+        // the same screen returns the same wrong answer.
+        const useBox = attempt === 0;
         const loc = await mediaAnalysis!.execute(
           `tapvisual-loc-${attempt}`,
           { file: tmpFile, prompt: useBox ? boxPrompt(element, dims) : localizePrompt(element, dims) },
           ctx,
         );
-        const pos = useBox ? parseBox(resultText(loc), dims) : parsePos(resultText(loc), dims);
+        // BOX-FIRST, always. The box is the currency the fusion wants: it
+        // carries SIZE (which separates a control from its wrapper) and it
+        // survives the localizer's measured vertical bias, where a point does
+        // not — a box 90pt low still overlaps the true control, a point 90pt
+        // low is simply below it. A point-shaped answer is still accepted so
+        // a model that ignores the box contract degrades, not fails.
+        const answered = resultText(loc);
+        const boxParsed = parseBoxRect(answered, dims);
+        const box = boxParsed && boxParsed !== "none" ? boxParsed : undefined;
+        const pos = box
+          ? { x: box.x + box.width / 2, y: box.y + box.height / 2, ...(box.via ? { via: box.via } : {}), ...(box.note ? { note: box.note } : {}) }
+          : parsePos(answered, dims);
         if (pos === "none") {
           // "Not on this screen" is a real answer and must not be overridden by
           // a stray element match — but if the tree DID match a label, the
@@ -3335,11 +3805,24 @@ export async function tapVisualAction(
           }
           vision = { unavailable: "reported the element as not visible, but the tree matched it" };
         } else if (!pos) {
-          vision = { unavailable: `did not follow the contract: ${resultText(loc).slice(0, 120)}` };
+          vision = { unavailable: `did not follow the contract: ${answered.slice(0, 120)}` };
         } else {
+          const logicalPoint = imageToLogical(pos, dims, screen);
+          const a = imageToLogical({ x: box?.x ?? 0, y: box?.y ?? 0 }, dims, screen);
+          const b = imageToLogical({ x: (box?.x ?? 0) + (box?.width ?? 0), y: (box?.y ?? 0) + (box?.height ?? 0) }, dims, screen);
           vision = {
-            point: imageToLogical(pos, dims, screen),
+            point: logicalPoint,
             imagePoint: { x: Math.round(pos.x), y: Math.round(pos.y) },
+            ...(box
+              ? {
+                  box: {
+                    x: Math.min(a.x, b.x),
+                    y: Math.min(a.y, b.y),
+                    width: Math.abs(b.x - a.x),
+                    height: Math.abs(b.y - a.y),
+                  },
+                }
+              : {}),
           };
           if (pos.note) steps.push(`- Localizer: ${pos.note}`);
         }
@@ -3355,6 +3838,7 @@ export async function tapVisualAction(
       all: allElements,
       ...(matched ? { matched } : {}),
       ...(beforeTree ? {} : { unavailable: "the UI tree could not be read" }),
+      ...(screen ? { screen: { width: screen.width, height: screen.height } } : {}),
     });
     if (!resolved) {
       return {
@@ -3392,7 +3876,16 @@ export async function tapVisualAction(
     const afterSig = (await readTree())?.signature;
     if (after) lastAfter = { data: after.data, mime: after.mime };
 
-    const verdict = changedBy(beforeSig, afterSig, before.data, after?.data);
+    // The tree speaks first; only when it says "unchanged" do the pixels get
+    // a vote (see changedBy — a tree-blind change must not be re-tapped).
+    let verdict = changedBy(beforeSig, afterSig, before.data, after?.data);
+    if (!verdict.changed && verdict.via === "element tree") {
+      const diff = await pixelsChanged(
+        before.data ? { data: before.data, mime: before.mime } : undefined,
+        after ? { data: after.data, mime: after.mime } : undefined,
+      );
+      verdict = changedBy(beforeSig, afterSig, before.data, after?.data, diff);
+    }
     if (verdict.changed) {
       steps.push(`- Confirmed by ${verdict.via}: the screen changed.`);
       return {

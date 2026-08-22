@@ -60,6 +60,13 @@ llm.stream = async function* (_model, ctx) {
     message: { role: "assistant", content, model: "x", api: "openrouter", provider: "x", usage: zeroUsage(), stopReason, timestamp: 0 },
   });
   yield { type: "start", partial: { role: "assistant", content: [], model: "x", api: "openrouter", provider: "x", usage: zeroUsage(), stopReason: "stop", timestamp: 0 } };
+  // The verify hop the chain adds after a write (route-policy FLOOR 0): this
+  // stub has no app to run, so it delivers an honest empty report. The
+  // observe-first guard refuses the first one and passes the re-issue.
+  if (/ACTIVITY INSPECT/.test(ctx.systemPrompt ?? "")) {
+    yield mk([{ type: "toolCall", id: "qa", name: "deliver", arguments: { writes: [], logPaths: [], findings: "nothing to run in this smoke stub" } }], "tool_use");
+    return;
+  }
   // Turn 1: create_plan (always first in write_edit).
   if (!planTurnDone) {
     planTurnDone = true;

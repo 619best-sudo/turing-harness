@@ -64,8 +64,13 @@ export const ANY_MARKER_RE = new RegExp(`${markerAlternation()}[_A-Za-z0-9-]*`);
 /**
  * A line whose ONLY purpose is a probe: whitespace, then a log call that carries
  * the marker, then optional whitespace. `print("TURING_TRACE_x …");`,
- * `console.log(`TURING_TRACE_x …`)`, `printf("TURING_TRACE_x …\n")`, a `//`
+ * `console.log(\`TURING_TRACE_x …\`)`, `printf("TURING_TRACE_x …\n")`, a `//`
  * comment about one.
+ *
+ * Case-insensitive because call names come in camelCase per language — Dart's
+ * idiomatic `debugPrint` (what every Flutter run reaches for) failed the
+ * case-sensitive match, so crashed runs' probes survived the deterministic
+ * strip and landed in the model pass — or in the next run's source.
  *
  * Deliberately narrow, because deleting a line is not reversible. A line that
  * MIXES a probe with code — `if (x) { print("TURING_TRACE_x"); return; }` — is
@@ -78,10 +83,11 @@ export const PURE_PROBE_LINE_RE = new RegExp(
     markerAlternation() +
     String.raw`[^\n]*$|` +
     String.raw`^[ \t]*(?:await\s+)?` +
-    String.raw`(?:[\w.$]*(?:print|log|write|puts|echo|NSLog|Debug\.\w+|Log\.\w+|fmt\.Print\w*)[\w.$]*)` +
+    String.raw`(?:[\w.$]*(?:print|log|write|puts|echo|nslog|debug|fmt\.)[\w.$]*)` +
     String.raw`\s*\(?[^;]*` +
     markerAlternation() +
     String.raw`[\s\S]*?\)?\s*;?\s*$`,
+  "i",
 );
 
 /** What a deterministic strip did to one file. */

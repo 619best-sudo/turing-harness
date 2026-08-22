@@ -62,6 +62,21 @@ export type ToolCategorizer = (tool: AgentTool, defaults: string[]) => string[];
 
 export interface RegistryOptions {
   categorizer?: ToolCategorizer;
+  /**
+   * How EXTERNAL MCP servers scope into the chain when they declare no
+   * categorizers of their own.
+   *
+   *   - "selection" (default): connected ≠ in-chain. The provider's tools get
+   *     NO categorizers and reach no hop until `selectExternalMcps` (or an
+   *     explicit `setProviderCategorizers`) names it. Before this mode, the
+   *     name heuristics in categorize.ts silently scoped any connected
+   *     browser-flavoured MCP into the QA hops of every project — a Flutter/iOS
+   *     run opening with ~62 tools, two-thirds of them unable to touch the
+   *     target, and the model reasoning "my automation is browser-based".
+   *   - "auto": the legacy behavior — heuristic scoping at registration.
+   *     Escape hatch for hosts that relied on it.
+   */
+  externalMcpScoping?: "selection" | "auto";
 }
 
 /** Declarative selection of a categorizer's toolset from the registry. */
@@ -82,6 +97,22 @@ export interface CategorizerToolFilter {
 
 /** A function that computes a categorizer's toolset from the live registry. */
 export type CategorizerToolResolver = (registry: Registry, categorizer: string) => AgentTool[];
+
+/**
+ * Does an MCP server match one of the selected names? Ids are hosts' own
+ * (`playwright`, `turing-machine:mcp:chrome-devtools`); the UI knows display
+ * names (`chrome-devtools`). Match exact id, an id's `:name` suffix, or the
+ * name itself — all case-insensitive.
+ */
+export function mcpNameMatches(id: string, name: string | undefined, selected: readonly string[]): boolean {
+  const wanted = selected.map((n) => n.trim().toLowerCase()).filter(Boolean);
+  if (!wanted.length) return false;
+  const idLower = id.toLowerCase();
+  const nameLower = name?.trim().toLowerCase();
+  return wanted.some(
+    (n) => idLower === n || idLower.endsWith(`:${n}`) || nameLower === n,
+  );
+}
 
 /**
  * Ways to define a categorizer's "fixed" toolset:
@@ -114,9 +145,11 @@ export class Registry {
   private toolIndex = new Map<string, string>();
   private listeners = new Set<(event: RegistryEvent) => void>();
   private readonly categorizer: ToolCategorizer;
+  private readonly externalMcpScoping: "selection" | "auto";
 
   constructor(opts: RegistryOptions = {}) {
     this.categorizer = opts.categorizer ?? ((_tool, def) => def);
+    this.externalMcpScoping = opts.externalMcpScoping ?? "selection";
   }
 
   /** Subscribe to add/remove/changed events (UI can keep its capability list in sync). */
@@ -142,13 +175,24 @@ export class Registry {
     // Per-tool categorizers: explicit → custom categorizer(default) → default.
     // Cohort scoping, decided once for the whole provider: a tool that names no
     // QA keyword but sits in a QA server is still QA. See `isInspectSurface`.
+    //
+    // EXCEPTION — external MCP servers under "selection" scoping: their
+    // undeclared tools get NO categorizers. Connected is not selected; the
+    // heuristics below decide where a tool belongs, never whether the user
+    // offered it to the run. Explicit declarations still win for hosts that
+    // genuinely want a server in-chain unconditionally.
+    const isExternalMcp = input.kind === "mcp" && input.source === "external";
+    const deferToSelection = isExternalMcp && this.externalMcpScoping === "selection";
     const qaSurface = input.categorizers?.length ? false : isInspectSurface(input.tools);
     const tools = input.tools.map((t) => ({
       ...t,
+      providerId: input.id,
       mutates: t.mutates ?? false,
       categorizers: t.categorizers?.length
         ? t.categorizers
-        : this.categorizer(t, qaSurface ? ["activity_inspect"] : categorizeTool(t)),
+        : deferToSelection && !input.categorizers?.length
+          ? []
+          : this.categorizer(t, qaSurface ? ["activity_inspect"] : categorizeTool(t)),
     }));
     const categorizers = input.categorizers?.length
       ? input.categorizers
@@ -314,6 +358,30 @@ export class Registry {
     for (const t of p.tools) (t as AgentTool).categorizers = [...next];
     this.emit({ type: "changed", provider: this.toListItem(p) });
     return true;
+  }
+
+  /**
+   * Apply a per-run MCP selection: every EXTERNAL MCP server whose id or name
+   * matches a selected name (exact id; the `…:name` suffix a host's
+   * namespacing produces; or the display name the UI knows) is scoped to
+   * `categorizers`; every other external MCP drops to NO scope, so it stays
+   * connected but reaches no hop. Non-MCP and builtin providers are untouched.
+   * Returns what it did, for the run log.
+   */
+  selectExternalMcps(names: readonly string[], categorizers: string[]): { selected: string[]; dropped: string[] } {
+    const selected: string[] = [];
+    const dropped: string[] = [];
+    for (const p of this.providers.values()) {
+      if (p.kind !== "mcp" || p.source !== "external") continue;
+      if (mcpNameMatches(p.id, p.name, names)) {
+        this.setProviderCategorizers(p.id, categorizers);
+        selected.push(p.id);
+      } else {
+        this.setProviderCategorizers(p.id, []);
+        dropped.push(p.id);
+      }
+    }
+    return { selected, dropped };
   }
 
   /** Look up a single executable tool by name. */

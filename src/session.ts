@@ -84,6 +84,12 @@ export interface SessionOptions {
   categorizerTools?: Partial<Record<string, CategorizerToolSpec>>;
   /** Custom scoping strategy for this session's registry (defaults per tool). */
   categorizer?: ToolCategorizer;
+  /**
+   * LEGACY: include every CONNECTED external MCP server in the chain via the
+   * name heuristics, without any per-run selection. Default false — connected
+   * is not selected; name servers per run with `selectMcpServers`.
+   */
+  includeUnselectedMcpTools?: boolean;
   maxSteps?: number;
   reasoning?: import("./types.js").ThinkingLevel;
   temperature?: number;
@@ -168,6 +174,8 @@ export class Session implements AgentHost {
 
   /** Active run abort controllers, so `abort()` cancels everything in-flight. */
   private activeRuns = new Set<AbortController>();
+  /** Per-run MCP selection (composer): named servers ride every category. */
+  private mcpSelection: string[] | undefined;
   /** Optional project-session context used when Prepare corrects the category. */
   private projectPresetReconciliation?: Pick<
     ApplyPresetOptions,
@@ -185,7 +193,13 @@ export class Session implements AgentHost {
     this.llm = deps.llm;
 
     this.logStore = new LogStore();
-    this.registry = new Registry({ categorizer: opts.categorizer });
+    this.registry = new Registry({
+      categorizer: opts.categorizer,
+      // Connected ≠ in-chain: external MCPs stay out of every hop until the
+      // host names them via selectMcpServers (the composer selection). The
+      // "auto" escape restores the legacy name-heuristic scoping.
+      externalMcpScoping: opts.includeUnselectedMcpTools ? "auto" : "selection",
+    });
     this.permission = new PermissionGate(opts.permissionMode ?? "ask-mutations", opts.permissionCallback);
 
     if (opts.registerBuiltins !== false) {
@@ -254,7 +268,9 @@ export class Session implements AgentHost {
   }
   async addMcpServer(opts: McpServerOptions): Promise<ProviderListItem> {
     const provider = await connectMcpServer(opts);
-    return this.registry.add(provider);
+    const item = this.registry.add(provider);
+    this.applyMcpSelectionTo(provider.id);
+    return item;
   }
   /**
    * Attach multiple MCP servers concurrently. Each `addMcpServer` is an
@@ -273,7 +289,51 @@ export class Session implements AgentHost {
   async addPooledMcpServer(opts: McpServerOptions, pool: McpRuntimePool): Promise<ProviderListItem> {
     const provider = await pool.borrow(opts, this.id);
     const wrapped = wrapPooledProvider(provider, pool, opts, this.id);
-    return this.registry.add(wrapped);
+    const item = this.registry.add(wrapped);
+    this.applyMcpSelectionTo(item.id);
+    return item;
+  }
+
+  /**
+   * Name the EXTERNAL MCP servers offered to this run (the composer
+   * selection). Selected servers join EVERY categorizer; every other external
+   * MCP stays connected but reaches no hop. Re-callable per run — a later call
+   * with a different list re-scopes both ways. Late-attached servers
+   * (addMcpServer after this call) inherit the current selection.
+   *
+   * Names match a provider id exactly or as its `…:name` suffix, so a host's
+   * namespaced ids (`turing-machine:mcp:chrome-devtools`) resolve from the
+   * plain server name the UI knows (`chrome-devtools`).
+   */
+  selectMcpServers(names: readonly string[]): { selected: string[]; dropped: string[] } {
+    this.mcpSelection = [...names];
+    const res = this.registry.selectExternalMcps(names, this.categoryIds);
+    this.logStore.append({
+      tags: ["session", "mcp", "mcp:selection"],
+      level: "info",
+      message: `mcp selection applied: ${res.selected.length} in-chain, ${res.dropped.length} connected-only`,
+      data: { selected: res.selected, dropped: res.dropped },
+    });
+    return res;
+  }
+
+  /** Current per-run MCP selection, if one has been made. */
+  get mcpServersSelected(): readonly string[] | undefined {
+    return this.mcpSelection ? [...this.mcpSelection] : undefined;
+  }
+
+  /** Re-apply the active selection (a server attached after the selection was
+   * made must not sneak into the chain unselected). Idempotent over the whole
+   * external-MCP set, so re-running it for one late attach is safe. */
+  private applyMcpSelectionTo(_providerId: string): void {
+    if (!this.mcpSelection) return;
+    this.registry.selectExternalMcps(this.mcpSelection, this.categoryIds);
+  }
+
+  /** Every categorizer id in this session's setup — what "all categories" means. */
+  private get categoryIds(): string[] {
+    const setup = this.orchestrator.categorizerSetup;
+    return setup ? setup.categories.map((c) => c.id) : ["conversation", "read", "write_edit", "activity_inspect"];
   }
 
   /** Attach multiple pooled MCP servers concurrently. */

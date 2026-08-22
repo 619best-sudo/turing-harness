@@ -812,24 +812,47 @@ function splitShellStatements(command: string): string[] {
  * escape from the authoring model.
  */
 export function probeOnlyReplacement(oldString: string, newString: string): "insert" | "strip" | null {
+  return probeOnlyReplacementDetailed(oldString, newString).kind;
+}
+
+/**
+ * {@link probeOnlyReplacement} with the evidence attached: on a refusal,
+ * `lostLines` carries the original lines that did not survive verbatim (the
+ * ones the replacement rewrote or dropped). A refusal that says only "not
+ * log-only" leaves the caller guessing WHICH line offended — a field run read
+ * it as "too many lines changed", fell back to a shell edit, and burned the
+ * pass. Naming the line closes that loop in one round.
+ */
+export function probeOnlyReplacementDetailed(
+  oldString: string,
+  newString: string,
+): { kind: "insert" | "strip" | null; lostLines: string[] } {
   const markers = (s: string) => (s.match(new RegExp(PROBE_MARKER_RE.source, "g")) ?? []).length;
   const meaningful = (s: string) =>
     s
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !PROBE_MARKER_RE.test(l));
-  const preserved = (before: string, after: string) => {
+  const unmatched = (before: string, after: string) => {
     const from = meaningful(before);
     const to = meaningful(after);
     let i = 0;
     for (const line of to) if (i < from.length && from[i] === line) i += 1;
-    return i === from.length;
+    return { preserved: i === from.length, lost: from.slice(i) };
   };
   const before = markers(oldString);
   const after = markers(newString);
-  if (after > before && preserved(oldString, newString)) return "insert";
-  if (before > after && preserved(newString, oldString)) return "strip";
-  return null;
+  if (after > before) {
+    const { preserved, lost } = unmatched(oldString, newString);
+    if (preserved) return { kind: "insert", lostLines: [] };
+    return { kind: null, lostLines: lost };
+  }
+  if (before > after) {
+    const { preserved, lost } = unmatched(newString, oldString);
+    if (preserved) return { kind: "strip", lostLines: [] };
+    return { kind: null, lostLines: lost };
+  }
+  return { kind: null, lostLines: [] };
 }
 
 /**
@@ -1044,6 +1067,30 @@ export const bashTool: AgentTool = {
         details: { command: "" },
       };
     }
+    const polling = sleepThenTailTarget(command);
+    if (polling) {
+      // SLEEP-AND-TAIL IS NOT HOW YOU WAIT HERE, and the cost is not the wasted
+      // seconds — it is the transcript. A field run launched `flutter run` in the
+      // background correctly, then polled its log with `tail -30`, `sleep 30 &&
+      // tail -50`, `sleep 60 && tail -80`. Three build logs went into the history
+      // and the next request came back 413 request entity too large, which ended
+      // the hop and the run. The tool already has the right primitive: re-issue
+      // the launch command with `waitMs` and the call ATTACHES to the copy that is
+      // already running (see startBackgroundCommand) and returns on an OUTCOME —
+      // one result instead of a growing pile of log tails.
+      return {
+        output:
+          `bash refused — \`sleep\` + \`${polling.reader}\` is polling, and each poll puts another slice of ` +
+          "that log into this conversation. Three of them is what makes the NEXT request too large to " +
+          "send.\n\nWait properly instead: re-issue the ORIGINAL command that started this process with " +
+          "`background: true` and `waitMs` (e.g. 300000). It attaches to the copy already running — it does " +
+          "not start a second one — and returns when there is an outcome: ready, failed, exited or " +
+          "settled.\n\nIf you need something SPECIFIC out of the log, ask for that and nothing else: " +
+          `\`grep -m5 -E "<pattern>" ${polling.target}\`, or \`tail -n 20\` with no sleep in front of it.`,
+        isError: true,
+        details: { command },
+      };
+    }
     ctx.log({ timestamp: Date.now(), level: "info", tags: ["tool:bash", "exec"], message: command });
     const runInBackground =
       args.background === true || (args.background == null && isLikelyBackgroundCommand(command));
@@ -1083,8 +1130,18 @@ export const bashReadonlyTool: AgentTool = {
     }
     const blocked = validateReadonlyShellCommand(command);
     if (blocked) {
+      const authored = detectShellAuthoring(command);
       return {
-        output: `bash_readonly: blocked "${command}" because it looks like ${blocked}. Use read/ls/grep for inspection, and reserve mutating shell for PERFORM/PERFECT.`,
+        output: authored
+          ? `bash_readonly refused — that command WRITES ${authored.path} (${authored.form}), and this tool ` +
+            "is read-only.\n\nMore importantly, changing a file here would be invisible: the run records " +
+            "changes made through `write`/`edit`, and a file rewritten by a shell script is not on that " +
+            "record — so nothing downstream builds it, runs it or verifies it, and the run would report " +
+            "having changed nothing.\n\nThis categorizer's job is to find and understand the code. Report " +
+            "the exact change that is needed — the file, the line, the old text and the new text — and " +
+            "`deliver` it (nominate `write_edit`); the pass that owns file changes makes it with `edit`, " +
+            "and the verify pass then proves it."
+          : `bash_readonly: blocked "${command}" because it looks like ${blocked}. Use read/ls/grep for inspection, and reserve mutating shell for the pass that owns file changes.`,
         isError: true,
         details: { command, blockedReason: blocked },
       };
@@ -1553,7 +1610,41 @@ function validateReadonlyShellCommand(command: string): string | undefined {
   for (const rule of READONLY_SHELL_BLOCKS) {
     if (rule.pattern.test(suppressed)) return rule.reason;
   }
+  // THE HOLE THIS CLOSES. The rules above are shell-shaped — redirection, `tee`,
+  // `rm`/`mv`/`cp` — and an interpreter is none of those. From the field: the
+  // READ hop ran, through this tool whose own description promises "Blocks file
+  // writes", a `python3 -c` script that opened a Dart source file with mode 'w'
+  // and rewrote the string the user asked about. It worked. Nothing recorded a
+  // write, so the run reported "0 written", the verify floor (which keys off
+  // written files) stayed inert, and a run that had already changed the user's
+  // code ended in the read hop with no build, no capture and no verdict.
+  //
+  // `detectShellAuthoring` already understood that command exactly — it was
+  // simply never asked. It is asked now.
+  const authoring = detectShellAuthoring(trimmed);
+  if (authoring) return `a file WRITE to ${authoring.path} (${authoring.form})`;
   return undefined;
+}
+
+/**
+ * `sleep N && tail <log>` — the polling shape, and only that shape.
+ *
+ * Deliberately narrow: a bare `sleep` (waiting on a device to boot), a bare
+ * `tail -n 20` (reading a log once), and `grep` of a log are all legitimate and
+ * pass through. What is refused is the COMBINATION, which is a wait loop the
+ * tool already implements better via `waitMs` — and whose real cost is one log
+ * dump per poll in the request that follows.
+ */
+export function sleepThenTailTarget(command: string): { reader: string; target: string } | undefined {
+  if (!/\bsleep\s+\d/.test(command)) return undefined;
+  const m = /\b(tail|cat|head)\b[^|;&]*?(\S*\.(?:log|txt|out))/.exec(command);
+  if (!m) {
+    // `sleep 30 && tail -f something` with no recognisable log path still counts
+    // when a reader follows the sleep.
+    const bare = /\bsleep\s+\d+\s*(?:&&|;)\s*(tail|cat|head)\b/.exec(command);
+    return bare ? { reader: bare[1], target: "<the log>" } : undefined;
+  }
+  return { reader: m[1], target: m[2] };
 }
 
 /** Characters of shell output handed back before it is truncated with a notice. */

@@ -385,3 +385,89 @@ test("the loop appends an unknown-arg warning to the result WITHOUT blocking the
   assert.match(captured, /bash accepts:/, "the accepted-fields list reached the model");
 });
 
+
+// ===========================================================================
+// Surface-mismatch coaching — the write pass reaching for browser tools.
+//
+// From the field: after a successful edit, the write pass tried `bash({})`,
+// then `playwright(...)`, then `browser_navigate(...)` — three unknown-tool
+// turns, stall, run dead, verification never ran. The bare "Unknown tool"
+// roster was not enough; the refusal must say WHERE the capability lives.
+// ===========================================================================
+
+test("a work pass reaching for browser tools is steered to deliver, not to retry", async () => {
+  const llm = new OpenRouterBridge();
+  let turn = 0;
+  llm.stream = async function* () {
+    turn += 1;
+    const m =
+      turn === 1
+        ? toolMsgOf([["b1", "browser_navigate", { url: "http://x" }]])
+        : msg([{ type: "text", text: "done" }]);
+    yield { type: "start", partial: m };
+    yield { type: "done", message: m };
+  };
+  llm.complete = async () => msg([{ type: "text", text: "ok" }]);
+
+  const results = [];
+  await runToolLoop({
+    task: "t", userMessage: "go",
+    tools: [writeTool()],
+    model: { id: "test/driver", openRouterSlug: "test/driver" },
+    llm,
+    permission: new PermissionGate("ask-all", async () => ({ allowed: true })),
+    logStore: new LogStore(),
+    phase: "write_edit",
+    emit: (e) => { if (e.type === "turn_end") results.push(...(e.toolResults ?? [])); },
+    cwd: process.cwd(),
+  });
+
+  const text = results.map((m) => (m.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("")).join("\n");
+  assert.match(text, /Unknown tool "browser_navigate"/);
+  assert.match(text, /NEXT pass's job \(activity_inspect\)/, "the refusal names whose job it is");
+  assert.match(text, /`deliver`/, "and how to finish this pass");
+});
+
+test("a QA pass holding `drive` is steered to the one-call form, not the roster alone", async () => {
+  const llm = new OpenRouterBridge();
+  let turn = 0;
+  llm.stream = async function* () {
+    turn += 1;
+    const m =
+      turn === 1
+        ? toolMsgOf([["b1", "browser_take_screenshot", {}]])
+        : msg([{ type: "text", text: "done" }]);
+    yield { type: "start", partial: m };
+    yield { type: "done", message: m };
+  };
+  llm.complete = async () => msg([{ type: "text", text: "ok" }]);
+
+  const results = [];
+  await runToolLoop({
+    task: "t", userMessage: "go",
+    tools: [writeTool(), { name: "drive", description: "drive the browser", parameters: { type: "object", properties: {} }, mutates: true, async execute() { return { output: "ok" }; } }],
+    model: { id: "test/driver", openRouterSlug: "test/driver" },
+    llm,
+    permission: new PermissionGate("ask-all", async () => ({ allowed: true })),
+    logStore: new LogStore(),
+    phase: "activity_inspect",
+    emit: (e) => { if (e.type === "turn_end") results.push(...(e.toolResults ?? [])); },
+    cwd: process.cwd(),
+  });
+
+  const text = results.map((m) => (m.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("")).join("\n");
+  assert.match(text, /through `drive`, not raw browser tools/);
+  assert.match(text, /drive \{action:"look"\}/);
+});
+
+function toolMsgOf(calls) {
+  return {
+    role: "assistant",
+    content: calls.map(([id, name, args]) => ({ type: "toolCall", id, name, arguments: args })),
+    model: "test/driver", api: "openrouter", provider: "test",
+    usage: zeroUsage(), stopReason: "tool_use", timestamp: 0,
+  };
+}
+function writeTool() {
+  return { name: "write", description: "write a file", parameters: { type: "object", properties: {} }, mutates: true, async execute() { return { output: "wrote" }; } };
+}

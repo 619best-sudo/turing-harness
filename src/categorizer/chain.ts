@@ -71,6 +71,7 @@ import { createClearingDoubtTool, CLEARING_DOUBT_TOOL_NAME } from "./clearing-do
 import { extractMentionTokens, resolveMentions, renderMentionNote } from "./mentions.js";
 import { routeCategorizer, type RouterChoice } from "./router.js";
 import { applyPolicyToRouted, decideFromDriver } from "./route-policy.js";
+import { isNonFatalLoopError } from "../orchestrator/stall-guard.js";
 import { ComprehensionStore } from "../tools/builtin/comprehension.js";
 
 // ---------------------------------------------------------------------------
@@ -177,6 +178,86 @@ const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : 
  * `clearing_doubt`. Missing names are skipped with a logged warning so a setup
  * can list optional tools (the *_memory set exists only in project sessions).
  */
+/**
+ * The QA-hop automation surface: which kind of software this run drives.
+ *
+ * An explicit URL in the task wins over the project's category — verifying a
+ * web dashboard from a mobile repo is still web work. Unknown category → no
+ * gating (a host that detects nothing keeps today's behavior).
+ */
+function qaSurfaceFor(input: CategorizerChainInput): "web" | "mobile" | "none" | undefined {
+  if (/https?:\/\//i.test(input.task)) return "web";
+  switch (input.projectCategory) {
+    case "mobile":
+    case "games":
+      return "mobile";
+    case "frontend":
+      return "web";
+    case "backend":
+      return "none";
+    default:
+      return undefined;
+  }
+}
+
+const isQaHop = (def: CategorizerDefinition): boolean =>
+  def.id === "activity_inspect" || def.id === "activity_reproduce" || def.toolScope === "activity_inspect";
+
+const BROWSER_TOOL_RE = /^(browser_|chrome_|devtools_|playwright_|puppeteer_)/i;
+const BROWSER_PROVIDER_RE = /playwright|chrome[-_]?devtools|puppeteer|selenium/i;
+const DEVICE_TOOL_RE = /^(mobile_|device_|simulator_|android_|ios_|adb_)/i;
+const DEVICE_PROVIDER_RE = /mobile|device|simulator|android|adb|appium/i;
+
+function isBrowserAutomation(tool: AgentTool): boolean {
+  return (
+    tool.name === "drive" ||
+    BROWSER_TOOL_RE.test(tool.name) ||
+    (tool.providerId != null && BROWSER_PROVIDER_RE.test(tool.providerId))
+  );
+}
+
+function isDeviceAutomation(tool: AgentTool): boolean {
+  return (
+    tool.name === "mobile" ||
+    DEVICE_TOOL_RE.test(tool.name) ||
+    (tool.providerId != null && DEVICE_PROVIDER_RE.test(tool.providerId))
+  );
+}
+
+/**
+ * Drop the QA hop's off-surface tools: mobile project → no browser automation,
+ * web project → no device automation, backend → neither. Identifies tools by
+ * the registry-stamped `providerId` first (an MCP server is the better signal
+ * than any one tool's name) and name prefixes second.
+ */
+function gateQaSurface(
+  tools: AgentTool[],
+  def: CategorizerDefinition,
+  input: CategorizerChainInput,
+): { tools: AgentTool[]; surface: "web" | "mobile" | "none" | undefined; dropped: Array<{ tool: string; reason: string }> } {
+  const surface = qaSurfaceFor(input);
+  if (!isQaHop(def) || surface == null) return { tools, surface: undefined, dropped: [] };
+  const dropped: Array<{ tool: string; reason: string }> = [];
+  const kept = tools.filter((t) => {
+    const browser = isBrowserAutomation(t);
+    const device = isDeviceAutomation(t);
+    if (surface === "mobile" && browser) {
+      dropped.push({ tool: t.name, reason: "browser tool in a device-surface hop" });
+      return false;
+    }
+    if (surface === "web" && device) {
+      dropped.push({ tool: t.name, reason: "device tool in a browser-surface hop" });
+      return false;
+    }
+    if (surface === "none" && (browser || device)) {
+      dropped.push({ tool: t.name, reason: "UI automation in a no-UI (backend) hop" });
+      return false;
+    }
+    return true;
+  });
+  return { tools: kept, surface, dropped };
+}
+
 function resolveCategorizerTools(
   input: CategorizerChainInput,
   def: CategorizerDefinition,
@@ -235,7 +316,25 @@ function resolveCategorizerTools(
     });
   }
 
-  const tools = [...byName.values()];
+  // QA hops carry ONE automation surface, by project: a mobile project drives
+  // the device toolkit, a web project the browser, a backend neither. Field
+  // run that produced this: a Flutter/iOS inspect hop opened with ~62 tools,
+  // two-thirds of them browser-MCP tools that could not touch the simulator —
+  // and the model reasoned "my connected automation is browser-based" and
+  // nearly declined to verify at all. See `gateQaSurface`.
+  const gated = gateQaSurface([...byName.values()], def, input);
+  if (gated.dropped.length) {
+    input.logStore.append({
+      tags: ["categorizer", "categorizer:tools", "categorizer:surface"],
+      level: "info",
+      message:
+        `categorizer "${def.id}" surface=${gated.surface}: dropped ${gated.dropped.length} tool(s) ` +
+        "of the other surface",
+      data: { categorizer: def.id, surface: gated.surface, dropped: gated.dropped },
+    });
+  }
+
+  const tools = gated.tools;
   tools.push(createDeliverTool(def, box));
   if (!byName.has(CLEARING_DOUBT_TOOL_NAME)) {
     tools.push(
@@ -330,6 +429,60 @@ function enforcePlanFirst(tools: AgentTool[]): AgentTool[] {
 const DESTRUCTIVE_GIT = /\bgit\s+(checkout\s+(--\s+)?\S+\.\w|restore\b|reset\s+--hard\b|clean\s+-[a-z]*f|stash\b(?!\s+list))/;
 
 /**
+ * `open`/`xdg-open` at the start of a bash command (optionally after a
+ * `cd … &&`), which is the shape "pop this in the user's desktop browser"
+ * takes. Narrow on purpose: a false positive costs one turn (one-shot refusal,
+ * re-issue passes); a false negative costs a stray browser window.
+ */
+const DESKTOP_OPEN_RE = /^\s*(?:cd\s+[^&]+&&\s*)?(?:open|xdg-open)\s+\S/i;
+
+/**
+ * Refuse (once) opening the target in the user's DESKTOP browser, in any
+ * categorizer hop. Nobody's job looks like that: it captures nothing, so it
+ * cannot verify; it mutates the USER's desktop, not the run's; and the verify
+ * pass opens the page in the harness's own browser anyway — which is the only
+ * opener whose capture can reach `media_analysis`.
+ *
+ * From the field: the write pass ran `bash open index.html` "to verify", and
+ * the inspect pass then opened the same page again through `drive`. One page,
+ * two opens, one of them uninvited on the user's desktop. The refusal states
+ * the distribution instead: finish this pass (`deliver`); the verify pass
+ * owns opening, driving and capturing.
+ */
+export function enforceNoDesktopOpen(tools: AgentTool[], categorizerId: string): AgentTool[] {
+  let refused = 0;
+  return tools.map((t) => {
+    if (bareName(t.name) !== "bash") return t;
+    return {
+      ...t,
+      execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+        const command = typeof args?.command === "string" ? args.command : "";
+        if (refused < 1 && DESKTOP_OPEN_RE.test(command)) {
+          refused += 1;
+          const qa = categorizerId === "activity_inspect" || categorizerId === "activity_reproduce";
+          return {
+            output:
+              "bash refused ONCE — this command opens the page in the user's DESKTOP browser. That is not " +
+              "verification: nothing is captured, nothing reaches `media_analysis`, and the user gets a " +
+              "browser window they did not ask for.\n\n" +
+              (qa
+                ? "This pass verifies with its OWN browser: `drive { action: \"open\", url }` opens the page " +
+                  "where `look`/`shot` can capture it (a device/simulator: the `mobile` tool). If you truly " +
+                  "need the desktop `open` for something else, re-issue this exact call and it goes through."
+                : "Opening, driving and capturing the result is the VERIFY pass's job, after you finish: make " +
+                  "the change, confirm it in the source if you must (`grep`/`read`), and `deliver`. The chain " +
+                  "routes verification with the right tools. If you truly need the desktop `open`, re-issue " +
+                  "this exact call and it goes through."),
+            isError: true,
+          };
+        }
+        return t.execute(id, args, ctx);
+      },
+    };
+  });
+}
+
+/**
  * Keep a QA hop out of the source tree.
  *
  * Both QA categorizers are told, at length, that they do not author product
@@ -352,15 +505,36 @@ const DESTRUCTIVE_GIT = /\bgit\s+(checkout\s+(--\s+)?\S+\.\w|restore\b|reset\s+-
  * source-shaped targets, and anything under a temp dir or outside the project is
  * not the source tree.
  */
-export function enforceNoShellAuthoring(tools: AgentTool[], cwd: string): AgentTool[] {
+export function enforceNoShellAuthoring(
+  tools: AgentTool[],
+  cwd: string,
+  opts: {
+    /**
+     * What this categorizer should do INSTEAD of authoring. "observe" is the QA
+     * hops (run it and look); "handoff" is a categorizer that has no business
+     * touching files at all and must pass the change to `write_edit`.
+     */
+    instead?: "observe" | "handoff";
+  } = {},
+): AgentTool[] {
+  const instead = opts.instead ?? "observe";
   return tools.map((t) => {
-    if (bareName(t.name) !== "bash") return t;
+    // `bash_readonly` too. It carries its own block list, but that list is
+    // shell-shaped (redirection, tee, rm/mv/cp) and an interpreter is not — a
+    // `python3 -c` that opened a source file with mode 'w' went straight through
+    // it in the read hop. Two independent layers now say no, because this one is
+    // the layer that knows WHICH categorizer is asking.
+    if (bareName(t.name) !== "bash" && bareName(t.name) !== "bash_readonly") return t;
     return {
       ...t,
       description:
         t.description +
-        " In this categorizer the shell RUNS things — it may not write or revert project files " +
-        "(no heredoc/sed/redirect into source, no `git checkout`/`restore`/`reset --hard`).",
+        (instead === "handoff"
+          ? " In this categorizer the shell only INSPECTS — it may not write project files by any means " +
+            "(no heredoc, sed -i, redirect, or python/node one-liner). A change belongs in the deliver " +
+            "report for `write_edit`, which is the only pass whose file changes the run records."
+          : " In this categorizer the shell RUNS things — it may not write or revert project files " +
+            "(no heredoc/sed/redirect into source, no `git checkout`/`restore`/`reset --hard`)."),
       execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
         const command = typeof args?.command === "string" ? args.command : "";
         if (command) {
@@ -374,19 +548,27 @@ export function enforceNoShellAuthoring(tools: AgentTool[], cwd: string): AgentT
               isError: true,
             };
           }
-          const authoring = shellAuthoringTarget("bash", args);
+          const authoring = shellAuthoringTarget(t.name, args);
           if (authoring && isProjectPath(cwd, authoring.path)) {
             return {
               output:
-                `bash refused — that command writes ${authoring.path} (${authoring.form}), and this ` +
-                "categorizer does not author product code. Two tools own the two legitimate reasons " +
-                "to touch a file here:\n" +
-                "  - a trace probe → `add_log` (log-only, and `activity_cleanup` takes it back out);\n" +
-                "  - the fix itself → not you. `write_edit` runs after you and works from your report; " +
-                "a fix written here is written blind, before anyone has seen the defect.\n\n" +
-                "What is missing from this pass is one observation. Launch it (`drive`/`mobile`), or " +
-                "run the project's own run/test command, and look at what it does. A scratch file " +
-                "outside the project (a temp script, a throwaway harness) is still fine.",
+                `${t.name} refused — that command writes ${authoring.path} (${authoring.form}), and this ` +
+                "categorizer does not author product code.\n\n" +
+                (instead === "handoff"
+                  ? "And a file changed this way is a file the run cannot see: changes are recorded " +
+                    "through `write`/`edit`, so a shell-written file appears nowhere — nothing builds it, " +
+                    "nothing runs it, nothing verifies it, and the run reports having changed nothing. " +
+                    "That is how a task ends 'done' in this hop with the user's code quietly edited and " +
+                    "never checked.\n\nSay what the change IS instead — file, line, exact old text, exact " +
+                    "new text — and `deliver` it, nominating `write_edit`. That pass makes the edit with " +
+                    "`edit` (which the run records), and the verify pass then proves it on the running app."
+                  : "Two tools own the two legitimate reasons to touch a file here:\n" +
+                    "  - a trace probe → `add_log` (log-only, and `activity_cleanup` takes it back out);\n" +
+                    "  - the fix itself → not you. `write_edit` runs after you and works from your report; " +
+                    "a fix written here is written blind, before anyone has seen the defect.\n\n" +
+                    "What is missing from this pass is one observation. Launch it (`drive`/`mobile`), or " +
+                    "run the project's own run/test command, and look at what it does.") +
+                "\n\nA scratch file outside the project (a temp script, a throwaway harness) is still fine.",
               isError: true,
             };
           }
@@ -476,6 +658,10 @@ export function isRuntimeCommand(command: unknown): boolean {
     /\brspec\b|\brails\s+(server|s|test)\b|\bbundle\s+exec\s+(rspec|rails)\b/,
     /\bphpunit\b|\bartisan\s+(serve|test)\b/,
     /\bmake\s+(test|run|dev|start|e2e)\b/,
+    // Mobile run commands beyond Flutter — React Native and Expo launch the
+    // app the same way `flutter run` does.
+    /\b(?:npx\s+)?react-native\s+run-/,
+    /\b(?:npx\s+)?expo\s+(?:start|run)\b/,
     // Exercising a running service.
     /\bcurl\b|\bhttpie\b|\bwget\b|\bgrpcurl\b/,
     // Driving a device or emulator for real.
@@ -496,6 +682,25 @@ export function isObservationCall(name: string, args?: Record<string, unknown>):
 /** Kept for callers that only have a tool NAME — a bash call needs its args. */
 export function isObservationTool(name: string): boolean {
   return isNamed(name, OBSERVATION_TOOL_PREFIXES) || bareName(name) === "bash";
+}
+
+/**
+ * Commands that produce an artifact and run nothing — the shapes the reproduce
+ * hop reached for when it could not find a way to RUN the app (`flutter build
+ * web`, three times, in one field run). Building is not reproducing: the
+ * artifact sits on disk while the defect stays unobserved.
+ */
+const BUILD_ONLY_RE =
+  /\bflutter\s+build\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|\bcargo\s+build\b|\bmake\s+build\b|\bgo\s+build\b|\bswift\s+build\b|\bxcodebuild\b(?![^\n]*\btest\b)|\bgradlew?\s+(?:build|assemble\w*)\b|\b(?:mvn|mvnw|maven)\s+(?:package|compile)\b|\bdotnet\s+build\b|\b(?:ng|vite|next)\s+build\b/;
+
+/**
+ * Whether a shell command is build-only: it matches {@link BUILD_ONLY_RE} and
+ * nothing in it actually runs the software (`isRuntimeCommand`), so `flutter
+ * build && flutter run` does not count — its second half runs.
+ */
+export function isBuildOnlyCommand(command: unknown): boolean {
+  if (typeof command !== "string" || !command.trim()) return false;
+  return BUILD_ONLY_RE.test(command.toLowerCase()) && !isRuntimeCommand(command);
 }
 
 /**
@@ -526,7 +731,16 @@ export function isObservationTool(name: string): boolean {
  */
 export function enforceObserveFirst(
   tools: AgentTool[],
-  opts: { probesBeforeLaunch?: boolean } = {},
+  opts: {
+    probesBeforeLaunch?: boolean;
+    /**
+     * The QA handshake's answer, read lazily (it arrives mid-hop). When the USER
+     * verifies or QA is SKIPPED, "you have not observed anything" is no longer a
+     * finding about this hop — it is the user's instruction being followed, so
+     * the deliver refusals stand down. See `enforceQaHandshake`.
+     */
+    qaMode?: () => QaMode | undefined;
+  } = {},
 ): AgentTool[] {
   const canObserve = tools.some((t) => t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name));
   if (!canObserve) return tools;
@@ -536,12 +750,48 @@ export function enforceObserveFirst(
     tools.some((t) => isNamed(t.name, ["activity_trace_start", "add_log"]));
   let observed = false;
   let instrumented = false;
-  const refused = { deliver: 0, cleanup: 0, launch: 0 };
+  // Evidence beyond "a process ran": a driving/capture call (screenshot, UI
+  // walk) or probe lines actually collected. `observed` alone let a field run
+  // launch the app, never walk it to the symptom, glimpse log lines in a bash
+  // tail, and deliver `reproduced: true` from analysis.
+  let droveOrCaptured = false;
+  let collectedLines = 0;
+  const refused = { deliver: 0, cleanup: 0, launch: 0, buildOnly: 0, undriven: 0 };
   return tools.map((t) => {
     if (t.name !== DELIVER_TOOL_NAME && isObservationTool(t.name)) {
       return {
         ...t,
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          // A build is not a run. The reproduce hop that cannot find how to RUN
+          // the app reaches for `flutter build web` et al — an artifact on disk,
+          // the defect still unobserved, and the turn spent. One-shot, and only
+          // in the reproduce hop: the verify hop's sequence has an explicit
+          // BUILD step before its run.
+          //
+          // Deliberately does NOT arm once anything has been observed: a build
+          // after the run (rebuilding with probes, say) is preparation this
+          // pass has already earned.
+          if (
+            opts.probesBeforeLaunch === true &&
+            bareName(t.name) === "bash" &&
+            !observed &&
+            refused.buildOnly < 1 &&
+            isBuildOnlyCommand(args?.command)
+          ) {
+            refused.buildOnly += 1;
+            return {
+              output:
+                "bash refused ONCE — this command BUILDS but runs nothing, and an artifact on disk is not a " +
+                "reproduction.\n\n" +
+                "If it was preparation to launch: the run command — whatever starts THIS app (the device " +
+                "run, the dev server, the service entrypoint) — belongs in " +
+                "`activity_trace_start { startCommand }` — that launches it AND pipes its stdout into the trace " +
+                "file, where your probes' output is collected.\n\n" +
+                "If you genuinely need the artifact (an install step, a bundle the device expects), re-issue this " +
+                "exact call and it goes through.",
+              isError: true,
+            };
+          }
           // Interrupt the FIRST launch of an uninstrumented build, once.
           //
           // The moment this exists for, from a run that otherwise went well: the
@@ -560,25 +810,61 @@ export function enforceObserveFirst(
           // it is cheap to say so.
           if (canInstrument && !instrumented && !observed && refused.launch < 1 && isObservationCall(t.name, args)) {
             refused.launch += 1;
+            // Name WHAT was interrupted. The field run this wording grew from
+            // interrupted `flutter test` on an empty suite and said "you are
+            // about to run the app" — the model then spent a turn parsing the
+            // mismatch instead of acting on the advice.
+            const commandText = typeof args?.command === "string" ? args.command : "";
+            const isTestRun =
+              /\b(?:pytest|vitest|jest|mocha|rspec|unittest|flutter\s+test|(?:npm|pnpm|yarn)\s+(?:run\s+)?test|(?:gradlew?|mvn|dotnet|go|cargo|make)\s+test)\b/i.test(
+                commandText,
+              );
+            const opener = isTestRun
+              ? `${t.name} refused ONCE — you are about to run the TEST suite with no probes in it. A test that ` +
+                "exercises the reported path IS a legitimate way to run it — but for a defect that is a VALUE " +
+                "THAT NEVER ARRIVES, the evidence is the probes, and they have to be compiled in before the run.\n\n"
+              : `${t.name} refused ONCE — you are about to run the app with no probes in it.\n\n`;
             return {
               output:
-                `${t.name} refused ONCE — you are about to run the app with no probes in it.\n\n` +
+                opener +
                 "Decide which kind of defect this is, because after this command the answer is baked " +
                 "into a build:\n" +
                 "  - VISIBLE on screen (wrong text, wrong colour, a broken layout, a crash)? Then a " +
                 "capture is the evidence. Re-issue this exact call and grab the screen.\n" +
                 "  - A VALUE THAT NEVER ARRIVES (a status that does not repaint, a list that does not " +
                 "refresh, a callback that does not fire)? A screenshot of a screen that looks normal " +
-                "proves nothing. `activity_trace_start`, then `add_log` at the sites the code summary " +
-                "named — the branch that returns early, the notify that is not called — THEN run it, " +
-                "drive the flow, and `activity_collect`. Probes must be compiled in, which is why this " +
-                "is the last moment they are cheap.",
+                "proves nothing. `activity_trace_start { startCommand }` — the run command as its " +
+                "`startCommand`, so the app launches THROUGH the trace and its stdout is piped where " +
+                "`activity_collect` reads — then `add_log` at the sites the code summary " +
+                "named (the branch that returns early, the notify that is not called), THEN drive the " +
+                "flow and `activity_collect`. Probes must be compiled in, which is why this is the last " +
+                "moment they are cheap.",
               isError: true,
             };
           }
           const res = await t.execute(id, args, ctx);
           // The ARGS decide for bash, so this is checked per call, not per tool.
           if (!res.isError && isObservationCall(t.name, args)) observed = true;
+          // A drive or a capture is evidence a UI was actually walked — a
+          // screenshot, a look, a tap. The distinction from `observed`: a bare
+          // run command proves a PROCESS ran, not that anyone reached the
+          // screen the defect lives on.
+          if (
+            !res.isError &&
+            (isNamed(t.name, ["mobile", "drive", "activity_inspect", "media_analysis"]) ||
+              bareName(t.name).startsWith("browser_"))
+          ) {
+            droveOrCaptured = true;
+          }
+          // Collected probe lines are the evidence an INVISIBLE defect was
+          // reached — `activity_collect` is itself an observation tool, so its
+          // count is read here rather than in a wrapper the observation branch
+          // would shadow. A collect that returns nothing after a launch means
+          // the flow was never walked to the instrumented path.
+          if (!res.isError && isNamed(t.name, ["activity_collect"])) {
+            const captured = Number((res.details as { captured?: unknown } | undefined)?.captured ?? 0);
+            if (captured > 0) collectedLines += captured;
+          }
           return res;
         },
       };
@@ -609,9 +895,11 @@ export function enforceObserveFirst(
               output:
                 `${t.name} refused — you placed probes and have not run the flow yet, so they have ` +
                 "recorded nothing. Taking them out now throws away the only evidence this pass was " +
-                "going to produce.\n\nRun it: `mobile {action:\"launch\"}` or `drive {action:\"open\"}` " +
-                "for a UI, the project's own run/test command through `bash` otherwise — then " +
-                "`activity_collect` to read what the probes saw. Strip them AFTER that.\n\nIf you " +
+                "going to produce.\n\nRun it — through the trace, so the probes' output lands where " +
+                "`activity_collect` reads: `activity_trace_start { startCommand }` launches the app " +
+                "with its stdout piped into the trace file (for a UI, `drive`/`mobile` then walk it " +
+                "to the symptom); with no UI, the project's own run/test command through `bash`. " +
+                "Then `activity_collect` to read what the probes saw. Strip them AFTER that.\n\nIf you " +
                 "genuinely cannot run it — nothing to launch on, credentials you do not have — " +
                 "re-issue this exact call and report `reproduced: false` with what you tried; the " +
                 "cleanup will go through and the honest answer is worth more than a guess.",
@@ -630,7 +918,19 @@ export function enforceObserveFirst(
           " Refused once if you have not yet RUN or CAPTURED anything in this categorizer — reading " +
           "source is not observing behaviour.",
         execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
-          if (!observed && refused.deliver < 1) {
+          // The user took the surface, or waved this pass off entirely: an
+          // unobserved deliver is then the correct outcome, not a hop that gave
+          // up, so the "go and run it" refusals stand down.
+          //
+          // The two modes part company on `reproduced: true`. When the USER
+          // drove, they are the witness and the claim is theirs to make. When
+          // the pass was SKIPPED, nobody witnessed anything — so that correction
+          // below still applies, and the fixer is told it is holding a
+          // hypothesis.
+          const mode = opts.qaMode?.();
+          if (mode === "user") return t.execute(id, args, ctx);
+          if (mode === "skip" && args?.reproduced !== true) return t.execute(id, args, ctx);
+          if (mode !== "skip" && !observed && refused.deliver < 1) {
             refused.deliver += 1;
             return {
               output:
@@ -643,6 +943,37 @@ export function enforceObserveFirst(
                 "is not running it. If you genuinely cannot reach it — no device, no credentials, no " +
                 "way in — re-issue this exact call with `reproduced: false` and say what you tried; " +
                 "it will go through.",
+              isError: true,
+            };
+          }
+          // The run launched something but nobody drove it. From the field: the
+          // app was launched through the trace, the agent REASONED about
+          // navigating to the reported screen ("let me look at what the app
+          // looks like and navigate to the contacts page"), never made one
+          // mobile/drive call, glimpsed log lines in a bash tail, and
+          // delivered `reproduced: true` from analysis. One-shot, then the
+          // correction below catches the re-issue.
+          if (
+            mode !== "skip" &&
+            observed &&
+            args?.reproduced === true &&
+            !collectedLines &&
+            !droveOrCaptured &&
+            refused.undriven < 1
+          ) {
+            refused.undriven += 1;
+            return {
+              output:
+                "deliver refused — the app RAN, but nobody drove it, and no probe line was ever collected. " +
+                "An app idling on its first screen has exercised none of the reported flow; `reproduced: true` " +
+                "from reading plus a launched process is the READ pass's hypothesis wearing a witness's " +
+                "cloak.\n\n" +
+                "Walk to the symptom: `mobile { action: \"look\" }` to see the screen it booted on, then " +
+                "`tap`/`type` your way to the reported state (on web, `drive`; no UI — the endpoint/job " +
+                "through `bash`), then `activity_collect { waitMs }` for what the probes saw. A capture or " +
+                "one collected line is what turns analysis into a reproduction.\n\n" +
+                "If you genuinely cannot reach the flow — a login nobody can cross, a device that will not " +
+                "boot — re-issue this exact call with `reproduced: false` and say what stood in the way.",
               isError: true,
             };
           }
@@ -664,11 +995,433 @@ export function enforceObserveFirst(
               ctx,
             );
           }
+          // The same correction for the launched-but-never-driven case: the
+          // refusal above was the chance to go drive it, the re-issue is the
+          // honest report.
+          if (observed && args?.reproduced === true && !collectedLines && !droveOrCaptured) {
+            const symptom = typeof args.symptom === "string" ? args.symptom : "";
+            return t.execute(
+              id,
+              {
+                ...args,
+                reproduced: false,
+                symptom:
+                  `${symptom}\n\n(NOT DRIVEN — the app was launched but never walked to the symptom, ` +
+                  "and no probe line was collected; what follows is analysis, not a witnessed symptom.)".trim(),
+              },
+              ctx,
+            );
+          }
           return t.execute(id, args, ctx);
         },
       };
     }
     return t;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The QA handshake: who runs the software, decided by the user, before anything
+// is launched — in BOTH QA hops
+// ---------------------------------------------------------------------------
+
+/** Who runs and drives the software for a QA pass. The user's call, not the agent's. */
+export type QaMode = "agent" | "user" | "skip";
+
+/**
+ * Which QA pass is asking. The two hops drive the same app for opposite reasons,
+ * so they ask the same question about different work: `reproduce` asks who makes
+ * the reported defect happen (before any fix exists), `verify` asks who checks
+ * the change that was just made.
+ */
+export type QaHandshakeRole = "reproduce" | "verify";
+
+/** A mutable holder so the handshake's answer is visible to the other wrappers. */
+export interface QaModeBox {
+  mode?: QaMode;
+}
+
+const SKIP_RE = /\b(?:skip|no qa|without qa|don'?t (?:verify|test|check|bother)|no (?:need|verification)|not needed|leave it)\b/;
+const USER_RE =
+  /\b(?:manual(?:ly)?|myself|by hand|human|i'?ll|i will|i can|i'?d rather|i'?m going to|i do it|my side|user (?:drive|drives|will|does|test|tests|check|checks))\b/;
+const AGENT_RE = /\b(?:agent|you (?:drive|do|run|verify|test|check|handle)|automat\w*|go ahead|yes|proceed|please do)\b/;
+
+/**
+ * Read one of the three answers out of whatever the user actually typed.
+ *
+ * Order is load-bearing: "skip it, I'll check it myself later" contains both a
+ * skip and a manual signal, and the instruction that matters is the one that
+ * stops the agent driving — so skip is tested first, and the agent (keep going)
+ * reading is last, since it is also the default when nothing matches.
+ */
+export function classifyQaMode(text: string | undefined): QaMode | undefined {
+  if (typeof text !== "string" || !text.trim()) return undefined;
+  const t = text.toLowerCase();
+  if (SKIP_RE.test(t)) return "skip";
+  if (USER_RE.test(t)) return "user";
+  if (AGENT_RE.test(t)) return "agent";
+  return undefined;
+}
+
+/**
+ * Does this question look like a QA handshake (so its answer already settled it)?
+ *
+ * Role-scoped, because the two questions are not interchangeable: "skip the
+ * reproduction, I know what's wrong — just fix it" must not also skip the
+ * verification of the fix. The chain's own in-memory record is the primary
+ * channel (see `shared.qaModes`); this is the fallback for a host that collects
+ * an answer out of band and restarts the run with it as a clarification.
+ */
+const QA_QUESTION_RE: Record<QaHandshakeRole, RegExp> = {
+  reproduce: /\b(?:reproduc\w*|repro|see it happen|witness\w*)\b/i,
+  verify: /\b(?:qa|verif\w*|test(?:ing)?|check\w*)\b/i,
+};
+/** Either role's phrasing — used when the caller does not say which pass is asking. */
+const QA_QUESTION_ANY = /\b(?:qa|verif\w*|test(?:ing)?|check\w*|drive[sr]?|driving|reproduc\w*|repro)\b/i;
+
+/**
+ * The answer the user already gave THIS RUN, if any.
+ *
+ * The handshake is a run-level fact, not a hop-level one: the repair loop enters
+ * `activity_inspect` again after every FAIL, and asking "who runs it?" once per
+ * round would make the loop that exists to fix things feel like an
+ * interrogation. `shared.clarifications` carries the Q&A across hops, so a
+ * second visit reads the first visit's answer instead of asking again.
+ */
+export function qaModeFromClarifications(
+  entries: readonly ResolvedClarification[] | undefined,
+  role?: QaHandshakeRole,
+): QaMode | undefined {
+  const re = role ? QA_QUESTION_RE[role] : QA_QUESTION_ANY;
+  for (const entry of [...(entries ?? [])].reverse()) {
+    if (!re.test(entry.question ?? "")) continue;
+    const mode = classifyQaMode(entry.answer);
+    if (mode) return mode;
+  }
+  return undefined;
+}
+
+/** What one run has been told about each QA pass so far. */
+export type QaModeRecord = Partial<Record<QaHandshakeRole, QaMode>>;
+
+/**
+ * The answer that applies to `role` now.
+ *
+ * Same role always wins. Failing that, the OTHER role's answer carries over —
+ * but only when it is about WHO: "you drive" and "I'll drive" are facts about
+ * this run (who is at the keyboard, whose device it is) and re-asking them per
+ * hop is an interrogation. A SKIP never carries: "skip the reproduction, I know
+ * what's broken" is a judgement about that step's value, and reading it as
+ * permission to ship the fix unverified is exactly the silence this gate exists
+ * to break.
+ */
+export function recallQaMode(record: QaModeRecord | undefined, role: QaHandshakeRole): QaMode | undefined {
+  const own = record?.[role];
+  if (own) return own;
+  const other = record?.[role === "verify" ? "reproduce" : "verify"];
+  return other === "skip" ? undefined : other;
+}
+
+/** The user's answer text, off an ANSWERED ask_user_question result. */
+function answerTextOf(result: { output?: string; details?: unknown }): string | undefined {
+  const details = result.details as { kind?: string; answered?: unknown } | undefined;
+  if (details?.kind !== "ask_user_question" || details.answered !== true) return undefined;
+  const match = /^User answered:\s*(.*)$/m.exec(result.output ?? "");
+  // An answer of files alone is still an answer — it just classifies as nothing,
+  // which the caller reads as "agent" (get on with it).
+  return match ? match[1].trim() : "";
+}
+
+/** Per-role wording for the question, and for each answer being obeyed. */
+const HANDSHAKE_TEXT: Record<
+  QaHandshakeRole,
+  { subject: string; ask: string; skip: string; user: string }
+> = {
+  verify: {
+    subject: "who does the QA",
+    ask:
+      "Ask it as one `ask_user_question` with these three options: " +
+      '"You verify it" (the agent builds, runs, drives the app and reports a verdict — recommended), ' +
+      '"I\'ll verify it myself" (the user runs it and tells you what they see, so you judge from what ' +
+      'they report and attach), "Skip QA" (deliver the change unverified, and say so). ' +
+      "Say which surface you would run (the app / the dev server / the endpoint) and what you would look " +
+      "at, so a one-click answer is enough.",
+    skip:
+      "the user chose to SKIP QA for this change. Do not build it, run it, drive it or " +
+      "instrument it.\n\nFinish the hop honestly instead: `deliver` with no `verdict` (inconclusive) and " +
+      "`findings` saying QA was skipped at the user's request, naming what WOULD have been checked and on " +
+      "which surface, so they can run it themselves. If they later say otherwise, that answer overrides " +
+      "this one.",
+    user:
+      "the user said THEY verify this one, so the app is theirs to run, not yours.\n\n" +
+      "Your job now is to make their check cheap and then judge what it produces:\n" +
+      "  1. `ask_user_question` with the EXACT steps to take (the surface, the route to the screen, the " +
+      "thing to look at) and `requestAttachments` for a screenshot or the log — a screenshot they attach " +
+      "becomes evidence you can actually judge;\n" +
+      "  2. judge what they send (`media_analysis` lens:\"qa\" with `expected`, or read the log they " +
+      "attach), then `deliver` a verdict that cites it;\n" +
+      "  3. if they report it plainly in words, that is evidence too — quote it in `findings`.\n" +
+      "Only take the surface back if they hand it back.",
+  },
+  reproduce: {
+    subject: "who makes the defect happen",
+    ask:
+      "Ask it as one `ask_user_question` with these three options: " +
+      '"You reproduce it" (the agent runs the app, instruments it and drives it to the reported state — ' +
+      'recommended), "I\'ll reproduce it myself" (the user drives their own app and reports what they ' +
+      'see, so you work from that), "Skip it — go straight to the fix" (no run at all; you deliver ' +
+      "`reproduced: false` with the suspects reading gave you, and the fixer knows it is working from a " +
+      "hypothesis). Say which surface you would run (the app / the dev server / the endpoint) and the " +
+      "route you would take to the reported state, so a one-click answer is enough.",
+    skip:
+      "the user chose to SKIP the reproduction and go straight to the fix. Do not launch it, " +
+      "drive it or instrument it.\n\nDeliver what reading gave you, honestly: `reproduced: false`, the " +
+      "symptom AS REPORTED (not as witnessed), `suspects` with the lines a fix should target, and " +
+      "`openQuestions` naming what only a run could have settled — the fixer needs to know it is working " +
+      "from a hypothesis. If they later say otherwise, that answer overrides this one.",
+    user:
+      "the user said THEY will reproduce it, so their app is theirs to drive, not " +
+      "yours.\n\nYour job now is to make their attempt count as evidence:\n" +
+      "  1. `ask_user_question` with the EXACT steps you need walked (the screen, the trigger, what to " +
+      "watch for) and `requestAttachments` for the capture or the log — for an INVISIBLE defect say which " +
+      "log lines matter, because a screenshot of a normal-looking screen proves nothing;\n" +
+      "  2. work from what they send: `media_analysis` on a capture, `read`/`activity_tail_file` on a log " +
+      "they point at;\n" +
+      "  3. `deliver` with `reproduced: true` ONLY if what they sent shows it, `symptom` in their words, " +
+      "and `suspects` for the fixer.\n" +
+      "Only take the surface back if they hand it back.",
+  },
+};
+
+/**
+ * STEP 0 OF THE PIPELINE, ENFORCED: a QA hop asks WHO runs the software before
+ * it runs anything.
+ *
+ * The prompt has said this in prose for a while ("0. WHO DRIVES") and prose did
+ * not bind. On the run this exists for, a development task changed a dialog
+ * title in two files and the run ended with a report that could not say what the
+ * new title was or whether anything had been verified — `ask_user_question` was
+ * never called once in the whole run. The question is not optional politeness:
+ * a QA pass on someone else's app can need a login, a seeded account, a device
+ * they are holding, or nothing at all because they are watching the simulator
+ * themselves, and only they know which.
+ *
+ * So every tool that RUNS, DRIVES, CAPTURES or INSTRUMENTS is refused until an
+ * `ask_user_question` has been answered in this hop (or was answered earlier in
+ * the run). Reading, grepping and searching the harness's own log stay open —
+ * orienting first is fine; starting the app before asking is not.
+ *
+ * Then the answer is OBEYED, which is the half that makes asking honest:
+ *   - the agent does it → nothing more happens here, the pipeline runs as written;
+ *   - "I'll do it myself" → the driving tools stay shut and the hop's job becomes
+ *     asking the user what they saw (with an attachment request) and judging THAT;
+ *   - "skip" → nothing runs at all and the hop delivers the honest empty result:
+ *     an unverified verdict, or `reproduced: false` with the suspects reading gave.
+ *
+ * BOTH QA HOPS ask it, because both of them run the user's app: `reproduce` asks
+ * who makes the reported defect happen, `verify` asks who checks the change. The
+ * two answers are tracked separately — "skip the reproduction, just fix it" is a
+ * statement about that step's value, not permission to ship unverified — while a
+ * "you drive" / "I drive" answer carries across, since who has their hands on the
+ * device is a fact about the run and not about the step (see `shared.qaModes`).
+ *
+ * Never a deadlock: `deliver` is untouched by this wrapper, and the handshake
+ * refusal itself stands down after `maxBlocks` so a model that cannot form the
+ * question proceeds with a warning rather than spinning.
+ */
+export function enforceQaHandshake(
+  tools: AgentTool[],
+  opts: {
+    box: QaModeBox;
+    /** Which pass is asking (default "verify"). Decides the wording and the recall. */
+    role?: QaHandshakeRole;
+    /** The answer this run already gave for this role, from the chain's own record. */
+    priorMode?: QaMode;
+    priorAnswers?: readonly ResolvedClarification[];
+    /** Told the mode the moment it is known, for the run log. */
+    onMode?: (mode: QaMode, answer: string, source: "asked" | "earlier") => void;
+    maxBlocks?: number;
+  },
+): AgentTool[] {
+  const canAsk = tools.some((t) => isNamed(t.name, ["ask_user_question"]));
+  // Nothing to enforce when the hop cannot ask (a host that stripped the tool):
+  // holding QA hostage to a question that cannot be put would verify nothing at
+  // all, which is the failure this whole gate is against.
+  if (!canAsk) return tools;
+
+  const role = opts.role ?? "verify";
+  const text = HANDSHAKE_TEXT[role];
+  const earlier = opts.priorMode ?? qaModeFromClarifications(opts.priorAnswers, role);
+  if (earlier) {
+    opts.box.mode = earlier;
+    opts.onMode?.(earlier, "(answered earlier in this run)", "earlier");
+  }
+  let asked = earlier != null;
+  let blocks = 0;
+  const maxBlocks = opts.maxBlocks ?? 2;
+
+  // Whether this tool can EVER be gated, decided at wrap time. `bash` is the
+  // one that has to be wrapped and judged per call: the same tool runs the app
+  // and reads the checkout, and only its arguments say which (`isRuntimeCommand`).
+  const gatable = (name: string): boolean =>
+    bareName(name) === "bash" ||
+    isNamed(name, OBSERVATION_TOOL_PREFIXES) ||
+    isNamed(name, INSTRUMENTATION_TOOLS);
+  const gatedCall = (name: string, args?: Record<string, unknown>): boolean => {
+    if (bareName(name) === "bash") return isRuntimeCommand(args?.command);
+    return gatable(name);
+  };
+  // What the user does themselves when they said they would: reaching the app.
+  // Judging evidence (`media_analysis` on a screenshot they attached), reading
+  // collected logs and stripping probes are still this hop's work.
+  const drivesTheApp = (name: string, args?: Record<string, unknown>): boolean => {
+    if (bareName(name) === "bash") return isRuntimeCommand(args?.command);
+    return isNamed(name, [
+      "drive",
+      "mobile",
+      "browser_",
+      "activity_inspect",
+      "activity_trace_start",
+      "take_screenshot",
+      "take_snapshot",
+      "lighthouse_audit",
+      "performance_",
+    ]);
+  };
+
+  return tools.map((t) => {
+    if (isNamed(t.name, ["ask_user_question"])) {
+      return {
+        ...t,
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          const res = await t.execute(id, args, ctx);
+          if (res.isError) return res;
+          const answer = answerTextOf(res);
+          if (answer == null) return res; // not answered in-band; the host will collect it
+          asked = true;
+          const mode = classifyQaMode(answer) ?? "agent";
+          opts.box.mode = mode;
+          opts.onMode?.(mode, answer, "asked");
+          return res;
+        },
+      };
+    }
+    if (t.name === DELIVER_TOOL_NAME || !gatable(t.name)) return t;
+    return {
+      ...t,
+      description:
+        t.description +
+        ` Refused until you have asked the user ${text.subject} (you / they do it / skip) — that is ` +
+        "step 0 of this categorizer, and their answer decides what runs.",
+      execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+        if (!gatedCall(t.name, args)) return t.execute(id, args, ctx);
+        if (!asked) {
+          if (blocks < maxBlocks) {
+            blocks += 1;
+            return {
+              output:
+                `${t.name} refused — nothing runs in this categorizer until the user has said ` +
+                `${text.subject}. That is step 0, and it is one question:\n\n${text.ask}\n\n` +
+                "Then follow the answer and re-issue this call if it is still the right one. Ask ONCE — " +
+                "this is the only question that comes before running; from there you drive and only stop " +
+                "at a wall you have actually met.",
+              isError: true,
+            };
+          }
+          return t.execute(id, args, ctx);
+        }
+        if (opts.box.mode === "skip") {
+          return { output: `${t.name} refused — ${text.skip}`, isError: true };
+        }
+        if (opts.box.mode === "user" && drivesTheApp(t.name, args)) {
+          return { output: `${t.name} refused — ${text.user}`, isError: true };
+        }
+        return t.execute(id, args, ctx);
+      },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// A wall is a question, not a puzzle
+// ---------------------------------------------------------------------------
+
+/** Automation results that mean the screen did not move. */
+const STALLED_DRIVE_RE =
+  /\b(?:not found|no such element|could not (?:find|locate|tap|click)|unable to (?:find|locate)|no (?:match|element)|screen (?:did not|didn't) change|unchanged|timed? ?out|timeout)\b/i;
+
+/**
+ * Nudge — never block — an automation streak that is not getting anywhere.
+ *
+ * The wall (a login, an OTP, a form field whose value only the user has, an
+ * upload, a paywall, an account picker) is the single most common way a QA pass
+ * dies, and it dies quietly: the run keeps tapping, burns its budget at the same
+ * screen, and reports what it never reached. The one move that crosses a wall is
+ * `ask_user_question`, and on the run that motivated this it came after the
+ * budget was gone.
+ *
+ * A NUDGE and not a refusal, deliberately: the model may be three taps from the
+ * target, and a run that is making progress must never be stopped by a heuristic.
+ * So the reminder rides along on the tool result the model is already reading,
+ * fires once per streak, and resets the moment it asks, drives successfully, or
+ * a call lands.
+ */
+export function nudgeAtWalls(tools: AgentTool[], opts: { maxNudges?: number } = {}): AgentTool[] {
+  const maxNudges = opts.maxNudges ?? 3;
+  let misses = 0;
+  let streak = 0;
+  let nudges = 0;
+
+  const NOTE = [
+    "",
+    "",
+    "── STUCK? ASK, DO NOT KEEP TAPPING ──",
+    "This automation streak is not moving the screen. If what is in the way is a WALL — a login or",
+    "signup, an OTP/2FA, a biometric or permission prompt, a paywall, an account selector, a form field",
+    "whose value only the user has, a file to upload, a record that does not exist in this environment",
+    "— then more taps will never cross it. Call `ask_user_question` NOW, naming the screen you are on",
+    "and what you need. Three shapes of answer all unblock you: they type the VALUE, they ATTACH the",
+    "file, or they DO that one step themselves on their machine and tell you to continue — you pick the",
+    "run back up from the state they leave it in. A bypass counts too (a seeded account, a dev flag, a",
+    "deep link past the gate). Ask once, keep working on anything that is not blocked, and never end a",
+    "run reporting on a screen you never reached.",
+  ].join("\n");
+
+  return tools.map((t) => {
+    if (isNamed(t.name, ["ask_user_question"])) {
+      return {
+        ...t,
+        execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+          const res = await t.execute(id, args, ctx);
+          // Asking IS the exit this nudge points at — the streak is over.
+          if (!res.isError) {
+            misses = 0;
+            streak = 0;
+          }
+          return res;
+        },
+      };
+    }
+    if (!isNamed(t.name, ["drive", "mobile", "browser_", "take_screenshot", "take_snapshot"])) return t;
+    return {
+      ...t,
+      execute: async (id: string, args: Record<string, unknown>, ctx: ToolContext) => {
+        const res = await t.execute(id, args, ctx);
+        streak += 1;
+        const stalled = res.isError === true || STALLED_DRIVE_RE.test(res.output ?? "");
+        misses = stalled ? misses + 1 : 0;
+        // Two calls in a row that went nowhere, or a long streak with nothing to
+        // show for it. Both are streak-scoped: firing resets the counters, so a
+        // pass that recovers is never nagged twice for the same stretch.
+        if (nudges < maxNudges && (misses >= 2 || streak >= 8)) {
+          nudges += 1;
+          misses = 0;
+          streak = 0;
+          return { ...res, output: `${res.output ?? ""}${NOTE}` };
+        }
+        return res;
+      },
+    };
   });
 }
 
@@ -703,6 +1456,35 @@ function buildOpening(
   if (ctx.fileNote) lines.push(ctx.fileNote);
   for (const f of ctx.mentionFiles) lines.push(`MENTIONED FILE: ${f}`);
   if (ctx.mentionNote) lines.push(ctx.mentionNote);
+
+  // Which automation surface this QA hop actually holds — stated so the model
+  // stops reasoning about capabilities it does not have. From the field: an
+  // inspect hop on a Flutter/iOS project, holding a pile of connected browser
+  // MCP tools it could not use, reasoned "my connected automation is
+  // browser-based, not a Flutter device MCP" and nearly declined to verify.
+  // The gating now removes those tools; this line tells the model WHY, so the
+  // absence reads as design and not as something missing.
+  if (isQaHop(def)) {
+    const surface = qaSurfaceFor(input);
+    if (surface === "mobile") {
+      lines.push(
+        "AUTOMATION SURFACE: this is a mobile/device project. Your automation surface is the device " +
+          "toolkit (`mobile` and the `activity_*` tools); there are no browser tools in this hop, by " +
+          "design — do not reason about browser-based automation.",
+      );
+    } else if (surface === "web") {
+      lines.push(
+        "AUTOMATION SURFACE: this is a web project. Your automation surface is the browser (`drive` " +
+          "and the `activity_*` tools); there are no device tools in this hop, by design.",
+      );
+    } else if (surface === "none") {
+      lines.push(
+        "AUTOMATION SURFACE: this is a backend project with no UI to drive. Verify through the " +
+          "project's own run/test commands (`bash`) and the `activity_*` tools; there are no browser " +
+          "or device tools in this hop, by design.",
+      );
+    }
+  }
 
   // Placed immediately under TASK, and OUTSIDE the `accepts` contract below.
   //
@@ -860,6 +1642,12 @@ async function runCategorizerHop(
     /** True once the host flag OR the router says this run fixes a reported bug. */
     isBugFix: boolean;
     /**
+     * Who runs the software, per QA pass, as the user has said this run. Written
+     * by the handshake gate and read by the next hop, so the question is asked
+     * once per role instead of once per visit (see `recallQaMode`).
+     */
+    qaModes: QaModeRecord;
+    /**
      * Questions the user has answered, run-wide. Grown after every hop and
      * handed to the next one — the channel that stops a later categorizer
      * asking for a value the user already gave.
@@ -871,11 +1659,66 @@ async function runCategorizerHop(
   const box: DeliverBox = { delivered: false };
   let tools = resolveCategorizerTools(input, def, box, shared.mentionTools, hops);
   if (def.id === "write_edit") tools = enforcePlanFirst(tools);
+  // The handshake's answer, shared between the wrappers: the QA gate writes it,
+  // observe-first reads it (a hop the USER verifies owes no observation of its own).
+  const qaBox: QaModeBox = {};
+  // A categorizer that was not GIVEN `write`/`edit` may not author through the
+  // shell either — by any spelling, in any language. Keyed off the toolset rather
+  // than a list of ids, because the id list was the bug: the guard named the two
+  // QA hops, and the run that broke this authored a source file from the READ
+  // hop, which nobody had thought to name.
+  const authorsFiles = tools.some((t) => bareName(t.name) === "write" || bareName(t.name) === "edit");
+  if (!authorsFiles) {
+    tools = enforceNoShellAuthoring(tools, input.cwd, {
+      // The QA hops have somewhere to go (run it and look); everyone else owes
+      // the change to `write_edit`, which is the only pass whose file changes the
+      // run records.
+      instead: def.id === "activity_reproduce" || def.id === "activity_inspect" ? "observe" : "handoff",
+    });
+  }
+  // EVERY hop: opening the target in the user's DESKTOP browser is nobody's job.
+  // From the field: the write pass ran `bash open index.html` to "verify", the
+  // page popped in the user's browser, captured nothing — and the inspect pass
+  // then opened it AGAIN in the harness's own browser, which is the only opener
+  // that produces evidence. One page, two opens, one of them on the user's
+  // desktop. The refusal names the real distribution: write finishes with
+  // deliver; the verify pass opens and captures.
+  tools = enforceNoDesktopOpen(tools, def.id);
   if (def.id === "activity_reproduce" || def.id === "activity_inspect") {
-    tools = enforceObserveFirst(enforceNoShellAuthoring(tools, input.cwd), {
+    tools = enforceObserveFirst(tools, {
       // Reproduction only. A verify pass legitimately builds and runs without
       // probes — it is measuring a change, not hunting for an invisible value.
       probesBeforeLaunch: def.id === "activity_reproduce",
+      qaMode: () => qaBox.mode,
+    });
+    // A wall met while driving is the same question the handshake asks, arriving
+    // later: nudge at it rather than letting the pass tap the budget away.
+    tools = nudgeAtWalls(tools);
+  }
+  // Step 0 of BOTH QA pipelines, enforced: the user says who runs the software
+  // before anything is built, launched, driven or instrumented. The reproduce
+  // hop asks who makes the reported defect happen; the verify hop asks who
+  // checks the change that was just made.
+  if (def.id === "activity_inspect" || def.id === "activity_reproduce") {
+    const role: QaHandshakeRole = def.id === "activity_reproduce" ? "reproduce" : "verify";
+    tools = enforceQaHandshake(tools, {
+      box: qaBox,
+      role,
+      // Asked once per run per role. A "you drive" / "I drive" answer carries
+      // across roles — who has their hands on the device is a fact about the
+      // run — while a SKIP does not: "skip the reproduction, just fix it" says
+      // nothing about whether the fix should be verified.
+      ...(recallQaMode(shared.qaModes, role) ? { priorMode: recallQaMode(shared.qaModes, role) as QaMode } : {}),
+      priorAnswers: shared.clarifications,
+      onMode: (mode, answer, source) => {
+        shared.qaModes[role] = mode;
+        input.logStore.append({
+          tags: ["categorizer", "categorizer:qa-mode"],
+          level: "info",
+          message: `${role} mode: ${mode} (${source})`,
+          data: { categorizer: def.id, role, mode, source, answer: trunc(answer, 240) },
+        });
+      },
     });
   }
   const toolNames = tools.map((t) => t.name);
@@ -889,13 +1732,63 @@ async function runCategorizerHop(
     ...(input.projectCategory ? { projectCategory: input.projectCategory } : {}),
   });
 
-  const opening = buildOpening(input, def, hops, {
+  let opening = buildOpening(input, def, hops, {
     mentionNote: shared.mentionNote,
     imageNote: shared.imageNote,
     fileNote: shared.fileNote,
     mentionFiles: shared.mentionFiles,
     clarifications: shared.clarifications,
   });
+
+  // Hop-start handover of comprehension. The read step paid a stronger model to
+  // understand these files, but the analysis only reached a LATER hop when that
+  // hop re-read the file — so the field reproduce hop re-read everything the
+  // read pass had already covered, ~28 read/grep calls that produced nothing the
+  // run did not already hold. Inject the analyses for the files the read
+  // deliverable names, stamp them emitted for THIS loop (a later read of one
+  // returns bytes + a pointer, not a second copy of the analysis), and seed the
+  // loop's re-visit tracking so the first redundant re-read is flagged.
+  const acceptedReadFiles = hops
+    .filter((h) => h.id === "read" && (def.accepts?.from ?? []).includes(h.id))
+    .flatMap((h) => {
+      const files = (h.deliverable as { files?: Array<{ path?: unknown }> } | undefined)?.files;
+      return (files ?? [])
+        .map((f) => (typeof f.path === "string" ? f.path : ""))
+        .filter((p) => p.length > 0);
+    });
+  let preComprehendedPaths: string[] = [];
+  {
+    const PER_FILE_CAP = 4_500;
+    const TOTAL_CAP = 24_000;
+    const MAX_FILES = 6;
+    let budget = TOTAL_CAP;
+    const sections: string[] = [];
+    for (const rel of acceptedReadFiles) {
+      if (sections.length >= MAX_FILES || budget <= 0) break;
+      const abs = path.isAbsolute(rel) ? rel : path.resolve(input.cwd, rel);
+      const entry = shared.comprehensionStore.recall(abs);
+      if (!entry?.analysis) continue;
+      const text =
+        entry.analysis.length > PER_FILE_CAP
+          ? `${entry.analysis.slice(0, PER_FILE_CAP)} …[truncated]`
+          : entry.analysis;
+      if (budget - text.length < 0) continue;
+      budget -= text.length;
+      entry.emitted = true;
+      entry.emittedInLoop = `categorizer:${def.id}`;
+      preComprehendedPaths.push(abs);
+      sections.push(`--- ${rel} (rated ${entry.rating}, by ${entry.model}) ---\n${text}`);
+    }
+    if (sections.length > 0) {
+      opening += `\n\n${[
+        "WHOLE-FILE ANALYSES YOU ALREADY HOLD — the read step had a stronger model understand these",
+        "files; its analysis of each is below, map and findings. Do NOT read them again to understand",
+        "them: the map covers the file's line ranges, and reading returns what you already hold. Read a",
+        "range of one ONLY for its exact bytes (an edit anchor, a verbatim quote).",
+        ...sections,
+      ].join("\n")}`;
+    }
+  }
 
   input.emit({ type: "categorizer_start", categorizer: def.id, model: model.openRouterSlug ?? model.id });
   input.logStore.append({
@@ -950,6 +1843,9 @@ async function runCategorizerHop(
     // visible to (and re-injected into) every later hop at zero model cost, so a
     // file is analysed once per run no matter how many hops touch it.
     sharedComprehension: shared.comprehensionStore,
+    // The analyses already printed in this hop's opening message: the re-visit
+    // advisor is armed for them from turn one.
+    ...(preComprehendedPaths.length ? { preComprehended: preComprehendedPaths } : {}),
     // Read-deliverable snippets feed the AUTHORING context only (labeled as
     // extracts). They must not satisfy a `read` — write_edit's edit anchors
     // need the file's exact bytes, so a read in that hop executes for real
@@ -1309,6 +2205,7 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     clarifyGate: new ClarifyGate(),
     clarifications: [] as ResolvedClarification[],
     isBugFix: input.isBugFix === true,
+    qaModes: {} as QaModeRecord,
     mentionTools,
     mentionNote,
     images: triage.images,
@@ -1447,8 +2344,32 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
         break;
       }
       if (loop.error) {
+        // A hop that stalled or ran out of steps stopped EARLY — it did not
+        // fail the run. Its writes are real, its routing debt is real, and the
+        // user's change still deserves its verification pass. From the field:
+        // a write hop landed both edits, spent three turns on unknown-tool
+        // calls, stalled — and the chain aborted HERE, so FLOOR 0 never forced
+        // the inspect pass and the run ended "failed" with the change
+        // unverified purely because its author dithered after finishing.
+        //
+        // So: record the error for the final result, DROP the stalled driver's
+        // nominations (a driver that stalled mid-work has no credible "what's
+        // next"), and let the hop loop continue into routing — the router and
+        // the floors decide what the run still owes, exactly as they would
+        // after a clean deliver. Fatal errors (transport, aborts) still end
+        // the run: there is no chain left to continue.
         error = loop.error;
-        break;
+        if (isNonFatalLoopError(loop.error)) {
+          nominationQueue = [];
+          input.logStore.append({
+            tags: ["categorizer", "categorizer:hop-stalled"],
+            level: "warn",
+            message: `hop "${hop.id}" stopped early (${loop.error.slice(0, 120)}) — continuing to routing`,
+            data: { categorizer: hop.id, error: loop.error },
+          });
+        } else {
+          break;
+        }
       }
 
       // The hop's own nomination REPLACES whatever remained of an older one: the
@@ -1529,6 +2450,15 @@ export async function runCategorizerChain(input: CategorizerChainInput): Promise
     }
   } catch {
     // cleanup is best-effort; never fails the run
+  }
+
+  // The harness's own browser session (drive) is per-run state: close it so a
+  // finished run never leaves a headless Chrome alive in the host's process.
+  try {
+    const { closeWebSession } = await import("../tools/web-session.js");
+    await closeWebSession();
+  } catch {
+    // best-effort
   }
 
   // --- summary ---

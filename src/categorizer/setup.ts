@@ -218,6 +218,12 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
         "screen, instrument and read the logs. Accepts the read pass's code summary; delivers the " +
         "symptom as observed, where the evidence is, and the lines a fix should target. Pick this " +
         "for a bug report — never to check a change that was just made (that is activity_inspect).",
+      // The reproduce hop drives real software (device/web automation, trace
+      // probes, launch/relaunch decisions) — pinned rather than left on the
+      // perform slot's default. MiMo-v2.5: omnimodal input (verified against
+      // OpenRouter), so captures and probe-laden traces are read natively, and
+      // a 1.05M window that swallows long build/run logs without compaction.
+      model: "xiaomi/mimo-v2.5",
       systemPrompt: DEFAULT_CATEGORIZER_PROMPTS.activity_reproduce,
       // Same QA surface as activity_inspect — browsers, devices, activity
       // builtins, and any MCP server scoped there — without every one of those
@@ -258,6 +264,19 @@ export function createDefaultCategorizers(): CategorizerDefinition[] {
     {
       id: "activity_inspect",
       name: "Activity Inspect",
+      // Why a non-default driver, and why THIS one: the hop's currency is
+      // screenshots and captures. On the extra-small driver a correctly-routed
+      // verify hop answered with prose, called NOTHING, and ended five seconds
+      // later without delivering — every gate in the QA pass keys off a tool
+      // call, so a driver that makes none is a driver none of them can reach.
+      // laguna-s followed: TEXT-ONLY, and its first `mobile look` screenshot
+      // got the whole request rejected ("No endpoints found that support image
+      // input") — the run died with the app launched and nobody at the wheel.
+      // MiMo-v2.5 sees images NATIVELY (verified against OpenRouter:
+      // input_modalities ["text","image","audio","video"], 1.05M context) —
+      // captures pass through untouched, and it is an order of magnitude
+      // cheaper than the vision models it replaces.
+      model: "xiaomi/mimo-v2.5",
       description:
         "VERIFY a change that was just made: run it, capture screens, compare against media, " +
         "read/instrument logs and traces. Accepts the write calls a work pass made; reports a " +

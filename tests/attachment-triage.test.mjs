@@ -101,6 +101,19 @@ function makeOrchestrator({ dir, onAnalysis, turns, plan }) {
     if (last?.role === "user" && typeof last.content === "string") seen.stepMessages.push(last.content);
     turn += 1;
     yield { type: "start", partial: assistant([]) };
+    // The verify hop the chain now adds after a write (route-policy FLOOR 0).
+    // Nothing here is about QA, so it delivers an honest empty report; the
+    // observe-first guard refuses the first one and lets the re-issue through.
+    if (/ACTIVITY INSPECT/.test(ctx.systemPrompt ?? "")) {
+      yield {
+        type: "done",
+        message: assistant(
+          [{ type: "toolCall", id: "qa", name: "deliver", arguments: { writes: [], logPaths: [], findings: "not exercised in this stub" } }],
+          "tool_use",
+        ),
+      };
+      return;
+    }
     // v2 write_edit always plans first, then runs the scripted turns, then
     // delivers.
     if (turn === 1) {

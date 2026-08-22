@@ -573,3 +573,144 @@ test("every channel state is narrated, so a failure is diagnosable in one read",
   assert.ok(r.steps.some((s) => s.includes("model timed out")), "the vision failure reason survives");
   assert.ok(r.steps.some((s) => s.includes("Elements: matched")), "the element outcome is stated");
 });
+
+// ===========================================================================
+// BOX-FIRST FUSION + BIAS TOLERANCE + WRAPPER SAFETY — the "ineffective tap"
+// fixes. Screen geometry: 402x874 pt (iPhone-class logical).
+//
+// The field numbers that motivated these (measured in this codebase's own
+// runs): the localizer's Y is short by 139-249px on a 2622px screenshot =
+// 47-90 LOGICAL pt, one-directional, every time. A 44pt icon missed by 90pt
+// lands below it — point containment fails, the 60pt snap range refuses, and
+// the raw biased estimate is tapped: a miss, on exactly the unlabeled control
+// that has no other way in.
+// ===========================================================================
+
+const SCREEN = { width: 402, height: 874 };
+
+test("a BOX biased 80pt low still identifies the unlabeled control (overlap, not containment)", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const icon = T(330, 300, 44, 44); // trailing icon in a row, no label
+  const row = T(0, 280, 402, 84); // the full-width wrapper row
+  const r = resolveTap(
+    {
+      point: { x: 352, y: 400 }, // box centre, ~80pt below the icon
+      box: { x: 330, y: 378, width: 44, height: 44 }, // same size as the icon, shifted down
+    },
+    { all: [icon, row], screen: SCREEN },
+  );
+  assert.equal(r.confidence, "box-overlap");
+  assert.deepEqual(r.point, icon.center, "the icon's measured centre, not the biased box");
+  assert.ok(
+    r.steps.some((s) => s.includes("control wins over its container")),
+    "the wrapper's inevitable 1.0 containment does not steal the identity",
+  );
+});
+
+test("box inside a WRAPPER only → the estimate is tapped (clamped), never the wrapper's centre", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const row = T(0, 280, 402, 84); // wrapper; the real control has no tree node
+  const r = resolveTap(
+    { point: { x: 352, y: 340 }, box: { x: 330, y: 318, width: 44, height: 44 } },
+    { all: [row], screen: SCREEN },
+  );
+  assert.equal(r.confidence, "box-in-wrapper");
+  assert.deepEqual(r.point, { x: 352, y: 340 }, "the estimate itself, not (201, 322) — the row centre would tap the middle of the screen");
+  assert.ok(r.steps.some((s) => s.includes("wrapper's centre is NOT the target")));
+});
+
+test("a CONTROL behind the top-scoring wrapper wins the box", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const row = T(0, 280, 402, 84);
+  const icon = T(330, 300, 44, 44);
+  // Box mostly inside the row (score 1.0 against the row by containment
+  // normalisation) and covering most of the icon: the control wins.
+  const r = resolveTap(
+    { point: { x: 352, y: 322 }, box: { x: 326, y: 296, width: 52, height: 52 } },
+    { all: [row, icon], screen: SCREEN },
+  );
+  assert.equal(r.confidence, "box-overlap");
+  assert.deepEqual(r.point, icon.center);
+});
+
+test("a POINT 80pt below an unlabeled control is recovered through the measured bias", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const icon = T(330, 300, 44, 44);
+  const r = resolveTap({ point: { x: 352, y: 424 } }, { all: [icon], screen: SCREEN });
+  assert.equal(r.confidence, "vision-in-element");
+  assert.deepEqual(r.point, icon.center, "raised onto the control the estimate was short of");
+  assert.ok(r.steps.some((s) => /raised \d+pt/.test(s)), "the transcript names the correction");
+});
+
+test("bias recovery refuses full-width rows — a row is a wrapper, not a target", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const row = T(0, 280, 402, 84);
+  const r = resolveTap({ point: { x: 201, y: 420 } }, { all: [row], screen: SCREEN });
+  assert.equal(r.confidence, "box-in-wrapper");
+  assert.equal(r.point.x, 201, "the estimate's column is kept");
+  assert.ok(r.point.y >= 280 && r.point.y <= 364, "clamped inside the row's tappable bounds");
+  assert.notDeepEqual(r.point, { x: 201, y: 322 }, "never the row's centre — that is the middle of the screen");
+});
+
+test("the snap range now covers the measured bias (adaptive, screen-scaled)", async () => {
+  const { resolveTap } = await import("../dist/devices/mobilecli.js");
+  const icon = T(330, 300, 44, 44);
+  // 80pt away with a clear winner: the old flat 60pt range refused this and
+  // tapped the raw estimate — the miss this file's header describes.
+  const r = resolveTap({ point: { x: 352, y: 384 } }, { all: [icon], screen: SCREEN });
+  assert.equal(r.confidence, "vision-in-element");
+  assert.deepEqual(r.point, icon.center);
+});
+
+test("rankByOverlap: a wrapper that contains the box outscores the control — but stays within the fusion's reach", async () => {
+  // Geometric truth: a box inside a row's x-span overlaps the row completely,
+  // so the ROW scores 1.0 and ranks first no matter the normaliser. That is
+  // exactly why resolveTap has the control-behind-wrapper branch: the control
+  // within 0.5x of the wrapper's score is converted into the winner. Here the
+  // box is lifted onto the icon (the bias-corrected candidate) and the icon
+  // scores 1.0 too — the AREA tiebreak puts the specific control first.
+  const { rankByOverlap } = await import("../dist/devices/mobilecli.js");
+  const row = T(0, 280, 402, 84);
+  const icon = T(330, 300, 44, 44);
+  const lifted = rankByOverlap({ x: 330, y: 300, width: 44, height: 44 }, [row, icon]);
+  assert.equal(lifted[0].el, icon, "at a 1.0 tie the smaller, more specific element ranks first");
+  assert.ok(lifted[1].el === row && lifted[1].score === 1, "the wrapper is right behind at 1.0");
+  // A box biased onto the row's bottom edge barely reaches the icon at zero
+  // lift — the FUSION's bias lifts are what put it within reach, so assert the
+  // lifted candidate carries the property.
+  const liftedPartial = rankByOverlap({ x: 330, y: 304, width: 44, height: 44 }, [row, icon]);
+  assert.ok(
+    liftedPartial.some((r) => r.el === icon && r.score >= 0.5),
+    "after the measured-bias lift the control is squarely within the fusion's reach",
+  );
+});
+
+// ===========================================================================
+// Tree-blind pixel verification — a good tap must not be re-tapped.
+//
+// The tree signs "" === "" for canvas/image/state changes; believing it
+// re-taps a toggle that already flipped, and the second tap reverts it.
+// ===========================================================================
+
+test("thresholdedPixelDiff: a real content change is CHANGED, a clock tick is not", async () => {
+  const { thresholdedPixelDiff } = await import("../dist/tools/builtin/activity-monitor.js");
+  const { Jimp } = await import("jimp");
+  const make = async (patch) => {
+    const img = new Jimp({ width: 402, height: 874, color: 0x202028ff });
+    patch(img);
+    return (await img.getBuffer("image/png")).toString("base64");
+  };
+  const base = await make(() => {});
+  const changed = await make((img) => {
+    // A keyboard-sized block: ~16% of the screen, below the status bar. Byte
+    // offsets are y * width * 4 (RGBA).
+    img.bitmap.data.fill(0xf0, 450 * 402 * 4, 590 * 402 * 4);
+  });
+  const clock = await make((img) => {
+    // Status-bar-only change: top ~2% — inside the strip the diff crops away.
+    img.bitmap.data.fill(0x50, 0, Math.floor(17 * 402 * 4));
+  });
+  assert.equal(await thresholdedPixelDiff(base, changed), true, "a large content change is a change");
+  assert.equal(await thresholdedPixelDiff(base, clock), false, "status-bar noise stays noise");
+  assert.equal(await thresholdedPixelDiff(base, undefined), undefined, "an unavailable tiebreak invents nothing");
+});
